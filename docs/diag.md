@@ -23,8 +23,9 @@ evidence), wake outcomes (presented / canceled / bar_owns / system_ring /
 reported_ring / bar_mode / skip_redelivery / skip_busy / skip_no_ids /
 report_failed), a launch config snapshot on both apps, turn-model tier
 selection and load failures (`turnmodel`: tier, rung, error) on both apps,
-and ScratchSweep findings (`scratchsweep`: removed, freed_bytes) on both
-apps. Wake and registration flush immediately — a woken process can die
+CallKit End-action routing state (`callkit.end_action`: mirrored owner and the
+live/video/agent machine states), and ScratchSweep findings (`scratchsweep`:
+removed, freed_bytes) on both apps. Wake and registration flush immediately — a woken process can die
 within ~1.5 s.
 
 ## Monitor side: the `monitor` agent
