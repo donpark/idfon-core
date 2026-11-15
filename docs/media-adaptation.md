@@ -480,6 +480,9 @@ Measure first — everything below needs the same instrumentation to prove out.
    400 ms, the decoder's `max_age` raised 50→250 ms (a later group used to be
    discarded on arrival, which no buffer can repair) and the sink trim cap
    raised 80→400 ms (it undid the buffer a burst had just earned).
+   **Latency tune 2026-11-14**: the initial target is now **60 ms**, the tested
+   floor. The startup decode gate shares this target instead of stacking a
+   second hold; observed jitter still grows the target up to 200 ms.
 9. **NWPathMonitor on ios/mac** (change). On interface change: announce it
    (quality record tag "transition"), proactively grow the jitter buffer and
    step video down one rung before the breakage hits.

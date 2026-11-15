@@ -93,14 +93,15 @@ struct PacedState {
     emit: Box<dyn Fn(&[u8]) + Send + Sync>,
 }
 
-/// Prebuffer before the first emit (and after an underrun): enough to ride
-/// out arrival jitter without adding perceptible latency. The starting
-/// value; [`ArrivalJitter`] adapts it as arrivals show their real jitter
-/// (docs/media-adaptation.md §C8).
-const PLAYOUT_TARGET: Duration = Duration::from_millis(80);
+/// Prebuffer before the first emit (and after an underrun): three 20 ms
+/// frames, the smallest target that survived the cellular-hiccup tests.
+pub const PLAYOUT_TARGET_MS: u64 = 60;
+/// Starting value; [`ArrivalJitter`] grows it when arrivals show more jitter
+/// (docs/media-adaptation.md §C8). The FFI startup gate uses the same value.
+const PLAYOUT_TARGET: Duration = Duration::from_millis(PLAYOUT_TARGET_MS);
 /// Adaptive target floor: a 20 ms frame needs room for a burst, and 30 ms
 /// (the old floor) underran on every 100 ms cellular hiccup.
-const PLAYOUT_TARGET_MIN: Duration = Duration::from_millis(60);
+const PLAYOUT_TARGET_MIN: Duration = Duration::from_millis(PLAYOUT_TARGET_MS);
 /// Adaptive target ceiling: past this, latency costs more than the jitter.
 const PLAYOUT_TARGET_MAX: Duration = Duration::from_millis(200);
 /// How much audio one emit carries; the pacing granularity.
@@ -438,7 +439,7 @@ mod tests {
             "buffered = {:?}",
             sink.buffered()
         );
-        // Prebuffer 50 ms + 200 ms of paced emits.
+        // The adaptive prebuffer must not truncate the 200 ms burst.
         std::thread::sleep(Duration::from_millis(600));
         assert_eq!(*emitted.lock().unwrap(), pcm);
         assert!(
@@ -476,6 +477,12 @@ mod tests {
     /// The prebuffer target tracks recent arrival jitter (docs/media-
     /// adaptation.md §C8): the default while warming up, the floor for
     /// perfect arrivals, following a jittery tail toward the ceiling.
+    #[test]
+    fn initial_target_is_the_tested_latency_floor() {
+        assert_eq!(PLAYOUT_TARGET_MS, 60);
+        assert_eq!(PLAYOUT_TARGET, PLAYOUT_TARGET_MIN);
+    }
+
     #[test]
     fn arrival_jitter_drives_the_paced_target() {
         let mut jitter = ArrivalJitter::new();

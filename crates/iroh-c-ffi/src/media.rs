@@ -47,6 +47,13 @@ static AUDIO_QUEUE_UNDERRUN_SAMPLES: std::sync::atomic::AtomicU64 =
 static AUDIO_QUEUE_OVERFLOW_SAMPLES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 static LIVE: Mutex<Option<LiveSession>> = Mutex::new(None);
+/// Shared monotonic origin for the live audio and video track timestamps.
+static LIVE_MEDIA_EPOCH: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+static VIDEO_PTS_CLOCK: Mutex<VideoPtsClock> = Mutex::new(VideoPtsClock {
+    capture_origin_ms: None,
+    last_capture_ms: None,
+    media_origin_us: 0,
+});
 static LAST_ERROR: Mutex<Option<String>> = Mutex::new(None);
 static MEDIA_SCOPE: Mutex<Option<PathBuf>> = Mutex::new(None);
 static LIVE_CONFIG: Mutex<Option<(bool, bool, bool, Option<PathBuf>, AudioCodec, u32, u32)>> =
@@ -258,20 +265,65 @@ fn audio_queue() -> Arc<Mutex<VecDeque<f32>>> {
 /// Largest single capture push seen, so the trim target fits the device.
 static AUDIO_MAX_BURST: AtomicUsize = AtomicUsize::new(0);
 
+fn media_pts_us(epoch: std::time::Instant, now: std::time::Instant) -> u64 {
+    now.saturating_duration_since(epoch)
+        .as_micros()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+fn live_media_epoch() -> Option<std::time::Instant> {
+    *LIVE_MEDIA_EPOCH
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
+
+#[derive(Default)]
+struct VideoPtsClock {
+    capture_origin_ms: Option<u64>,
+    last_capture_ms: Option<u64>,
+    media_origin_us: u64,
+}
+
+impl VideoPtsClock {
+    fn map(
+        &mut self,
+        capture_pts_ms: u64,
+        epoch: std::time::Instant,
+        now: std::time::Instant,
+    ) -> u64 {
+        if self.capture_origin_ms.is_none()
+            || self
+                .last_capture_ms
+                .is_some_and(|last| capture_pts_ms < last)
+        {
+            self.capture_origin_ms = Some(capture_pts_ms);
+            self.media_origin_us = media_pts_us(epoch, now);
+        }
+        self.last_capture_ms = Some(capture_pts_ms);
+        let capture_origin_ms = self.capture_origin_ms.unwrap_or(capture_pts_ms);
+        self.media_origin_us.saturating_add(
+            capture_pts_ms
+                .saturating_sub(capture_origin_ms)
+                .saturating_mul(1_000),
+        )
+    }
+}
+
 fn audio_stream(
     queue: Arc<Mutex<VecDeque<f32>>>,
     sample_rate: u32,
     channels: u32,
 ) -> BoxStream<AudioFrame> {
     let frame_samples = sample_rate as usize / 50 * channels as usize;
+    let epoch = live_media_epoch().unwrap_or_else(std::time::Instant::now);
     let mut ticker = tokio::time::interval_at(
         tokio::time::Instant::now() + std::time::Duration::from_millis(20),
         std::time::Duration::from_millis(20),
     );
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     Box::pin(unfold(
-        (queue, 0u64, ticker, None::<std::time::Instant>),
-        move |(queue, pts, mut ticker, last_tick)| async move {
+        (queue, ticker, None::<std::time::Instant>),
+        move |(queue, mut ticker, last_tick)| async move {
             ticker.tick().await;
             let now = std::time::Instant::now();
             let tick_gap_us = last_tick
@@ -302,15 +354,11 @@ fn audio_stream(
                 );
             }
             let bytes: Vec<u8> = data.into_iter().flat_map(f32::to_le_bytes).collect();
-            let pts_delta = if tick_gap_us > 30_000 {
-                tick_gap_us as u64
-            } else {
-                20_000
-            };
+            let pts = media_pts_us(epoch, now);
             let timestamp = moq_net::Timestamp::from_micros(pts).ok()?;
             Some((
                 AudioFrame::new(bytes::Bytes::from(bytes), timestamp),
-                (queue, pts + pts_delta, ticker, Some(now)),
+                (queue, ticker, Some(now)),
             ))
         },
     ))
@@ -471,6 +519,14 @@ fn start_live(
         let builder = Live::from_env().await?;
         tracing::info!(target: "idfon.media", elapsed_ms = setup_started.elapsed().as_millis() as u64, "live endpoint setup returned");
         let live = builder.spawn();
+        // Start a shared near-zero media timeline only after endpoint setup;
+        // MoQ consumers expect track PTS to begin near the start of publish.
+        *LIVE_MEDIA_EPOCH
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(std::time::Instant::now());
+        *VIDEO_PTS_CLOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = VideoPtsClock::default();
         // Accept-side routing (MoQ + the health ALPN) comes from the health
         // module's router (docs/media-adaptation.md §B2.2).
         crate::health::ensure_served(&live);
@@ -534,6 +590,12 @@ fn start_live(
             Ok(ticket)
         }
         Err(err) => {
+            *LIVE_MEDIA_EPOCH
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) = None;
+            *VIDEO_PTS_CLOCK
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) = VideoPtsClock::default();
             *LAST_ERROR.lock().expect("error poisoned") = Some(format!("{err:#}"));
             Err(err)
         }
@@ -812,6 +874,12 @@ pub fn media_live_stop() {
     if let Ok(mut queue) = AUDIO_QUEUE.lock() {
         *queue = None;
     }
+    *LIVE_MEDIA_EPOCH
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = None;
+    *VIDEO_PTS_CLOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = VideoPtsClock::default();
 }
 // --- Listen-leg state (docs/media-adaptation.md §C2) ----------------------
 
@@ -1278,10 +1346,10 @@ async fn subscribe_decode_once(
         };
         // A/V sync: video presents against the audio playout clock (av.rs).
         crate::av::reset();
-        // Do not start the speaker on the first arriving packet. A short
-        // startup prebuffer absorbs normal network/decoder scheduling
-        // jitter without turning the first late packet into a click.
-        const STARTUP_PREBUFFER_FRAMES: usize = 3_840; // 80 ms @ 48 kHz
+        // Match PacedPlayback's target so startup buffering is one hold, not
+        // a second delay before the jitter buffer can start draining.
+        const STARTUP_PREBUFFER_FRAMES: usize =
+            (idfon_media::seam::PLAYOUT_TARGET_MS as usize * 48_000) / 1_000;
         let mut startup = Vec::new();
         let mut started = false;
         let mut last_arrival = None;
@@ -1542,6 +1610,18 @@ pub fn media_video_push_frame(data: *const u8, len: usize, width: u32, height: u
     if data.is_null() || width == 0 || height == 0 || len < width as usize * height as usize * 4 {
         return;
     }
+    // Camera PTS uses CoreMedia's clock; calibrate its origin to the call's
+    // monotonic audio timeline, then preserve the camera's capture spacing.
+    let now = std::time::Instant::now();
+    let pts_us = live_media_epoch().map_or_else(
+        || pts_ms.saturating_mul(1_000),
+        |epoch| {
+            VIDEO_PTS_CLOCK
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .map(pts_ms, epoch, now)
+        },
+    );
     let mut pixels =
         unsafe { std::slice::from_raw_parts(data, width as usize * height as usize * 4) }.to_vec();
     bgra_to_rgba(&mut pixels);
@@ -1556,7 +1636,7 @@ pub fn media_video_push_frame(data: *const u8, len: usize, width: u32, height: u
         );
     }
     if let Ok(mut slot) = VIDEO_QUEUE.lock() {
-        *slot = Some((width, height, pixels, pts_ms * 1_000));
+        *slot = Some((width, height, pixels, pts_us));
     }
 }
 
@@ -2134,6 +2214,18 @@ pub fn media_shutdown() {
 #[cfg(test)]
 mod tests {
     use super::AudioCodec;
+
+    #[test]
+    fn video_pts_map_to_audio_epoch_and_keep_capture_spacing() {
+        let epoch = std::time::Instant::now();
+        let mut clock = super::VideoPtsClock::default();
+        let first = clock.map(9_000_000, epoch, epoch + std::time::Duration::from_secs(2));
+        let next = clock.map(9_000_033, epoch, epoch + std::time::Duration::from_secs(3));
+        let restarted = clock.map(0, epoch, epoch + std::time::Duration::from_secs(4));
+        assert_eq!(first, 2_000_000);
+        assert_eq!(next, 2_033_000);
+        assert_eq!(restarted, 4_000_000);
+    }
 
     #[test]
     fn pushed_capture_bytes_are_reordered_bgra_to_rgba() {
