@@ -279,28 +279,34 @@ network-side rung mechanism, C7 (auto video-off) is one policy rule over the
 profile, C8 (jitter target) is a profile field, C9 (NWPathMonitor) is just
 another trigger.
 
-**Landed 2026-11-15 — iOS video admission ladder.** The call bar shows Off →
-Enabling → Photo updates / Active video. A request initially publishes only a
-160×284 photo rung (12 kbps). The sender adds the 240×426 (250 kbps), 480×854
-(800 kbps), and 720×1280 (2 Mbps) rungs only after two healthy photo windows
-show the delivery estimate can cover the lowest live rung with 1.5× headroom.
-The receiver starts at the smallest rendition; the existing MoQ adaptive loop
-uses delivery/goodput evidence and probes to move up or down.
+**2026-11-15 — iOS video admission: photo-first ladder tried and removed.**
+The publisher offers low (240×426, 250 kbps), medium (480×854, 800 kbps), and
+high (720×1280, 2 Mbps) renditions. The receiver starts at the **best** rung and
+steps down one notch at a time when the publisher's delivery estimate says the
+current rung does not fit (500 ms hold per step); it steps back up only when
+the estimate covers the next rung with 1.5× headroom. Starting degraded and
+climbing was tried first and abandoned with the photo gate below — a call
+should open at its best picture and shed quality under pressure.
 
-Enabling sends low-resolution still updates over that same H.264 path. Their
-1.5–10 s cadence follows measured headroom. A peer supporting the call-mode
-signal holds the last photo for 11 s; older peers get the compatibility cadence
-below 2 s. Two two-ended health windows must show actually presented
-photo frames and healthy audio before the UI reports Photo updates. Normal
-capture cadence starts only after the far end has selected a non-photo rung;
-Active video then requires two windows with at least 30 presented frames per
-2.5 s. Two degraded active windows step back to Photo updates. Either leg's
-mic-capture padding above 4,800 samples or any received-audio gap over 100 ms
-pauses all visual media immediately. Missing or old-peer telemetry cannot
-promote to continuous video. The ladder is best effort, not a
-FaceTime-performance guarantee; real-device calibration remains necessary.
+A photo-first admission gate was built on top of that and removed the same day
+(commit `1f0bf9ba`, reverted): a 160×284 still rung, 1.5–10 s update cadence,
+and multi-window promotion before normal capture. It made calls look frozen —
+a still that updates every few seconds is indistinguishable from a hung call,
+and no health threshold is worth that impression. The rule learned: capacity
+pressure removes pixels or the picture, never the frame cadence. The `photo`
+rangement name, the `media_video_set_photo_mode` receiver idle-hold, and the
+`call_video_*` control messages are gone with it.
 
-**Continuation:** Track results in [epic #208](https://github.com/donpark/idfon/issues/208). Phase 0 (implementation and local builds) is complete; Phase 1 requires both phones on the updated local build and covers both directions, Wi-Fi/cellular paths, camera toggles, repeat calls, and two-ended audio/video health. Phases 2–5 cover threshold calibration, old/new-peer compatibility, visual-quality review, and a separately approved release decision. No device call or TestFlight upload has been done for this ladder.
+The health telemetry built for that gate is kept: `delivery_bps_mean`,
+`video_frames_received`, `video_rendition`, `video_frame_age_ms`,
+`audio_stalls_over_100ms`, and `audio_missing_frames`, plus audio gaps folded
+into the health verdict. It is read-only observability for diagnosis; nothing
+gates video on it now.
+
+**Continuation:** [epic #208](https://github.com/donpark/idfon/issues/208)
+tracks what remains: two-phone validation of the rung ladder, rung/threshold
+calibration, and a separately approved release decision. No device call or
+TestFlight upload has been done for the ladder.
 
 ### B2.1 Tie-in: LL-HLS (soon to come)
 

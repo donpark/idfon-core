@@ -60,7 +60,6 @@ static LIVE_CONFIG: Mutex<Option<(bool, bool, bool, Option<PathBuf>, AudioCodec,
     Mutex::new(None);
 static AUDIO_ENABLED: AtomicBool = AtomicBool::new(true);
 static VIDEO_ENABLED: AtomicBool = AtomicBool::new(false);
-static VIDEO_LADDER_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Audio samples the playout could not deliver in time, for health checks.
 pub(crate) fn underruns() -> u64 {
@@ -477,16 +476,10 @@ impl AudioPlayback for DevicePlayback {
     }
 }
 
-fn live_video_renditions(include_live: bool) -> Vec<VideoRendition> {
-    let photo = VideoRendition::new("photo")
-        .with_size(Size::new(160, 284))
-        .with_bitrate(12_000)
-        .with_keyframe_interval(std::time::Duration::from_millis(1));
-    if !include_live {
-        return vec![photo];
-    }
+/// Every rung keeps motion: a still rung reads as a frozen call, so capacity
+/// pressure removes pixels (down a rung) or the picture, never the cadence.
+fn live_video_renditions() -> Vec<VideoRendition> {
     vec![
-        photo,
         VideoRendition::new("low")
             .with_size(Size::new(240, 426))
             .with_bitrate(250_000),
@@ -588,10 +581,9 @@ fn start_live(
             }
             if video {
                 VIDEO_ENABLED.store(true, Ordering::Relaxed);
-                VIDEO_LADDER_ENABLED.store(false, Ordering::Relaxed);
                 broadcast.video().set_renditions(
                     Box::new(ShellVideoCapture).into_source(),
-                    live_video_renditions(false),
+                    live_video_renditions(),
                 )?;
             }
             combined_broadcast = Some(broadcast);
@@ -824,33 +816,6 @@ pub fn media_live_set_audio_enabled(enabled: u8) -> u8 {
     0
 }
 #[ffi_export]
-pub fn media_live_set_video_profile(include_live: u8) -> u8 {
-    if include_live > 1 {
-        return 2;
-    }
-    let include_live = include_live != 0;
-    let live = LIVE.lock().unwrap_or_else(|poison| poison.into_inner());
-    let Some(session) = live.as_ref() else { return 1; };
-    let Some(broadcast) = session._audio.as_ref() else { return 1; };
-    if VIDEO_LADDER_ENABLED.load(Ordering::Relaxed) == include_live {
-        return 0;
-    }
-    match broadcast.video().set_renditions(
-        Box::new(ShellVideoCapture).into_source(),
-        live_video_renditions(include_live),
-    ) {
-        Ok(()) => {
-            VIDEO_LADDER_ENABLED.store(include_live, Ordering::Relaxed);
-            0
-        }
-        Err(error) => {
-            tracing::warn!(error = %error, include_live, "live video profile update failed");
-            1
-        }
-    }
-}
-
-#[ffi_export]
 pub fn media_live_set_video_enabled(enabled: u8) -> u8 {
     VIDEO_ENABLED.store(enabled != 0, Ordering::Relaxed);
     // Drop the frame parked while the camera was on: re-enabling would
@@ -907,7 +872,6 @@ pub fn media_live_stop() {
     crate::health::finish_call_sampling();
     crate::abr::stop();
     VIDEO_ENABLED.store(false, Ordering::Relaxed);
-    VIDEO_LADDER_ENABLED.store(false, Ordering::Relaxed);
     let underruns = AUDIO_QUEUE_UNDERRUN_SAMPLES.swap(0, Ordering::Relaxed);
     let overflows = AUDIO_QUEUE_OVERFLOW_SAMPLES.swap(0, Ordering::Relaxed);
     if underruns > 0 || overflows > 0 {
@@ -2268,18 +2232,13 @@ mod tests {
     use super::AudioCodec;
 
     #[test]
-    fn calls_start_photo_only_and_offer_a_measured_video_ladder() {
-        let photo = super::live_video_renditions(false);
-        assert_eq!(photo.len(), 1);
-        assert_eq!(photo[0].name, "photo");
-        assert_eq!(photo[0].bitrate, Some(12_000));
-
-        let live = super::live_video_renditions(true);
-        assert_eq!(live.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
-                   ["photo", "low", "medium", "high"]);
-        assert_eq!(live[1].bitrate, Some(250_000));
-        assert_eq!(live[2].bitrate, Some(800_000));
-        assert_eq!(live[3].bitrate, Some(2_000_000));
+    fn the_video_ladder_keeps_motion_at_every_rung() {
+        let ladder = super::live_video_renditions();
+        assert_eq!(ladder.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+                   ["low", "medium", "high"]);
+        assert_eq!(ladder[0].bitrate, Some(250_000));
+        assert_eq!(ladder[1].bitrate, Some(800_000));
+        assert_eq!(ladder[2].bitrate, Some(2_000_000));
     }
 
     #[test]
