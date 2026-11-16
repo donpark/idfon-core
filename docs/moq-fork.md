@@ -90,3 +90,39 @@ Then in idfon:
   whose moq reqs the fork satisfies.
 - `moq-relay` never enters our dependency graph (iroh-live's workspace lists it;
   `moq-media`/`iroh-moq` do not use it), so its version skew does not matter.
+
+## iOS has no hardware encoder (VideoToolbox is macOS-gated)
+
+Observed in a real iPhone↔iPhone call (build 0.10.0/35, 2026-11-15 23:17,
+82 s): both phones logged `no hardware encoder available, falling back to
+software encoder="openh264"` and encoded 720×1280 at 30 fps with openh264.
+Software encode could not sustain the frame rate, so the picture stalled while
+the path was idle (RTT 8–15 ms, loss ≈0, goodput steady ~2 Mbps, direct LAN
+paths). The same CPU contention starved mic capture on one phone (25,664
+underrun samples, 1.43 s max gap). A network-side rendition ladder cannot fix
+this: delivery, loss and RTT all looked healthy.
+
+Cause: in this fork `moq-video` gates the VideoToolbox backend macOS-only —
+`#[cfg(target_os = "macos")]` on `mod videotoolbox`, its `HARDWARE` candidate,
+and the CoreVideo surface module in `frame.rs`, plus `objc2-*` deps under a
+`cfg(target_os = "macos")` target table. iOS (`target_os = "ios"`) therefore
+has no Apple candidate in `HARDWARE` and always falls back to openh264.
+
+Patch (verified with `cargo check -p moq-video --target aarch64-apple-ios`,
+with and without default features, using the `stable-aarch64-apple-darwin`
+toolchain — the `1.98.1` toolchain has no iOS target installed):
+
+1. `Cargo.toml`: rename the Apple target table to
+   `[target.'cfg(any(target_os="macos", target_os="ios"))'.dependencies]`, and
+   move `objc2-screen-capture-kit` and `objc2-core-graphics` (CGDirectDisplay)
+   into a new macOS-only table — ScreenCaptureKit does not exist on iOS.
+2. `src/encode/backend/mod.rs`: widen both gates (`mod videotoolbox` and its
+   `HARDWARE` entry) to `cfg(any(target_os = "macos", target_os = "ios"))`.
+3. `src/frame.rs`: widen the `macos` module gate, the `Surface::PixelBuffer`
+   variant, the scaler `Cache` struct/impl/tests, and their call sites (15
+   `cfg(target_os = "macos")` sites) the same way.
+4. `src/color.rs`: widen `Color::with_range` (CoreVideo spells out range).
+
+Not yet verified: linking and running on a device (`VTCompressionSession`) —
+needs a rebuild of `ios/Vendor/device/libiroh_c_ffi.a` and a two-phone call.
+The patch also leaves `objc2-av-foundation` unused on iOS, which is expected.
