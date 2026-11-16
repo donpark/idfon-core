@@ -281,12 +281,13 @@ another trigger.
 
 **2026-11-15 — iOS video admission: photo-first ladder tried and removed.**
 The publisher offers low (240×426, 250 kbps), medium (480×854, 800 kbps), and
-high (720×1280, 2 Mbps) renditions. The receiver starts at the **best** rung and
-steps down one notch at a time when the publisher's delivery estimate says the
-current rung does not fit (500 ms hold per step); it steps back up only when
-the estimate covers the next rung with 1.5× headroom. Starting degraded and
-climbing was tried first and abandoned with the photo gate below — a call
-should open at its best picture and shed quality under pressure.
+high (720×1280, 2 Mbps) renditions. The receiver starts at the **middle** rung
+and steps from there — up when the estimate covers the next rung with 1.5×
+headroom, down when the current rung does not fit (500 ms hold per step).
+Neither end is assumed: the top strands a constrained path while it walks down,
+the bottom shows a poor picture while it climbs. The starting rung is a
+calibration value; it is set from what the reference client opens at, which is
+not yet measured (see #208).
 
 A photo-first admission gate was built on top of that and removed the same day
 (commit `1f0bf9ba`, reverted): a 160×284 still rung, 1.5–10 s update cadence,

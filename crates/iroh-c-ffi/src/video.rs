@@ -251,13 +251,15 @@ async fn video_loop(ticket: &str, render: Box<dyn VideoRender>, stop: Arc<Atomic
         }
         tokio::time::sleep(STOP_POLL).await;
     }
-    // Start at the best rung and step down; do not start degraded and climb.
-    // The publisher's own delivery estimate (`NetworkSignals::delivery_bps`)
-    // describes capacity rather than change, so a rung that does not fit is
-    // left after `downgrade_hold` (500 ms) instead of being probed for. One
-    // notch per step: the ladder walks down until the picture fits.
-    let first_rendition = moq_media::adaptive::rank_renditions(broadcast.catalog().video())
-        .first()
+    // Start in the middle of the ladder, not at its top or bottom. Neither end
+    // is a safe assumption: the top strands a constrained path while it walks
+    // down, and the bottom shows a bad picture while it climbs. One step either
+    // way from the middle lands on a useful rung, and the adaptation loop takes
+    // it within a check or two. The rung to start on is a calibration value:
+    // measure what the reference client (FaceTime) opens at before tuning it.
+    let ranked = moq_media::adaptive::rank_renditions(broadcast.catalog().video());
+    let first_rendition = ranked
+        .get(ranked.len() / 2)
         .map(|rendition| rendition.name.clone());
     let Some(first_rendition) = first_rendition else {
         video_error("video catalog has no renditions");
