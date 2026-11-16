@@ -6,10 +6,10 @@ use std::{
     ffi::c_void,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex, OnceLock,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use idfon_media::seam::VideoRender;
@@ -19,6 +19,33 @@ use crate::media::media_path;
 
 static VIDEO: Mutex<Option<VideoSession>> = Mutex::new(None);
 static VIDEO_ERROR: OnceLock<Mutex<String>> = OnceLock::new();
+static VIDEO_FRAMES_PRESENTED: AtomicU64 = AtomicU64::new(0);
+static VIDEO_LAST_FRAME_AT: Mutex<Option<Instant>> = Mutex::new(None);
+static VIDEO_RENDITION: Mutex<Option<String>> = Mutex::new(None);
+
+pub(crate) fn frames_presented() -> u64 {
+    VIDEO_FRAMES_PRESENTED.load(Ordering::Relaxed)
+}
+
+pub(crate) fn current_rendition() -> Option<String> {
+    VIDEO_RENDITION
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone()
+}
+
+pub(crate) fn last_frame_age_ms() -> Option<u64> {
+    VIDEO_LAST_FRAME_AT
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .as_ref()
+        .map(|last| last.elapsed().as_millis() as u64)
+}
+
+fn record_presented_frame() {
+    VIDEO_FRAMES_PRESENTED.fetch_add(1, Ordering::Relaxed);
+    *VIDEO_LAST_FRAME_AT.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(Instant::now());
+}
 
 /// Stored as `usize` so the function pointer survives a static `Mutex`.
 type RenderFn = unsafe extern "C" fn(*const c_void, *const u8, usize, u32, u32, u64);
@@ -51,6 +78,7 @@ pub fn media_video_clear_render_cb() {
 /// idles), so silence is "peer camera off": remove the artifact so the shell
 /// clears the stale picture instead of presenting it as live.
 const FRAME_IDLE: Duration = Duration::from_secs(2);
+const PHOTO_FRAME_IDLE: Duration = Duration::from_secs(11);
 /// How often the loop re-checks the stop flag while waiting on the peer.
 const STOP_POLL: Duration = Duration::from_millis(100);
 
@@ -62,6 +90,7 @@ fn video_error(message: impl Into<String>) {
 
 struct VideoSession {
     stop: Arc<AtomicBool>,
+    photo_mode: tokio::sync::watch::Sender<bool>,
 }
 
 #[ffi_export]
@@ -77,17 +106,19 @@ pub fn media_video_start(ticket: char_p::Ref<'_>) -> char_p::Box {
         Some((ctx, cb)) => Box::new(CallbackRender { ctx, cb }),
         None => Box::new(DiskRender::new(&frame_path, &temp_path)),
     };
+    *VIDEO_LAST_FRAME_AT.lock().unwrap_or_else(|poison| poison.into_inner()) = None;
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = stop.clone();
+    let (photo_mode_tx, photo_mode_rx) = tokio::sync::watch::channel(false);
     let return_path = frame_path.to_string_lossy().into_owned();
     std::thread::spawn(move || {
         let Ok(runtime) = tokio::runtime::Runtime::new() else {
             video_error("video runtime creation failed");
             return;
         };
-        runtime.block_on(video_loop(&ticket, render, thread_stop));
+        runtime.block_on(video_loop(&ticket, render, thread_stop, photo_mode_rx));
     });
-    *VIDEO.lock().unwrap() = Some(VideoSession { stop });
+    *VIDEO.lock().unwrap() = Some(VideoSession { stop, photo_mode: photo_mode_tx });
     return_path.try_into().unwrap()
 }
 
@@ -104,9 +135,19 @@ pub fn media_video_last_error() -> char_p::Box {
 
 #[ffi_export]
 pub fn media_video_stop() {
+    *VIDEO_RENDITION.lock().unwrap_or_else(|poison| poison.into_inner()) = None;
+    *VIDEO_LAST_FRAME_AT.lock().unwrap_or_else(|poison| poison.into_inner()) = None;
     if let Some(session) = VIDEO.lock().unwrap().take() {
         session.stop.store(true, Ordering::Relaxed);
     }
+}
+
+#[ffi_export]
+pub fn media_video_set_photo_mode(enabled: u8) -> u8 {
+    let session = VIDEO.lock().unwrap_or_else(|poison| poison.into_inner());
+    let Some(session) = session.as_ref() else { return 1 };
+    session.photo_mode.send_replace(enabled != 0);
+    0
 }
 
 /// Disk artifact renderer: the fallback when no shell callback is registered.
@@ -183,7 +224,12 @@ impl VideoRender for CallbackRender {
     }
 }
 
-async fn video_loop(ticket: &str, render: Box<dyn VideoRender>, stop: Arc<AtomicBool>) {
+async fn video_loop(
+    ticket: &str,
+    render: Box<dyn VideoRender>,
+    stop: Arc<AtomicBool>,
+    mut photo_mode: tokio::sync::watch::Receiver<bool>,
+) {
     let ticket = match ticket.parse::<LiveTicket>() {
         Ok(ticket) => ticket,
         Err(error) => {
@@ -221,7 +267,19 @@ async fn video_loop(ticket: &str, render: Box<dyn VideoRender>, stop: Arc<Atomic
         }
         tokio::time::sleep(STOP_POLL).await;
     }
-    let track = match broadcast.video().await {
+    // Never start at `best_video()`: on a cellular path that would ask for
+    // 720p before the receiver has measured whether the link can carry it.
+    // Start at the lowest rung (the still-update profile) and let the existing
+    // adaptation loop earn upgrades from delivery/goodput evidence.
+    let first_rendition = moq_media::adaptive::rank_renditions(broadcast.catalog().video())
+        .last()
+        .map(|rendition| rendition.name.clone());
+    let Some(first_rendition) = first_rendition else {
+        video_error("video catalog has no renditions");
+        live.shutdown().await;
+        return;
+    };
+    let track = match broadcast.video_rendition(&first_rendition).await {
         Ok(track) => track,
         Err(error) => {
             video_error(format!("video track failed: {error}"));
@@ -230,25 +288,45 @@ async fn video_loop(ticket: &str, render: Box<dyn VideoRender>, stop: Arc<Atomic
         }
     };
     track.enable_adaptation(subscription.signals().clone());
-    crate::health::attach(&live, subscription.session().conn(), subscription.signals().clone());
+    *VIDEO_RENDITION.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(track.rendition());
+    // Admission must measure the video leg's actual delivery, not only audio
+    // goodput; attach this subscription after the audio leg so it is sampled.
+    crate::health::attach_video(&live, subscription.session().conn(), subscription.signals().clone());
+    let mut stop_poll = tokio::time::interval(STOP_POLL);
     while !stop.load(Ordering::Relaxed) {
-        // `VideoTrack::recv` is a cancel-safe latest-frame slot, so bounding it
-        // keeps hangup prompt and lets an idle track clear the picture.
-        let frame = match tokio::time::timeout(FRAME_IDLE, track.recv()).await {
-            Ok(Some(frame)) => frame,
-            Ok(None) => break,
-            Err(_) => {
-                render.clear();
+        // Photo mode retains the last still through the capacity-aware update
+        // interval; ordinary video clears promptly when its stream goes quiet.
+        let idle = if *photo_mode.borrow() { PHOTO_FRAME_IDLE } else { FRAME_IDLE };
+        let frame = tokio::select! {
+            _ = stop_poll.tick() => {
+                if stop.load(Ordering::Relaxed) { break; }
                 continue;
             }
+            changed = photo_mode.changed() => {
+                if changed.is_err() { break; }
+                continue;
+            }
+            frame = tokio::time::timeout(idle, track.recv()) => match frame {
+                Ok(Some(frame)) => frame,
+                Ok(None) => break,
+                Err(_) => {
+                    render.clear();
+                    continue;
+                }
+            }
         };
+        *VIDEO_RENDITION.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(track.rendition());
         // Present against the audio playout clock: wait out an early frame,
         // drop one too late to show (av.rs). No audio leg = present on arrival.
         match crate::av::decide(frame.timestamp.as_micros() as u64) {
-            crate::av::Decision::Present => render.present(frame),
+            crate::av::Decision::Present => {
+                render.present(frame);
+                record_presented_frame();
+            }
             crate::av::Decision::Wait(due) => {
                 tokio::time::sleep_until(tokio::time::Instant::from_std(due)).await;
                 render.present(frame);
+                record_presented_frame();
             }
             crate::av::Decision::Drop => {}
         }

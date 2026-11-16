@@ -279,6 +279,29 @@ network-side rung mechanism, C7 (auto video-off) is one policy rule over the
 profile, C8 (jitter target) is a profile field, C9 (NWPathMonitor) is just
 another trigger.
 
+**Landed 2026-11-15 — iOS video admission ladder.** The call bar shows Off →
+Enabling → Photo updates / Active video. A request initially publishes only a
+160×284 photo rung (12 kbps). The sender adds the 240×426 (250 kbps), 480×854
+(800 kbps), and 720×1280 (2 Mbps) rungs only after two healthy photo windows
+show the delivery estimate can cover the lowest live rung with 1.5× headroom.
+The receiver starts at the smallest rendition; the existing MoQ adaptive loop
+uses delivery/goodput evidence and probes to move up or down.
+
+Enabling sends low-resolution still updates over that same H.264 path. Their
+1.5–10 s cadence follows measured headroom. A peer supporting the call-mode
+signal holds the last photo for 11 s; older peers get the compatibility cadence
+below 2 s. Two two-ended health windows must show actually presented
+photo frames and healthy audio before the UI reports Photo updates. Normal
+capture cadence starts only after the far end has selected a non-photo rung;
+Active video then requires two windows with at least 30 presented frames per
+2.5 s. Two degraded active windows step back to Photo updates. Either leg's
+mic-capture padding above 4,800 samples or any received-audio gap over 100 ms
+pauses all visual media immediately. Missing or old-peer telemetry cannot
+promote to continuous video. The ladder is best effort, not a
+FaceTime-performance guarantee; real-device calibration remains necessary.
+
+**Continuation:** Track results in [epic #208](https://github.com/donpark/idfon/issues/208). Phase 0 (implementation and local builds) is complete; Phase 1 requires both phones on the updated local build and covers both directions, Wi-Fi/cellular paths, camera toggles, repeat calls, and two-ended audio/video health. Phases 2–5 cover threshold calibration, old/new-peer compatibility, visual-quality review, and a separately approved release decision. No device call or TestFlight upload has been done for this ladder.
+
 ### B2.1 Tie-in: LL-HLS (soon to come)
 
 The dynamic profile work is deliberately transport-neutral because LL-HLS

@@ -28,6 +28,9 @@ use idfon_media::health::{
 pub const HEALTH_ALPN: &[u8] = b"idfon-health/1";
 
 static SIGNALS: Mutex<Option<watch::Receiver<NetworkSignals>>> = Mutex::new(None);
+/// Prefer the dedicated video subscription when measuring video admission;
+/// the parallel audio subscription can otherwise overwrite its signals.
+static VIDEO_SIGNALS: Mutex<Option<watch::Receiver<NetworkSignals>>> = Mutex::new(None);
 static CHANNELS: AtomicU64 = AtomicU64::new(1);
 /// Routers serving [`HEALTH_ALPN`], one per session endpoint. A call runs
 /// two endpoints in one process (publish and subscribe legs); each keeps its
@@ -64,6 +67,31 @@ pub(crate) fn attach(live: &Live, conn: &Connection, signals: watch::Receiver<Ne
     start_call_sampling();
 }
 
+/// Attach the video leg separately so an audio resubscribe cannot replace the
+/// goodput source that gates video admission.
+pub(crate) fn attach_video(
+    live: &Live,
+    conn: &Connection,
+    signals: watch::Receiver<NetworkSignals>,
+) {
+    attach(live, conn, signals.clone());
+    *VIDEO_SIGNALS.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(signals);
+}
+
+fn current_signals() -> Option<watch::Receiver<NetworkSignals>> {
+    if let Some(signals) = VIDEO_SIGNALS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone()
+    {
+        return Some(signals);
+    }
+    SIGNALS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone()
+}
+
 /// The live session's channel count, for the mono/stereo tips.
 pub(crate) fn set_channels(channels: u64) {
     CHANNELS.store(channels.max(1), Ordering::Relaxed);
@@ -76,6 +104,7 @@ fn take_sample(signals: &watch::Receiver<NetworkSignals>) -> Sample {
         min_rtt_ms: signals.min_rtt.as_millis() as u64,
         loss_pct: signals.loss_rate * 100.0,
         goodput_kbps: signals.goodput_bps.map(|bps| bps / 1_000),
+        delivery_bps: signals.delivery_bps,
     }
 }
 
@@ -96,9 +125,29 @@ struct CallSampler {
     audio: std::sync::Arc<Mutex<AudioArrival>>,
     video_seen: std::sync::Arc<AtomicBool>,
     underruns_at_start: u64,
+    video_frames_at_start: u64,
 }
 
 static CALL: Mutex<Option<CallSampler>> = Mutex::new(None);
+
+/// Snapshot decoded-audio gap counters for the bounded health-check window.
+fn audio_arrival_snapshot() -> Option<AudioArrival> {
+    let audio = CALL
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .as_ref()?
+        .audio
+        .clone();
+    let snapshot = *audio.lock().unwrap_or_else(|poison| poison.into_inner());
+    Some(snapshot)
+}
+
+fn audio_window_counts(before: Option<AudioArrival>) -> (u64, u64) {
+    match (before, audio_arrival_snapshot()) {
+        (Some(before), Some(after)) => after.window_counts_since(&before),
+        _ => (0, 0),
+    }
+}
 
 /// The attached connection's selected path: id and relay flag.
 /// The attached connection's selected path: id, relay flag, and the addresses
@@ -160,6 +209,7 @@ fn start_call_sampling() {
     let last_path = std::sync::Arc::new(Mutex::new(None));
     let audio = std::sync::Arc::new(Mutex::new(AudioArrival::new()));
     let video_seen = std::sync::Arc::new(AtomicBool::new(false));
+    let video_frames_at_start = crate::video::frames_presented();
     let thread_stop = stop.clone();
     let thread_timeline = timeline.clone();
     let thread_switches = switches.clone();
@@ -171,11 +221,7 @@ fn start_call_sampling() {
             std::thread::sleep(Duration::from_millis(500));
             // Sources are re-read each tick: a return-leg re-invite swaps the
             // subscription (and with it SIGNALS/CONN) mid-call.
-            let Some(signals) = SIGNALS
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
-                .clone()
-            else {
+            let Some(signals) = current_signals() else {
                 continue;
             };
             let sample = take_sample(&signals);
@@ -216,6 +262,7 @@ fn start_call_sampling() {
                     min_rtt_ms: sample.min_rtt_ms,
                     loss_pct: sample.loss_pct,
                     goodput_kbps: sample.goodput_kbps,
+                    delivery_bps: sample.delivery_bps,
                     relay,
                 });
         }
@@ -232,6 +279,7 @@ fn start_call_sampling() {
         audio,
         video_seen,
         underruns_at_start: crate::media::underruns(),
+        video_frames_at_start,
     });
 }
 
@@ -266,6 +314,7 @@ fn build_record(call: &CallSampler) -> CallRecord {
             min_rtt_ms: p.min_rtt_ms,
             loss_pct: p.loss_pct,
             goodput_kbps: p.goodput_kbps,
+            delivery_bps: p.delivery_bps,
         })
         .collect();
     let context = Context {
@@ -277,12 +326,23 @@ fn build_record(call: &CallSampler) -> CallRecord {
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
         .stats(underruns);
+    let video_frames = crate::video::frames_presented().saturating_sub(call.video_frames_at_start);
+    let mut leg = Leg::fold_with_media(
+        &samples,
+        underruns,
+        audio.stalls_over_100ms,
+        audio.missing_frames,
+        video_frames,
+    );
+    leg.video_rendition = crate::video::current_rendition();
+    leg.video_frame_age_ms = crate::video::last_frame_age_ms();
+    let report = Report::one_sided(leg, context);
     CallRecord {
         started_ms: call.started_wall_ms,
         duration_ms: call.started.elapsed().as_millis() as u64,
         context,
         audio,
-        report: Report::one_sided(Leg::fold(&samples, underruns), context),
+        report,
         timeline: decimate(&points, TIMELINE_CAP),
         path_switches: call
             .switches
@@ -304,6 +364,7 @@ pub(crate) fn finish_call_sampling() {
     tracing::info!(target: "quality", "per-call record: {json}");
     eprintln!("[health] per-call record: {json}");
     *LAST_REPORT.lock().unwrap_or_else(|poison| poison.into_inner()) = json;
+    *VIDEO_SIGNALS.lock().unwrap_or_else(|poison| poison.into_inner()) = None;
 }
 
 /// The running call's record so far (`idfon_media::health::CallRecord`), read
@@ -361,22 +422,25 @@ impl ProtocolHandler for HealthProtocol {
 
 /// Sample this endpoint's downlink over `window`, the responder half.
 async fn sample_leg(window: Duration) -> Leg {
-    let Some(signals) = SIGNALS
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .clone()
-    else {
+    let Some(signals) = current_signals() else {
         return Leg::default();
     };
     let start = Instant::now();
     let underruns_at_start = crate::media::underruns();
+    let video_frames_at_start = crate::video::frames_presented();
+    let audio_at_start = audio_arrival_snapshot();
     let mut samples = Vec::new();
     while start.elapsed() < window {
         tokio::time::sleep(Duration::from_millis(250).min(window)).await;
         samples.push(take_sample(&signals));
     }
     let underruns = crate::media::underruns().saturating_sub(underruns_at_start);
-    Leg::fold(&samples, underruns)
+    let video_frames = crate::video::frames_presented().saturating_sub(video_frames_at_start);
+    let (stalls, missing) = audio_window_counts(audio_at_start);
+    let mut leg = Leg::fold_with_media(&samples, underruns, stalls, missing, video_frames);
+    leg.video_rendition = crate::video::current_rendition();
+    leg.video_frame_age_ms = crate::video::last_frame_age_ms();
+    leg
 }
 
 /// Ask the far end for its leg over the health ALPN, on the session endpoint.
@@ -459,11 +523,7 @@ fn run_check(
     duration_ms: u64,
     remote: Option<(Endpoint, EndpointAddr)>,
 ) -> u8 {
-    let Some(signals) = SIGNALS
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .clone()
-    else {
+    let Some(signals) = current_signals() else {
         return 1;
     };
     let ctx = ctx as usize;
@@ -493,6 +553,8 @@ fn run_check(
         });
         let start = Instant::now();
         let underruns_at_start = crate::media::underruns();
+        let video_frames_at_start = crate::video::frames_presented();
+        let audio_at_start = audio_arrival_snapshot();
         let mut samples = Vec::new();
         while start.elapsed() < duration {
             std::thread::sleep(Duration::from_millis(250).min(duration));
@@ -503,7 +565,11 @@ fn run_check(
             });
         }
         let underruns = crate::media::underruns().saturating_sub(underruns_at_start);
-        let local = Leg::fold(&samples, underruns);
+        let video_frames = crate::video::frames_presented().saturating_sub(video_frames_at_start);
+        let (stalls, missing) = audio_window_counts(audio_at_start);
+        let mut local = Leg::fold_with_media(&samples, underruns, stalls, missing, video_frames);
+        local.video_rendition = crate::video::current_rendition();
+        local.video_frame_age_ms = crate::video::last_frame_age_ms();
         let context = Context {
             video_on: crate::media::video_enabled(),
             stereo: CHANNELS.load(Ordering::Relaxed) > 1,

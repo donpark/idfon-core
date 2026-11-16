@@ -19,10 +19,13 @@ pub struct Sample {
     pub loss_pct: f64,
     /// Downlink goodput in kbps, or `None` while too little arrives to measure.
     pub goodput_kbps: Option<u64>,
+    /// The publisher's current delivery-rate estimate in bits per second.
+    pub delivery_bps: Option<u64>,
 }
 
 /// What one endpoint measured over the check window.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Leg {
     /// Smallest round trip seen: the path's idle delay.
     pub rtt_ms_min: u64,
@@ -32,16 +35,52 @@ pub struct Leg {
     pub loss_pct_mean: f64,
     /// Mean downlink goodput in kbps, or `None` when never measurable.
     pub goodput_kbps_mean: Option<u64>,
-    /// Audio the local playout could not deliver in time, in samples.
+    /// Mean publisher delivery-rate estimate in bits per second.
+    pub delivery_bps_mean: Option<u64>,
+    /// Mic-capture samples the encoder had to pad during the window.
     pub audio_underrun_samples: u64,
+    /// Decoded audio arrival gaps longer than 100 ms during the window.
+    pub audio_stalls_over_100ms: u64,
+    /// Audio frames inferred missing from PTS discontinuities in the window.
+    pub audio_missing_frames: u64,
+    /// Video frames actually presented during the window.
+    pub video_frames_received: u64,
+    /// Rendition currently presented, when the shell reports one.
+    pub video_rendition: Option<String>,
+    /// Milliseconds since the receiver last presented a video frame.
+    pub video_frame_age_ms: Option<u64>,
 }
 
 impl Leg {
-    /// Fold the window's samples. `audio_underrun_samples` counts the local
-    /// playout samples lost during the same window.
+    /// Fold network samples and local audio-health deltas for one window.
     pub fn fold(samples: &[Sample], audio_underrun_samples: u64) -> Self {
+        Self::fold_with_audio(samples, audio_underrun_samples, 0, 0)
+    }
+
+    /// Fold the window's samples, including decoded audio gaps measured over
+    /// the same interval.
+    pub fn fold_with_audio(
+        samples: &[Sample],
+        audio_underrun_samples: u64,
+        audio_stalls_over_100ms: u64,
+        audio_missing_frames: u64,
+    ) -> Self {
+        Self::fold_with_media(samples, audio_underrun_samples, audio_stalls_over_100ms, audio_missing_frames, 0)
+    }
+
+    /// Fold network, audio, and presented-video measurements for one window.
+    pub fn fold_with_media(
+        samples: &[Sample],
+        audio_underrun_samples: u64,
+        audio_stalls_over_100ms: u64,
+        audio_missing_frames: u64,
+        video_frames_received: u64,
+    ) -> Self {
         let mut leg = Self {
             audio_underrun_samples,
+            audio_stalls_over_100ms,
+            audio_missing_frames,
+            video_frames_received,
             ..Self::default()
         };
         if samples.is_empty() {
@@ -53,6 +92,10 @@ impl Leg {
         let goodputs: Vec<u64> = samples.iter().filter_map(|s| s.goodput_kbps).collect();
         if !goodputs.is_empty() {
             leg.goodput_kbps_mean = Some(goodputs.iter().sum::<u64>() / goodputs.len() as u64);
+        }
+        let deliveries: Vec<u64> = samples.iter().filter_map(|s| s.delivery_bps).collect();
+        if !deliveries.is_empty() {
+            leg.delivery_bps_mean = Some(deliveries.iter().sum::<u64>() / deliveries.len() as u64);
         }
         leg
     }
@@ -130,6 +173,8 @@ pub struct NetPoint {
     pub loss_pct: f64,
     /// Downlink goodput in kbps, or `None` while too little arrives to measure.
     pub goodput_kbps: Option<u64>,
+    /// The publisher's current delivery-rate estimate in bits per second.
+    pub delivery_bps: Option<u64>,
     /// Whether the selected path is a relay path (false = direct).
     pub relay: bool,
 }
@@ -209,6 +254,14 @@ impl AudioArrival {
             last_pts_us: 0,
             last_pts_gap_us: 0,
         }
+    }
+
+    /// Counts accrued since a prior snapshot, for a bounded health-check window.
+    pub fn window_counts_since(&self, prior: &Self) -> (u64, u64) {
+        (
+            self.stalls_over_100ms.saturating_sub(prior.stalls_over_100ms),
+            self.missing_frames.saturating_sub(prior.missing_frames),
+        )
     }
 
     /// One decoded frame: `arrival_us` since subscribe start, `pts_us` on the
@@ -348,6 +401,7 @@ impl Report {
             if context.video_on
                 && (leg.loss_pct_mean >= LOSS_VIDEO_OFF_PCT
                     || leg.audio_underrun_samples > UNDERRUN_AUDIBLE
+                    || leg.audio_stalls_over_100ms > 0
                     || leg.goodput_kbps_mean.is_some_and(|k| k < GOODPUT_CRITICAL_KBPS))
             {
                 tips.push(Tip {
@@ -383,7 +437,10 @@ impl Report {
 }
 
 fn leg_verdict(leg: &Leg) -> Verdict {
-    if leg.loss_pct_mean >= LOSS_POOR_PCT || leg.audio_underrun_samples > UNDERRUN_AUDIBLE {
+    if leg.loss_pct_mean >= LOSS_POOR_PCT
+        || leg.audio_underrun_samples > UNDERRUN_AUDIBLE
+        || leg.audio_stalls_over_100ms > 0
+    {
         Verdict::Poor
     } else if leg.loss_pct_mean >= LOSS_FAIR_PCT || leg.audio_underrun_samples > 0 || queues(leg) {
         Verdict::Fair
@@ -414,6 +471,7 @@ mod tests {
             min_rtt_ms: 20,
             loss_pct,
             goodput_kbps: Some(2_000),
+            delivery_bps: Some(3_000_000),
         }
     }
 
@@ -455,6 +513,19 @@ mod tests {
     }
 
     #[test]
+    fn delivery_and_audio_window_metrics_are_folded() {
+        let leg = Leg::fold_with_media(&[sample(25, 0.0), sample(30, 0.0)], 12, 1, 2, 3);
+        assert_eq!(leg.delivery_bps_mean, Some(3_000_000));
+        assert_eq!(leg.audio_underrun_samples, 12);
+        assert_eq!(leg.audio_stalls_over_100ms, 1);
+        assert_eq!(leg.audio_missing_frames, 2);
+        assert_eq!(leg.video_frames_received, 3);
+        assert_eq!(leg.video_rendition, None);
+        assert_eq!(leg.video_frame_age_ms, None);
+        assert_eq!(Report::one_sided(leg, Context::default()).verdict, Verdict::Poor);
+    }
+
+    #[test]
     fn a_merged_check_takes_the_worse_leg_and_tips_from_both() {
         let local = Leg::fold(&[sample(25, 0.0)], 0);
         let remote = Leg::fold(&[sample(60, 4.0)], 0);
@@ -462,6 +533,30 @@ mod tests {
         assert_eq!(report.verdict, Verdict::Fair);
         assert!(report.tips.iter().any(|t| t.action == Action::TurnOffVideo));
         assert!(report.remote.is_some());
+    }
+
+    #[test]
+    fn audio_arrival_window_counts_are_deltas() {
+        let mut arrival = AudioArrival::new();
+        arrival.record(0, 0, 20_000);
+        let before = arrival;
+        arrival.record(150_000, 140_000, 20_000);
+        arrival.record(160_000, 160_000, 20_000);
+        assert_eq!(arrival.window_counts_since(&before), (1, 6));
+    }
+
+    #[test]
+    fn older_remote_leg_json_defaults_new_health_fields() {
+        let leg: Leg = serde_json::from_str(
+            r#"{"rtt_ms_min":20,"rtt_ms_max":30,"loss_pct_mean":0.0,"goodput_kbps_mean":null,"audio_underrun_samples":0}"#,
+        )
+        .unwrap();
+        assert_eq!(leg.delivery_bps_mean, None);
+        assert_eq!(leg.audio_stalls_over_100ms, 0);
+        assert_eq!(leg.audio_missing_frames, 0);
+        assert_eq!(leg.video_frames_received, 0);
+        assert_eq!(leg.video_rendition, None);
+        assert_eq!(leg.video_frame_age_ms, None);
     }
 
     #[test]
@@ -481,6 +576,7 @@ mod tests {
             min_rtt_ms: 20,
             loss_pct: 0.0,
             goodput_kbps: Some(2_000),
+            delivery_bps: Some(3_000_000),
             relay: false,
         }
     }
@@ -528,12 +624,12 @@ mod tests {
         );
         assert_eq!(
             keys(&json["report"]["local"]),
-            ["audio_underrun_samples", "goodput_kbps_mean", "loss_pct_mean", "rtt_ms_max", "rtt_ms_min"]
+            ["audio_missing_frames", "audio_stalls_over_100ms", "audio_underrun_samples", "delivery_bps_mean", "goodput_kbps_mean", "loss_pct_mean", "rtt_ms_max", "rtt_ms_min", "video_frame_age_ms", "video_frames_received", "video_rendition"]
         );
         assert_eq!(json["report"]["verdict"], "good", "verdict is a snake_case string");
         assert_eq!(
             keys(&json["timeline"][0]),
-            ["goodput_kbps", "loss_pct", "min_rtt_ms", "relay", "rtt_ms", "t_ms"]
+            ["delivery_bps", "goodput_kbps", "loss_pct", "min_rtt_ms", "relay", "rtt_ms", "t_ms"]
         );
         assert_eq!(
             keys(&json["path_switches"][0]),
