@@ -256,7 +256,9 @@ async fn video_loop(ticket: &str, render: Box<dyn VideoRender>, stop: Arc<Atomic
     // down, and the bottom shows a bad picture while it climbs. One step either
     // way from the middle lands on a useful rung, and the adaptation loop takes
     // it within a check or two. The rung to start on is a calibration value:
-    // measure what the reference client (FaceTime) opens at before tuning it.
+    // measure what the iPhone reference client (FaceTime) opens at before
+    // tuning it. The Mac FaceTime app is a separate implementation and is not
+    // the reference for an iOS ladder.
     let ranked = moq_media::adaptive::rank_renditions(broadcast.catalog().video());
     let first_rendition = ranked
         .get(ranked.len() / 2)
