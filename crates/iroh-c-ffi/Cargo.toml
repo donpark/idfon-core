@@ -50,10 +50,10 @@ n0-future = "0.3.0"
 data-encoding = "2.9.0"
 iroh-mdns-address-lookup = "0.6"
 moq-media = { git = "https://github.com/n0-computer/iroh-live", rev = "dd80d44efb587f31deed14fc11eeaa12946c9fd2", package = "moq-media", default-features = false, features = ["capture"] }
-moq-audio = { git = "https://github.com/donpark/moq", branch = "loss-recovery-release", default-features = false, features = ["aac", "capture", "playback"] }
-moq-video = { git = "https://github.com/donpark/moq", branch = "loss-recovery-release" }
-moq-net = { git = "https://github.com/donpark/moq", branch = "loss-recovery-release" }
-moq-mux = { git = "https://github.com/donpark/moq", branch = "loss-recovery-release" }
+moq-audio = { git = "https://github.com/donpark/moq", branch = "liquid-codec", default-features = false, features = ["aac", "capture", "playback"] }
+moq-video = { git = "https://github.com/donpark/moq", branch = "liquid-codec" }
+moq-net = { git = "https://github.com/donpark/moq", branch = "liquid-codec" }
+moq-mux = { git = "https://github.com/donpark/moq", branch = "liquid-codec" }
 idfon-protocol = { path = "../idfon-protocol" }
 idfon-core = { path = "../idfon-core" }
 idfon-client = { path = "../idfon-client" }

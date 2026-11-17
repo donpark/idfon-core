@@ -45,9 +45,15 @@ Our branches on `donpark/moq`:
 
 | Branch | Base | Used by |
 | --- | --- | --- |
-| `loss-recovery-release` | `origin/release` + our 2 patch commits | **idfon (this repo)** |
+| `loss-recovery-release` | `origin/release` + our 2 patch commits | idfon `main` |
+| `liquid-codec` | `loss-recovery-release` + LiquidCodec (`AudioCodec::Liquid`, `moq_audio::external`) + iOS VideoToolbox decode | **idfon branch `liquid-codec`** (idfon-home `docs/liquidcodec.md`) |
 | `loss-recovery-0.1` | `origin/main` + the same 2 patches (ported) | nothing yet — kept for the eventual move to line B |
 | `loss-recovery-0.0.23` | Frando `iroh-live-3` (the original) | nothing — frozen, rollback reference |
+
+The `liquid-codec` branch also pairs with an iroh-live fork, `donpark/iroh-live`
+branch `audio-renditions` (off the `dd80d44` pin): moq-media publishes several
+audio renditions so a subscriber can switch codecs mid-call. idfon's
+`Cargo.toml` patches every iroh-live crate to it.
 
 ## Update procedure
 
