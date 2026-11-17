@@ -242,7 +242,7 @@ public final class StreamingDecoder {
 final class Synthesizer {
     static let trim = 480
     static let tail = 960
-    private let weight: [Float]
+    private let weightT: [Float]  // hidden x 2*bins (transposed once so vDSP_mmul can be used)
     private let bias: [Float]
     private let window: [Float]
     private let windowSquared: [Float]
@@ -254,7 +254,9 @@ final class Synthesizer {
 
     init(weight: [Float], bias: [Float], trimStart: Bool = true) {
         started = !trimStart
-        self.weight = weight
+        var weightT = [Float](repeating: 0, count: weight.count)
+        vDSP_mtrans(weight, 1, &weightT, 1, vDSP_Length(LiquidCodec.hidden), vDSP_Length(2 * LiquidCodec.bins))
+        self.weightT = weightT
         self.bias = bias
         let n = LiquidCodec.nFFT
         window = (0..<n).map { 0.5 - 0.5 * cos(2 * Float.pi * Float($0) / Float(n)) }  // periodic Hann
@@ -284,10 +286,14 @@ final class Synthesizer {
         let rows = 6, n = LiquidCodec.nFFT, bins = LiquidCodec.bins, hop = LiquidCodec.hop
         // y = hidden (6x512) * W^T (512x1282) + b
         var y = [Float](repeating: 0, count: rows * 2 * bins)
-        for r in 0..<rows { for c in 0..<(2 * bins) { y[r * 2 * bins + c] = bias[c] } }
-        cblas_sgemm(
-            CblasRowMajor, CblasNoTrans, CblasTrans, Int32(rows), Int32(2 * bins), Int32(LiquidCodec.hidden), 1,
-            hidden, Int32(LiquidCodec.hidden), weight, Int32(LiquidCodec.hidden), 1, &y, Int32(2 * bins))
+        vDSP_mmul(
+            hidden, 1, weightT, 1, &y, 1, vDSP_Length(rows), vDSP_Length(2 * bins), vDSP_Length(LiquidCodec.hidden))
+        y.withUnsafeMutableBufferPointer { yp in
+            for r in 0..<rows {
+                let row = yp.baseAddress! + r * 2 * bins
+                vDSP_vadd(row, 1, bias, 1, row, 1, vDSP_Length(2 * bins))
+            }
+        }
         let length = (rows - 1) * hop + n
         var audio = [Float](repeating: 0, count: length)
         var envelope = [Float](repeating: 0, count: length)
