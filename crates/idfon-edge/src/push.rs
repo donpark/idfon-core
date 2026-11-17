@@ -483,7 +483,7 @@ impl LocalRoute for PushRoutes {
             && matches!(
                 path,
                 "/_push/register" | "/_push/unregister" | "/_push/ring" | "/_push/cancel"
-                    | "/_push/pull" | "/_push/health"
+                    | "/_push/offer" | "/_push/pull" | "/_push/health"
             )
     }
 
@@ -577,7 +577,7 @@ impl PushRoutes {
                     }
                     json(StatusCode::OK, "{}")
                 }
-                "ring" | "cancel" => {
+                "ring" | "cancel" | "offer" => {
                     let Some(call_uuid) = value.get("call_uuid").and_then(|v| v.as_str()) else {
                         return json(StatusCode::BAD_REQUEST, "call_uuid required");
                     };
@@ -588,7 +588,7 @@ impl PushRoutes {
                         .get("caller_id")
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
-                    if action == "ring" && caller_id.is_empty() {
+                    if action != "cancel" && caller_id.is_empty() {
                         return json(StatusCode::BAD_REQUEST, "caller_id required");
                     }
                     // Being a contact is the right to ring (the caller holds
@@ -606,6 +606,36 @@ impl PushRoutes {
                         if subject != caller_id {
                             return json(StatusCode::FORBIDDEN, "ticket subject mismatch");
                         }
+                    }
+                    if action == "offer" {
+                        // Push-first ring (the standard VoIP order): the caller
+                        // rang before its media was up and posts the invite
+                        // here once it exists — stored for `/_push/pull`, no
+                        // second push. A call's offer belongs to its caller.
+                        let Some(invite) = value.get("invite").and_then(|v| v.as_str()) else {
+                            return json(StatusCode::BAD_REQUEST, "invite required");
+                        };
+                        if invite.is_empty() || invite.len() > 16 * 1024 {
+                            return json(StatusCode::BAD_REQUEST, "invite invalid");
+                        }
+                        let mut offers =
+                            self.offers.lock().unwrap_or_else(|error| error.into_inner());
+                        offers.retain(|_, offer| offer.expires > Instant::now());
+                        if let Some(existing) = offers.get(call_uuid) {
+                            if existing.account != account || existing.caller_id != caller_id {
+                                return json(StatusCode::CONFLICT, "call_uuid belongs to another call");
+                            }
+                        }
+                        offers.insert(
+                            call_uuid.to_owned(),
+                            StoredOffer {
+                                account: account.to_owned(),
+                                caller_id: caller_id.to_owned(),
+                                invite: invite.to_owned(),
+                                expires: Instant::now() + OFFER_TTL,
+                            },
+                        );
+                        return json(StatusCode::OK, serde_json::json!({ "ok": true }));
                     }
                     let Some(apns) = self.apns.as_deref() else {
                         return json(StatusCode::SERVICE_UNAVAILABLE, "push not configured");
@@ -1003,6 +1033,75 @@ mod tests {
             serde_json::json!({ "call_uuid": call }),
         );
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn push_first_ring_then_offer_stores_the_invite_without_a_second_push() {
+        let key = generate_identity();
+        let account = idfon_core::peer_id(&key);
+        let apns = MockApns::new();
+        let (store, routes) = routes(Some(apns.clone()));
+        store.register(&account, "tok-offer", "com.idfon.ios.voip", None);
+        let ticket = self_ticket(&key, None, Some("2999-01-01T00:00:00Z".to_owned()));
+        let call = "33333333-3333-3333-3333-333333333333";
+
+        // Ring first, before the caller's media (and invite) exist.
+        let (status, body) = post(
+            &routes,
+            &account,
+            "/_push/ring",
+            Some(&ticket),
+            serde_json::json!({ "call_uuid": call, "caller_id": "caller" }),
+        );
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["rung"], 1);
+        let (status, _) = post(
+            &routes,
+            &account,
+            "/_push/pull",
+            Some(&ticket),
+            serde_json::json!({ "call_uuid": call }),
+        );
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // The invite follows; the woken callee can pull it, and no second
+        // push went out.
+        let (status, _) = post(
+            &routes,
+            &account,
+            "/_push/offer",
+            Some(&ticket),
+            serde_json::json!({
+                "call_uuid": call,
+                "caller_id": "caller",
+                "invite": "IDFON-LIVE/1\naction=start\nticket=t2"
+            }),
+        );
+        assert_eq!(status, StatusCode::OK);
+        let (status, body) = post(
+            &routes,
+            &account,
+            "/_push/pull",
+            Some(&ticket),
+            serde_json::json!({ "call_uuid": call }),
+        );
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["invite"], "IDFON-LIVE/1\naction=start\nticket=t2");
+        assert_eq!(apns.sent.lock().unwrap().len(), 1);
+
+        // Another caller cannot overwrite this call's offer.
+        let (status, _) = post(
+            &routes,
+            &account,
+            "/_push/offer",
+            Some(&ticket),
+            serde_json::json!({
+                "call_uuid": call,
+                "caller_id": "someone-else",
+                "invite": "IDFON-LIVE/1\naction=start\nticket=evil"
+            }),
+        );
+        assert_eq!(status, StatusCode::CONFLICT);
     }
 
     struct MockApns {
