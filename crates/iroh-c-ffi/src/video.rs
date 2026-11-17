@@ -22,6 +22,74 @@ static VIDEO_ERROR: OnceLock<Mutex<String>> = OnceLock::new();
 static VIDEO_FRAMES_PRESENTED: AtomicU64 = AtomicU64::new(0);
 static VIDEO_LAST_FRAME_AT: Mutex<Option<Instant>> = Mutex::new(None);
 static VIDEO_RENDITION: Mutex<Option<String>> = Mutex::new(None);
+/// What the call's status line shows about incoming video: the decoder in use, the last frame's size, and the
+/// presented frame rate over the last second.
+static VIDEO_INFO: Mutex<VideoInfo> = Mutex::new(VideoInfo::new());
+
+struct VideoInfo {
+    rendition: Option<String>,
+    bitrate: Option<u64>,
+    decoder: Option<String>,
+    size: Option<(u32, u32)>,
+    window_start: Option<Instant>,
+    window_frames: u32,
+    fps: Option<f32>,
+}
+
+impl VideoInfo {
+    const fn new() -> Self {
+        Self {
+            rendition: None,
+            bitrate: None,
+            decoder: None,
+            size: None,
+            window_start: None,
+            window_frames: 0,
+            fps: None,
+        }
+    }
+
+    fn frame(&mut self, size: (u32, u32)) {
+        self.size = Some(size);
+        let now = Instant::now();
+        let start = *self.window_start.get_or_insert(now);
+        self.window_frames += 1;
+        let elapsed = now.duration_since(start).as_secs_f32();
+        if elapsed >= 1.0 {
+            self.fps = Some(self.window_frames as f32 / elapsed);
+            self.window_start = Some(now);
+            self.window_frames = 0;
+        }
+    }
+}
+
+/// Incoming video for the status line, while frames are arriving.
+pub(crate) struct IncomingVideo {
+    pub rendition: Option<String>,
+    pub width: u32,
+    pub height: u32,
+    pub fps: Option<f32>,
+    pub hardware: Option<bool>,
+    pub bitrate: Option<u64>,
+}
+
+pub(crate) fn incoming_video() -> Option<IncomingVideo> {
+    if last_frame_age_ms().is_none_or(|age| age > 2_000) {
+        return None;
+    }
+    let info = VIDEO_INFO
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let (width, height) = info.size?;
+    Some(IncomingVideo {
+        rendition: info.rendition.clone(),
+        width,
+        height,
+        fps: info.fps,
+        hardware: info.decoder.as_deref().map(|name| name != "openh264"),
+        bitrate: info.bitrate,
+    })
+}
 
 pub(crate) fn frames_presented() -> u64 {
     VIDEO_FRAMES_PRESENTED.load(Ordering::Relaxed)
@@ -42,7 +110,11 @@ pub(crate) fn last_frame_age_ms() -> Option<u64> {
         .map(|last| last.elapsed().as_millis() as u64)
 }
 
-fn record_presented_frame() {
+fn record_presented_frame(size: (u32, u32)) {
+    VIDEO_INFO
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .frame(size);
     VIDEO_FRAMES_PRESENTED.fetch_add(1, Ordering::Relaxed);
     *VIDEO_LAST_FRAME_AT.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(Instant::now());
 }
@@ -299,18 +371,36 @@ async fn video_loop(ticket: &str, render: Box<dyn VideoRender>, stop: Arc<Atomic
                 }
             }
         };
-        *VIDEO_RENDITION.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(track.rendition());
+        *VIDEO_RENDITION
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(track.rendition());
+        {
+            let rendition = track.rendition();
+            let mut info = VIDEO_INFO
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if info.rendition.as_deref() != Some(rendition.as_str()) {
+                info.bitrate = broadcast
+                    .catalog()
+                    .video()
+                    .get(&rendition)
+                    .and_then(|config| config.bitrate);
+                info.rendition = Some(rendition);
+            }
+            info.decoder = Some(track.decoder());
+        }
+        let size = (frame.surface.width(), frame.surface.height());
         // Present against the audio playout clock: wait out an early frame,
         // drop one too late to show (av.rs). No audio leg = present on arrival.
         match crate::av::decide(frame.timestamp.as_micros() as u64) {
             crate::av::Decision::Present => {
                 render.present(frame);
-                record_presented_frame();
+                record_presented_frame(size);
             }
             crate::av::Decision::Wait(due) => {
                 tokio::time::sleep_until(tokio::time::Instant::from_std(due)).await;
                 render.present(frame);
-                record_presented_frame();
+                record_presented_frame(size);
             }
             crate::av::Decision::Drop => {}
         }

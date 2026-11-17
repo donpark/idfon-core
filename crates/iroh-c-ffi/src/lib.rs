@@ -1,4 +1,5 @@
 pub mod addr;
+mod audio_rendition;
 pub mod abr;
 pub mod av;
 pub mod health;
@@ -7,6 +8,7 @@ pub mod client;
 pub mod daemon;
 pub mod endpoint;
 pub mod key;
+pub mod liquid;
 pub mod media;
 pub mod stream;
 pub mod util;

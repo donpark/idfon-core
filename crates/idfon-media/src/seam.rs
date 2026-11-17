@@ -90,6 +90,10 @@ struct PacedState {
     /// Adaptive prebuffer target in microseconds: the write side computes it,
     /// the pacing thread reads it at each (re)prebuffer.
     target_us: std::sync::atomic::AtomicU64,
+    /// Codec floor under the adaptive target, in microseconds: a codec whose
+    /// packets carry more than one chunk (LiquidCodec: 80 ms) must keep at
+    /// least a packet plus slack queued, or playout runs dry between packets.
+    floor_us: std::sync::atomic::AtomicU64,
     emit: Box<dyn Fn(&[u8]) + Send + Sync>,
 }
 
@@ -173,6 +177,7 @@ impl PacedPlayback {
             volume: std::sync::atomic::AtomicU32::new(1f32.to_bits()),
             jitter: std::sync::Mutex::new(ArrivalJitter::new()),
             target_us: std::sync::atomic::AtomicU64::new(PLAYOUT_TARGET.as_micros() as u64),
+            floor_us: std::sync::atomic::AtomicU64::new(0),
             emit,
         });
         let thread_shared = shared.clone();
@@ -183,6 +188,24 @@ impl PacedPlayback {
             shared,
             thread: Some(thread),
         }
+    }
+
+    /// Keep at least `floor` queued before (re)starting playout, whatever the
+    /// measured jitter (see [`PacedState::floor_us`]). Takes effect at once.
+    pub fn set_target_floor(&self, floor: Duration) {
+        let floor_us = floor.as_micros().min(u128::from(u64::MAX)) as u64;
+        self.shared
+            .floor_us
+            .store(floor_us, std::sync::atomic::Ordering::Relaxed);
+        self.shared
+            .target_us
+            .fetch_max(floor_us, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// A handle that changes the floor later (a mid-call codec switch), after the
+    /// playback has been boxed.
+    pub fn floor_handle(&self) -> PlayoutFloor {
+        PlayoutFloor(self.shared.clone())
     }
 
     /// Interleaved f32 PCM, matching [`AudioInput::format`] (the only layout
@@ -248,6 +271,22 @@ impl PacedPlayback {
     }
 }
 
+/// See [`PacedPlayback::floor_handle`].
+pub struct PlayoutFloor(Arc<PacedState>);
+
+impl PlayoutFloor {
+    /// Same as [`PacedPlayback::set_target_floor`]; `Duration::ZERO` removes the floor.
+    pub fn set(&self, floor: Duration) {
+        let floor_us = floor.as_micros().min(u128::from(u64::MAX)) as u64;
+        self.0
+            .floor_us
+            .store(floor_us, std::sync::atomic::Ordering::Relaxed);
+        self.0
+            .target_us
+            .fetch_max(floor_us, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 impl Drop for PacedPlayback {
     fn drop(&mut self) {
         self.shared
@@ -269,10 +308,14 @@ impl AudioPlayback for PacedPlayback {
         {
             let mut jitter = self.shared.jitter.lock().unwrap();
             jitter.record(std::time::Instant::now(), pts_us);
-            let target = jitter.target();
+            let target = (jitter.target().as_micros() as u64).max(
+                self.shared
+                    .floor_us
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            );
             self.shared
                 .target_us
-                .store(target.as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+                .store(target, std::sync::atomic::Ordering::Relaxed);
         }
         let mut queue = self.shared.queue.lock().unwrap();
         queue.extend(pcm.iter().copied());

@@ -172,7 +172,160 @@ fn call_options(
     options.settings.fec = codec == AudioCodec::Opus && mode == redundancy::INBAND;
     options.settings.dred = (codec == AudioCodec::Opus && mode == redundancy::DRED).then_some(DRED_COVER);
     options.parity_window = (mode == redundancy::TRANSPORT).then_some(PARITY_WINDOW);
+    if codec == AudioCodec::Liquid {
+        // Fixed 80 ms frames; the codec carries its own redundancy, not the encoder knobs.
+        options.settings.frame_duration = std::time::Duration::from_millis(80);
+    }
     Ok(options)
+}
+
+/// The codec the call's invite names (`audio_codec=`): the rendition a subscriber prefers when the
+/// publisher offers several. Set by the shell before subscribing; cleared on unsubscribe.
+static AUDIO_PREFERENCE: Mutex<Option<String>> = Mutex::new(None);
+
+/// Prefer `codec` (`liquid`, `opus`, ...; empty clears) among a publisher's audio renditions for the
+/// next and current subscription. Returns 0.
+#[ffi_export]
+pub fn media_live_set_audio_preference(codec: char_p::Ref<'_>) -> u8 {
+    let codec = codec.to_str().trim();
+    *AUDIO_PREFERENCE
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) =
+        (!codec.is_empty()).then(|| codec.to_string());
+    0
+}
+
+/// The catalog's audio renditions, for crate::audio_rendition.
+fn audio_renditions(
+    catalog: &moq_media::subscribe::CatalogSnapshot,
+) -> Vec<crate::audio_rendition::Rendition> {
+    catalog
+        .audio()
+        .iter()
+        .map(|(name, config)| crate::audio_rendition::Rendition {
+            name: name.clone(),
+            codec: config.codec.to_string(),
+            bitrate: config.bitrate,
+        })
+        .collect()
+}
+
+/// The codec of the audio track being decoded, for the call's status line.
+static INCOMING_AUDIO_CODEC: Mutex<Option<String>> = Mutex::new(None);
+
+/// A human status for the live call, for checking the adaptive heuristics rather than reading IDs: one line
+/// for the incoming video (rendition, resolution, frame rate, hardware or software decode, the rendition's
+/// bitrate) and one for the call (audio codecs each way, direct or relay, round trip, loss, the delivery-rate
+/// estimate adaptation acts on). Empty when nothing is live. E.g.
+/// `high 720p · 30 fps · HW decode · 1.5 Mbps` / `LiquidCodec · direct · 10 ms · 0% loss · 4.8 Mbps avail`.
+#[ffi_export]
+pub fn media_live_summary() -> char_p::Box {
+    fn rate(bps: u64) -> String {
+        if bps >= 1_000_000 {
+            format!("{:.1} Mbps", bps as f64 / 1e6)
+        } else {
+            format!("{} kbps", (bps + 500) / 1_000)
+        }
+    }
+    // Line 1: the incoming video — what the adaptive ladder picked and how it is arriving.
+    let mut video: Vec<String> = Vec::new();
+    if let Some(v) = crate::video::incoming_video() {
+        let p = format!("{}p", v.width.min(v.height));
+        video.push(match v.rendition {
+            Some(name) => format!("{name} {p}"),
+            None => p,
+        });
+        if let Some(fps) = v.fps {
+            video.push(format!("{} fps", fps.round() as u32));
+        }
+        match v.hardware {
+            Some(true) => video.push("HW decode".into()),
+            Some(false) => video.push("SW decode".into()),
+            None => {}
+        }
+        if let Some(bps) = v.bitrate {
+            video.push(rate(bps));
+        }
+    }
+    // Line 2: audio codecs each way, then the path and the signals adaptation acts on.
+    let mut call: Vec<String> = Vec::new();
+    let codec_name = |codec: &str| match codec {
+        "liquid" => "LiquidCodec".to_string(),
+        "opus" => "Opus".to_string(),
+        "pcm" => "PCM".to_string(),
+        other => other.to_string(),
+    };
+    let incoming = INCOMING_AUDIO_CODEC
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone();
+    let outgoing = LIVE_CONFIG
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .as_ref()
+        .map(|c| c.4.to_string());
+    match (incoming, outgoing) {
+        (Some(i), Some(o)) if i == o => call.push(codec_name(&i)),
+        (Some(i), Some(o)) => call.push(format!("{} ↓ {} ↑", codec_name(&i), codec_name(&o))),
+        (Some(i), None) => call.push(codec_name(&i)),
+        (None, Some(o)) => call.push(codec_name(&o)),
+        (None, None) => {}
+    }
+    if let Some(net) = crate::health::network_summary() {
+        call.push(if net.relay {
+            "relay".into()
+        } else {
+            "direct".into()
+        });
+        if let Some(rtt) = net.rtt_ms {
+            call.push(format!("{rtt} ms"));
+        }
+        call.push(format!("{:.0}% loss", net.loss_pct));
+        if let Some(bps) = net.delivery_bps {
+            call.push(format!("{} avail", rate(bps)));
+        }
+    }
+    [video.join(" · "), call.join(" · ")]
+        .into_iter()
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .try_into()
+        .unwrap()
+}
+
+/// Playout floor for LiquidCodec tracks: one 80 ms packet plus 40 ms of arrival slack.
+const LIQUID_PLAYOUT_FLOOR_MS: u64 = 120;
+
+/// The call's audio renditions: the chosen codec first, plus an alternate so each subscriber can pick
+/// (and switch mid-call) by what it can decode and what its network affords — LiquidCodec's ~3.4 kbps
+/// next to Opus, either way round. The alternate needs nothing new from the shell: the encoder resamples
+/// and remixes the one pushed source. Voice-agent PCM stays single.
+fn call_renditions(
+    codec: AudioCodec,
+    sample_rate: u32,
+    channels: u32,
+    video: bool,
+) -> anyhow::Result<Vec<AudioOptions>> {
+    let mut renditions = vec![call_options(codec, sample_rate, channels, video)?];
+    match codec {
+        AudioCodec::Liquid => renditions.push(call_options(
+            AudioCodec::Opus,
+            sample_rate,
+            channels,
+            video,
+        )?),
+        AudioCodec::Opus if moq_audio::external::liquid_available() => {
+            renditions.push(call_options(
+                AudioCodec::Liquid,
+                moq_audio::external::liquid::SAMPLE_RATE,
+                1,
+                video,
+            )?)
+        }
+        _ => {}
+    }
+    Ok(renditions)
 }
 
 /// Stored as `usize` so the function pointer survives a static `Mutex`.
@@ -553,15 +706,23 @@ fn start_live(
             let broadcast = live.publish(&name)?;
             tracing::info!(target: "idfon.media", "live broadcast created");
             if audio {
-                let mut options = call_options(codec, sample_rate, channels, video)?;
-                // Audio ABR (docs/media-adaptation.md §C5): drive the encoder
-                // from the connection's send estimate — the same congestion-
-                // controller rate `delivery_bps` carries to the peer — clamped
-                // to the voice band. The control rides Options to the encoder
-                // the publish task owns.
-                if codec == AudioCodec::Opus {
-                    let total = options.settings.bitrate.as_ref().map_or(0, |rate| rate.as_bps());
-                    options.bitrate_control = crate::abr::start(&live, total, channels);
+                let mut renditions = call_renditions(codec, sample_rate, channels, video)?;
+                // Audio ABR (docs/media-adaptation.md §C5): drive the Opus
+                // encoder from the connection's send estimate — the same
+                // congestion-controller rate `delivery_bps` carries to the
+                // peer — clamped to the voice band. The control rides Options
+                // to the encoder the publish task owns.
+                if let Some(opus) = renditions
+                    .iter_mut()
+                    .find(|o| o.settings.codec == AudioCodec::Opus)
+                {
+                    let total = opus
+                        .settings
+                        .bitrate
+                        .as_ref()
+                        .map_or(0, |rate| rate.as_bps());
+                    let opus_channels = opus.settings.layout.channels();
+                    opus.bitrate_control = crate::abr::start(&live, total, opus_channels);
                 }
                 // Capture device is the default live source; shell-pushed PCM
                 // remains available through `media_audio_push_samples`.
@@ -577,7 +738,9 @@ fn start_live(
                         INPUT_DEVICE.lock().unwrap().clone(),
                     ))
                 };
-                broadcast.audio().set_with(capture.into_source(), options);
+                broadcast
+                    .audio()
+                    .set_renditions(capture.into_source(), renditions)?;
             }
             if video {
                 VIDEO_ENABLED.store(true, Ordering::Relaxed);
@@ -686,6 +849,7 @@ fn supported_audio_profile(codec: AudioCodec, sample_rate: u32) -> bool {
         (AudioCodec::Opus, 48_000)
             | (AudioCodec::Opus, 24_000)
             | (AudioCodec::Pcm, 24_000)
+            | (AudioCodec::Liquid, 24_000)
     )
 }
 
@@ -701,6 +865,7 @@ pub fn media_live_start_with_profile(
     let codec = match codec.to_str() {
         "opus" => AudioCodec::Opus,
         "pcm" => AudioCodec::Pcm,
+        "liquid" => AudioCodec::Liquid,
         other => {
             *LAST_ERROR.lock().unwrap() = Some(format!("unknown live audio codec: {other}"));
             return String::new().try_into().unwrap();
@@ -719,6 +884,16 @@ pub fn media_live_start_with_profile(
     }
     if codec == AudioCodec::Pcm && channels != 1 {
         *LAST_ERROR.lock().unwrap() = Some("pcm24k voice-agent calls are mono".into());
+        return String::new().try_into().unwrap();
+    }
+    if codec == AudioCodec::Liquid && channels != 1 {
+        *LAST_ERROR.lock().unwrap() = Some("liquid calls are mono".into());
+        return String::new().try_into().unwrap();
+    }
+    if codec == AudioCodec::Liquid && !moq_audio::external::liquid_available() {
+        *LAST_ERROR.lock().unwrap() = Some(
+            "liquid codec unavailable: no implementation registered (media_liquid_register)".into(),
+        );
         return String::new().try_into().unwrap();
     }
     let source = source.to_str();
@@ -1287,19 +1462,47 @@ async fn subscribe_decode_once(
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         let catalog = broadcast.catalog();
-        let Some(name) = catalog.first_audio() else {
-            anyhow::bail!("broadcast has no audio track");
+        // A publisher may offer the same audio in several codecs (LiquidCodec + Opus); the subscriber
+        // picks, and can switch mid-call (crate::audio_rendition).
+        let preferred = AUDIO_PREFERENCE
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        let mut policy = crate::audio_rendition::Policy::new();
+        let renditions = audio_renditions(&catalog);
+        let Some(chosen) = policy
+            .choose(
+                &renditions,
+                preferred.as_deref(),
+                crate::audio_rendition::decodable,
+            )
+            .cloned()
+        else {
+            anyhow::bail!("broadcast has no audio track this side can decode");
         };
         let config = catalog
             .audio()
-            .get(name)
-            .ok_or_else(|| anyhow::anyhow!("audio catalog missing"))?;
+            .get(&chosen.name)
+            .ok_or_else(|| anyhow::anyhow!("audio catalog missing"))?
+            .clone();
+        let name = chosen.name.clone();
+        let mut current = chosen;
+        let liquid_track = current.codec == "liquid";
+        *INCOMING_AUDIO_CODEC
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(current.codec.clone());
         let mut output = moq_audio::decode::Output::default();
         output.format = Format::F32;
         output.sample_rate = Some(48_000);
         // Native channel count from the catalog (mono or stereo): the shell
-        // renders stereo natively — old mono publishers decode as mono.
-        output.layout = None;
+        // renders stereo natively — old mono publishers decode as mono. With several
+        // renditions the layout is pinned to the first one's, so a switch keeps feeding
+        // playback the same channel count (moq-audio remixes).
+        output.layout = if renditions.len() > 1 {
+            moq_audio::Layout::from_channels(config.channel_count).ok()
+        } else {
+            None
+        };
         let mut decode = moq_audio::decode::Options::default();
         decode.output = output;
         // Keep a bounded playout budget so a late group is not discarded
@@ -1322,7 +1525,8 @@ async fn subscribe_decode_once(
                 .clamp(120, 1_000),
         );
         let mut consumer =
-            moq_audio::decode::Consumer::new(broadcast.consumer(), config, name, decode).await?;
+            moq_audio::decode::Consumer::new(broadcast.consumer(), &config, name, decode.clone())
+                .await?;
         let input = AudioInput {
             format: Format::F32,
             sample_rate: 48_000,
@@ -1333,20 +1537,35 @@ async fn subscribe_decode_once(
         // Shell playback renders remote call audio on the app's playback bus,
         // which is the VoiceProcessingIO echo reference (docs/audio-media.md);
         // the bundled device engine is the fallback when no callback is set.
+        // LiquidCodec packets carry 80 ms each (and recovering a lost one needs
+        // the next): hold a packet plus slack, not Opus's 60 ms.
+        let playout_floor =
+            liquid_track.then_some(std::time::Duration::from_millis(LIQUID_PLAYOUT_FLOOR_MS));
+        let mut floor_handle: Option<idfon_media::seam::PlayoutFloor> = None;
         let mut playback: Box<dyn AudioPlayback> = match *AUDIO_PLAYBACK_CB.lock().unwrap() {
-            Some((ctx, cb)) => Box::new(PacedPlayback::new(input, Box::new(move |pcm| {
-                // SAFETY: the shell copies before returning (documented contract).
-                unsafe {
-                    (cb)(
-                        ctx as *const c_void,
-                        pcm.as_ptr(),
-                        pcm.len(),
-                        input.sample_rate,
-                        input.channels,
-                        0,
-                    )
+            Some((ctx, cb)) => {
+                let paced = PacedPlayback::new(
+                    input,
+                    Box::new(move |pcm| {
+                        // SAFETY: the shell copies before returning (documented contract).
+                        unsafe {
+                            (cb)(
+                                ctx as *const c_void,
+                                pcm.as_ptr(),
+                                pcm.len(),
+                                input.sample_rate,
+                                input.channels,
+                                0,
+                            )
+                        }
+                    }),
+                );
+                if let Some(floor) = playout_floor {
+                    paced.set_target_floor(floor);
                 }
-            }))),
+                floor_handle = Some(paced.floor_handle());
+                Box::new(paced)
+            }
             None => {
                 let device = OUTPUT_DEVICE.lock().unwrap().clone();
                 let device_playback = DevicePlayback::open(device, input).await?;
@@ -1364,8 +1583,12 @@ async fn subscribe_decode_once(
         crate::av::reset();
         // Match PacedPlayback's target so startup buffering is one hold, not
         // a second delay before the jitter buffer can start draining.
-        const STARTUP_PREBUFFER_FRAMES: usize =
-            (idfon_media::seam::PLAYOUT_TARGET_MS as usize * 48_000) / 1_000;
+        let startup_prebuffer_frames: usize = (playout_floor
+            .map_or(idfon_media::seam::PLAYOUT_TARGET_MS, |floor| {
+                floor.as_millis() as u64
+            }) as usize
+            * 48_000)
+            / 1_000;
         let mut startup = Vec::new();
         let mut started = false;
         let mut last_arrival = None;
@@ -1376,6 +1599,18 @@ async fn subscribe_decode_once(
         // died without SUBSCRIBE_END, and consumer.read() then never returns
         // — neither frames nor a track end). Treat it like an early end.
         let mut last_frame = std::time::Instant::now();
+        let mut last_choice = std::time::Instant::now();
+        type PendingSwitch = std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = anyhow::Result<(
+                            crate::audio_rendition::Rendition,
+                            moq_audio::decode::Consumer,
+                        )>,
+                    > + Send,
+            >,
+        >;
+        let mut pending_switch: Option<PendingSwitch> = None;
         loop {
             if stop.load(Ordering::Relaxed) {
                 if !started && !startup.is_empty() {
@@ -1405,14 +1640,98 @@ async fn subscribe_decode_once(
                 set_sub_state(SUB_RECONNECTING);
                 return Err(anyhow::anyhow!(SubscribeEndError::Transient));
             }
-            let frame = match tokio::time::timeout(
-                std::time::Duration::from_millis(200),
-                consumer.read(),
-            )
-            .await
+            // Rendition choice: re-checked every 500 ms against the catalog, what this side can
+            // decode now, and the network. A change opens the new track alongside the old one.
+            if pending_switch.is_none()
+                && last_choice.elapsed() >= std::time::Duration::from_millis(500)
             {
-                Ok(frame) => frame?,
-                Err(_) => continue,
+                last_choice = std::time::Instant::now();
+                {
+                    let signals = subscription.signals().borrow();
+                    policy.sample(last_choice, signals.loss_rate, signals.delivery_bps);
+                }
+                let catalog = broadcast.catalog();
+                let renditions = audio_renditions(&catalog);
+                let want = policy
+                    .choose(
+                        &renditions,
+                        preferred.as_deref(),
+                        crate::audio_rendition::decodable,
+                    )
+                    .filter(|want| want.name != current.name)
+                    .cloned();
+                let want_config = want
+                    .as_ref()
+                    .and_then(|want| catalog.audio().get(&want.name).cloned());
+                if let (Some(want), Some(want_config)) = (want, want_config) {
+                    tracing::info!(target: "idfon.media", from = %current.codec, to = %want.codec,
+                        constrained = policy.constrained(), "audio rendition switch: opening");
+                    let bc = broadcast.consumer().clone();
+                    let decode = decode.clone();
+                    pending_switch = Some(Box::pin(async move {
+                        let consumer = moq_audio::decode::Consumer::new(
+                            &bc,
+                            &want_config,
+                            want.name.clone(),
+                            decode,
+                        )
+                        .await?;
+                        anyhow::Ok((want, consumer))
+                    }));
+                }
+            }
+            let frame = tokio::select! {
+                ready = async { pending_switch.as_mut().expect("guarded").await }, if pending_switch.is_some() => {
+                    pending_switch = None;
+                    match ready {
+                        Ok((want, mut next)) => {
+                            // Cut over at the stream position: drop what the old track already
+                            // played, trim an overlapping frame, accept a small gap.
+                            match tokio::time::timeout(std::time::Duration::from_millis(1_000), next.read()).await {
+                                Ok(Ok(Some(mut first))) => {
+                                    if let Some(expected) = expected_pts_us {
+                                        let pts = first.timestamp.as_micros();
+                                        if pts < expected {
+                                            let skip = ((expected - pts) * 48_000 / 1_000_000) as usize
+                                                * input.channels as usize * 4;
+                                            first.data = first.data.slice(skip.min(first.data.len())..);
+                                            first.timestamp = moq_net::Timestamp::from_micros(expected as u64)
+                                                .unwrap_or(first.timestamp);
+                                        }
+                                    }
+                                    tracing::info!(target: "idfon.media", from = %current.codec, to = %want.codec,
+                                        "audio rendition switch: cut over");
+                                    if let Some(floor) = floor_handle.as_ref() {
+                                        floor.set(if want.codec == "liquid" {
+                                            std::time::Duration::from_millis(LIQUID_PLAYOUT_FLOOR_MS)
+                                        } else {
+                                            std::time::Duration::ZERO
+                                        });
+                                    }
+                                    *INCOMING_AUDIO_CODEC.lock().unwrap_or_else(|poison| poison.into_inner()) =
+                                        Some(want.codec.clone());
+                                    consumer = next;
+                                    current = want;
+                                    if first.data.is_empty() { continue; }
+                                    Some(first)
+                                }
+                                _ => {
+                                    tracing::warn!(target: "idfon.media", to = %want.codec,
+                                        "audio rendition switch: new track gave no audio; staying");
+                                    continue;
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(target: "idfon.media", error = %err, "audio rendition switch failed; staying");
+                            continue;
+                        }
+                    }
+                }
+                read = tokio::time::timeout(std::time::Duration::from_millis(200), consumer.read()) => match read {
+                    Ok(frame) => frame?,
+                    Err(_) => continue,
+                },
             };
             let Some(frame) = frame else {
                 // Track ended. Normal only if the caller stopped it; otherwise
@@ -1452,7 +1771,7 @@ async fn subscribe_decode_once(
             timing.push_str(&format!("{decoded},{arrival_us},{arrival_gap_us},{pts_us},{media_gap_us},{frame_samples},{:.2}\n", playback.buffered().as_secs_f64() * 1_000.0));
             if !started {
                 startup.extend_from_slice(&frame.data);
-                if startup.len() / 4 < STARTUP_PREBUFFER_FRAMES * input.channels as usize {
+                if startup.len() / 4 < startup_prebuffer_frames * input.channels as usize {
                     continue;
                 }
                 let batch_us = (startup.len() as u128 / 4 / input.channels.max(1) as u128)
@@ -1604,6 +1923,12 @@ fn wav_format(data: &[u8]) -> Option<WavFormat> {
 #[ffi_export]
 pub fn media_live_unsubscribe() {
     media_recording_stop_playback();
+    *INCOMING_AUDIO_CODEC
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = None;
+    *AUDIO_PREFERENCE
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = None;
     if let Some(mut sub) = SUBSCRIBER.lock().unwrap().take() {
         sub.stop.store(true, Ordering::Relaxed);
         if let Some(handle) = sub.handle.take() {
@@ -1821,12 +2146,17 @@ fn rebuild_audio_track() -> u8 {
         let Some(broadcast) = session._audio.as_ref() else {
             return 1;
         };
-        let Ok(mut options) = call_options(codec, sample_rate, channels, video) else {
+        let Ok(mut renditions) = call_renditions(codec, sample_rate, channels, video) else {
             return 1;
         };
-        // The rebuild restarts the track: keep driving the new encoder from
-        // the running call's ABR control.
-        options.bitrate_control = crate::abr::control();
+        // The rebuild restarts the tracks: keep driving the new Opus encoder
+        // from the running call's ABR control.
+        if let Some(opus) = renditions
+            .iter_mut()
+            .find(|o| o.settings.codec == AudioCodec::Opus)
+        {
+            opus.bitrate_control = crate::abr::control();
+        }
         // The shell queue is shared across replaces, so a push source keeps
         // whatever it holds; a device source re-opens.
         let capture: Box<dyn AudioCapture> = if push_audio {
@@ -1844,7 +2174,13 @@ fn rebuild_audio_track() -> u8 {
                 INPUT_DEVICE.lock().unwrap().clone(),
             ))
         };
-        broadcast.audio().set_with(capture.into_source(), options);
+        if broadcast
+            .audio()
+            .set_renditions(capture.into_source(), renditions)
+            .is_err()
+        {
+            return 1;
+        }
         0
     })
 }
@@ -2675,5 +3011,422 @@ mod tests {
         assert!(high > 5.0 * magnitude(1, 440.0), "ch1 must carry 880 Hz");
         assert!(low > 5.0 * magnitude(1, 440.0), "440 Hz must stay out of ch1");
         assert!(high > 5.0 * magnitude(0, 880.0), "880 Hz must stay out of ch0");
+    }
+
+    /// LiquidCodec through the real MoQ publish → decode path, with a stand-in codec registered through the same C
+    /// callbacks the shell uses: a packet is the frame's mean, decoding yields a constant frame of it. Checks the
+    /// 80 ms framing, the catalog, the decoder, and that the profile is refused before registration.
+    #[test]
+    fn liquid_profile_roundtrips_through_the_registered_codec() {
+        use std::ffi::c_void;
+        use std::sync::atomic::Ordering;
+
+        let _guard = crate::util::MEDIA_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        crate::liquid::media_liquid_unregister();
+        let refused =
+            super::media_live_start_with_profile(1, 0, c"push".into(), c"liquid".into(), 24_000, 1);
+        assert!(
+            refused.to_str().is_empty(),
+            "liquid must be refused with no codec registered"
+        );
+
+        unsafe extern "C" fn new(_: *const c_void) -> *const c_void {
+            Box::into_raw(Box::new(0f32)) as *const c_void
+        }
+        unsafe extern "C" fn free(h: *const c_void) {
+            drop(unsafe { Box::from_raw(h as *mut f32) });
+        }
+        unsafe extern "C" fn encode(
+            _: *const c_void,
+            pcm: *const f32,
+            n: usize,
+            out: *mut u8,
+            cap: usize,
+        ) -> i32 {
+            assert_eq!(n, 1920);
+            assert!(cap >= 4);
+            let pcm = unsafe { std::slice::from_raw_parts(pcm, n) };
+            let mean = pcm.iter().sum::<f32>() / n as f32;
+            unsafe { std::ptr::copy_nonoverlapping(mean.to_le_bytes().as_ptr(), out, 4) };
+            4
+        }
+        unsafe extern "C" fn decode(
+            h: *const c_void,
+            p: *const u8,
+            len: usize,
+            out: *mut f32,
+            cap: usize,
+        ) -> i32 {
+            assert_eq!(len, 4);
+            let mut b = [0u8; 4];
+            unsafe { std::ptr::copy_nonoverlapping(p, b.as_mut_ptr(), 4) };
+            let v = f32::from_le_bytes(b);
+            unsafe { *(h as *mut f32) = v };
+            let out = unsafe { std::slice::from_raw_parts_mut(out, cap) };
+            out[..1920].fill(v);
+            1920
+        }
+        unsafe extern "C" fn recover(
+            h: *const c_void,
+            _: *const u8,
+            _: usize,
+            _: u32,
+            out: *mut f32,
+            cap: usize,
+        ) -> i32 {
+            let v = unsafe { *(h as *const f32) };
+            let out = unsafe { std::slice::from_raw_parts_mut(out, cap) };
+            out[..1920].fill(v);
+            1920
+        }
+        unsafe extern "C" fn discard(
+            _: *const c_void,
+            _: *const u8,
+            _: usize,
+            _: u32,
+            _: u32,
+            _: u64,
+        ) {
+        }
+        crate::liquid::media_liquid_register(
+            std::ptr::null(),
+            new,
+            encode,
+            free,
+            new,
+            decode,
+            recover,
+            free,
+            400,
+        );
+        assert_eq!(crate::liquid::media_liquid_available(), 1);
+        assert_eq!(
+            super::media_audio_set_playback_cb(std::ptr::null(), discard),
+            0
+        );
+
+        let ticket_text = super::start_live(true, false, true, None, AudioCodec::Liquid, 24_000, 1)
+            .expect("publish liquid");
+        let mut ticket = super::LiveTicket::deserialize(&ticket_text).expect("ticket");
+        ticket.endpoint = super::LIVE
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .live
+            .endpoint()
+            .addr();
+
+        // 0.25 for the whole push, in 20 ms chunks as the shell does, a little faster than real time so the
+        // 20 ms pump never pads a chunk with silence (the capture-side trim bounds the backlog).
+        let pusher = std::thread::spawn(move || {
+            // 80 ms bursts every 70 ms: the capture-side trim then keeps ~160 ms of slack for the pump.
+            for _ in 0..40u32 {
+                let frame = vec![0.25f32; 1920];
+                super::media_audio_push_frames(frame.as_ptr(), 1920, 1);
+                std::thread::sleep(std::time::Duration::from_millis(70));
+            }
+        });
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watchdog = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                for _ in 0..120 {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                stop.store(true, Ordering::Relaxed);
+            })
+        };
+        let mut samples = Vec::new();
+        let mut timing = String::new();
+        let mut decoded_total = 0;
+        let mut channels = 0u32;
+        let ended = super::tokio_executor(async {
+            let live = super::subscriber_live().await.expect("listen endpoint");
+            super::subscribe_decode_once(
+                live,
+                ticket,
+                &stop,
+                &mut samples,
+                &mut timing,
+                &mut decoded_total,
+                std::time::Instant::now(),
+                1,
+                &mut channels,
+            )
+            .await
+        });
+        pusher.join().unwrap();
+        stop.store(true, Ordering::Relaxed);
+        watchdog.join().unwrap();
+        super::media_live_stop();
+        super::media_audio_clear_playback_cb();
+        crate::liquid::media_liquid_unregister();
+        if let Some(live) = super::SUBSCRIBER_LIVE.lock().unwrap().take() {
+            super::tokio_executor(live.shutdown());
+        }
+        assert!(ended.expect("decode"), "watchdog should end the decode");
+        assert_eq!(channels, 1, "liquid decodes mono");
+        // Output is 48 kHz (resampled from the codec's 24 kHz). Skip the start (silence, then the resampler's ramp).
+        assert!(
+            samples.len() > 48_000,
+            "capture too short: {}",
+            samples.len()
+        );
+        // The push lasts 3 s of a ~12 s capture: measure 0.5-2.5 s after the signal starts.
+        let first = samples
+            .iter()
+            .position(|s| s.abs() > 1e-3)
+            .expect("decoded signal");
+        let tail = &samples[first + 24_000..first + 120_000];
+        let mean = tail.iter().sum::<f32>() / tail.len() as f32;
+        let at_level =
+            tail.iter().filter(|s| (**s - 0.25).abs() < 0.01).count() as f32 / tail.len() as f32;
+        eprintln!(
+            "DIAG at_level={at_level:.3} underrun_samples={} overflow_samples={}",
+            super::AUDIO_QUEUE_UNDERRUN_SAMPLES.load(Ordering::Relaxed),
+            super::AUDIO_QUEUE_OVERFLOW_SAMPLES.load(Ordering::Relaxed)
+        );
+        let nonzero = samples.iter().filter(|s| s.abs() > 1e-4).count();
+        eprintln!(
+            "DIAG liquid samples={} nonzero={nonzero} decoded_total={decoded_total} pushed={} encoded={} steady mean={mean:.4}\n{timing}",
+            samples.len(),
+            super::AUDIO_SAMPLES_PUSHED.load(Ordering::Relaxed),
+            super::AUDIO_FRAMES_ENCODED.load(Ordering::Relaxed),
+        );
+        assert!(
+            (mean - 0.25).abs() < 0.01,
+            "steady level should be 0.25, got {mean}"
+        );
+        assert!(
+            at_level > 0.95,
+            "nearly every steady sample should decode at 0.25, got {at_level}"
+        );
+    }
+
+    /// Two audio renditions through the real MoQ path: the publisher offers LiquidCodec (a stand-in that
+    /// carries each frame's RMS) and Opus; the subscriber prefers LiquidCodec, then — when the codec goes
+    /// away mid-call — switches to Opus on its own, without a gap the listener would hear.
+    #[test]
+    fn audio_renditions_switch_mid_call_without_a_gap() {
+        use std::ffi::c_void;
+        use std::sync::atomic::Ordering;
+
+        let _guard = crate::util::MEDIA_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        unsafe extern "C" fn new(_: *const c_void) -> *const c_void {
+            Box::into_raw(Box::new(0f32)) as *const c_void
+        }
+        unsafe extern "C" fn free(h: *const c_void) {
+            drop(unsafe { Box::from_raw(h as *mut f32) });
+        }
+        unsafe extern "C" fn encode(
+            _: *const c_void,
+            pcm: *const f32,
+            n: usize,
+            out: *mut u8,
+            _: usize,
+        ) -> i32 {
+            let pcm = unsafe { std::slice::from_raw_parts(pcm, n) };
+            let rms = (pcm.iter().map(|s| s * s).sum::<f32>() / n as f32).sqrt();
+            unsafe { std::ptr::copy_nonoverlapping(rms.to_le_bytes().as_ptr(), out, 4) };
+            4
+        }
+        unsafe extern "C" fn decode(
+            h: *const c_void,
+            p: *const u8,
+            _: usize,
+            out: *mut f32,
+            cap: usize,
+        ) -> i32 {
+            let mut b = [0u8; 4];
+            unsafe { std::ptr::copy_nonoverlapping(p, b.as_mut_ptr(), 4) };
+            let v = f32::from_le_bytes(b);
+            unsafe { *(h as *mut f32) = v };
+            let out = unsafe { std::slice::from_raw_parts_mut(out, cap) };
+            out[..1920].fill(v);
+            1920
+        }
+        unsafe extern "C" fn recover(
+            h: *const c_void,
+            _: *const u8,
+            _: usize,
+            _: u32,
+            out: *mut f32,
+            cap: usize,
+        ) -> i32 {
+            let v = unsafe { *(h as *const f32) };
+            let out = unsafe { std::slice::from_raw_parts_mut(out, cap) };
+            out[..1920].fill(v);
+            1920
+        }
+        unsafe extern "C" fn discard(
+            _: *const c_void,
+            _: *const u8,
+            _: usize,
+            _: u32,
+            _: u32,
+            _: u64,
+        ) {
+        }
+        crate::liquid::media_liquid_register(
+            std::ptr::null(),
+            new,
+            encode,
+            free,
+            new,
+            decode,
+            recover,
+            free,
+            400,
+        );
+        assert_eq!(
+            super::media_audio_set_playback_cb(std::ptr::null(), discard),
+            0
+        );
+        super::media_live_set_audio_preference(c"liquid".into());
+
+        let ticket_text = super::start_live(true, false, true, None, AudioCodec::Liquid, 24_000, 1)
+            .expect("publish");
+        let mut ticket = super::LiveTicket::deserialize(&ticket_text).expect("ticket");
+        ticket.endpoint = super::LIVE
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .live
+            .endpoint()
+            .addr();
+        let published = super::LIVE
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            ._audio
+            .as_ref()
+            .unwrap()
+            .audio()
+            .renditions();
+        assert_eq!(
+            published,
+            vec!["liquid".to_string(), "opus".to_string()],
+            "both renditions published"
+        );
+
+        // A 440 Hz tone at RMS ~0.177, in 80 ms bursts a little faster than real time.
+        let pusher = std::thread::spawn(move || {
+            for burst in 0..90u32 {
+                let frame: Vec<f32> = (0..1920)
+                    .map(|n| {
+                        let t = (burst as usize * 1920 + n) as f32 / 24_000.0;
+                        (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.25
+                    })
+                    .collect();
+                super::media_audio_push_frames(frame.as_ptr(), 1920, 1);
+                std::thread::sleep(std::time::Duration::from_millis(70));
+            }
+        });
+        // LiquidCodec goes away 3 s in: the subscriber must move to Opus by itself.
+        let unregister = std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            crate::liquid::media_liquid_unregister();
+        });
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watchdog = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                for _ in 0..90 {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                stop.store(true, Ordering::Relaxed);
+            })
+        };
+        let (mut samples, mut timing, mut decoded_total, mut channels) =
+            (Vec::new(), String::new(), 0, 0u32);
+        let mut codec_seen = Vec::new();
+        let ended = super::tokio_executor(async {
+            let live = super::subscriber_live().await.expect("listen endpoint");
+            let decode = super::subscribe_decode_once(
+                live,
+                ticket,
+                &stop,
+                &mut samples,
+                &mut timing,
+                &mut decoded_total,
+                std::time::Instant::now(),
+                1,
+                &mut channels,
+            );
+            tokio::pin!(decode);
+            loop {
+                tokio::select! {
+                    ended = &mut decode => break ended,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
+                        let codec = super::INCOMING_AUDIO_CODEC.lock().unwrap().clone();
+                        if codec_seen.last() != Some(&codec) { codec_seen.push(codec); }
+                    }
+                }
+            }
+        });
+        pusher.join().unwrap();
+        unregister.join().unwrap();
+        stop.store(true, Ordering::Relaxed);
+        watchdog.join().unwrap();
+        super::media_live_stop();
+        super::media_audio_clear_playback_cb();
+        super::media_live_set_audio_preference(c"".into());
+        if let Some(live) = super::SUBSCRIBER_LIVE.lock().unwrap().take() {
+            super::tokio_executor(live.shutdown());
+        }
+        assert!(ended.expect("decode"), "watchdog should end the decode");
+        let codecs: Vec<String> = codec_seen.into_iter().flatten().collect();
+        eprintln!("DIAG codecs over time: {codecs:?}");
+        assert_eq!(
+            codecs.first().map(String::as_str),
+            Some("liquid"),
+            "starts on the preferred codec"
+        );
+        assert_eq!(
+            codecs.last().map(String::as_str),
+            Some("opus"),
+            "switches when LiquidCodec goes away"
+        );
+
+        // Level per 100 ms window (48 kHz mono) across the tone: no audible hole at the switch.
+        let first = samples.iter().position(|s| s.abs() > 1e-3).expect("signal");
+        let last = samples
+            .iter()
+            .rposition(|s| s.abs() > 1e-3)
+            .expect("signal");
+        let windows: Vec<f32> = samples[first + 4_800..last.saturating_sub(4_800)]
+            .chunks(4_800)
+            .map(|w| (w.iter().map(|s| s * s).sum::<f32>() / w.len() as f32).sqrt())
+            .collect();
+        let quiet = windows.iter().filter(|rms| **rms < 0.05).count();
+        eprintln!(
+            "DIAG windows={} quiet={quiet} min_rms={:.3}",
+            windows.len(),
+            windows.iter().cloned().fold(f32::MAX, f32::min)
+        );
+        assert!(
+            windows.len() > 30,
+            "tone too short: {} windows",
+            windows.len()
+        );
+        assert!(
+            quiet <= 1,
+            "{quiet} silent 100 ms windows around the switch"
+        );
     }
 }

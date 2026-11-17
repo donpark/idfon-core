@@ -179,6 +179,26 @@ fn local_label(local: &str) -> String {
         .to_string()
 }
 
+/// The path and its signals for the status line.
+pub(crate) struct NetworkSummary {
+    pub relay: bool,
+    pub rtt_ms: Option<u64>,
+    pub loss_pct: f64,
+    pub delivery_bps: Option<u64>,
+}
+
+pub(crate) fn network_summary() -> Option<NetworkSummary> {
+    let (_, relay, _, _) = selected_path()?;
+    let signals = current_signals();
+    let sample = signals.as_ref().map(take_sample);
+    Some(NetworkSummary {
+        relay,
+        rtt_ms: sample.as_ref().map(|s| s.rtt_ms).filter(|ms| *ms > 0),
+        loss_pct: sample.as_ref().map_or(0.0, |s| s.loss_pct),
+        delivery_bps: sample.and_then(|s| s.delivery_bps),
+    })
+}
+
 /// The selected path as one short line for the call UI: `direct 192.168.1.42`
 /// or `relay`. Empty when no connection is attached. The local IP is what
 /// says which network carries the call (192.168.x vs a cellular address) —
