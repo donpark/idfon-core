@@ -20,11 +20,11 @@ batch, never a call or a wake.
 `-diagpeer <peerId>` at launch, else the saved one. Instrumentation today:
 iOS PushKit token lifecycle, per-ref registration results (the 403 storm
 evidence), wake outcomes (presented / canceled / bar_owns / system_ring /
-reported_ring / bar_mode / skip_redelivery / skip_busy / skip_no_ids /
+reported_ring / bar_fallback / skip_redelivery / skip_busy / skip_no_ids /
 report_failed), a launch config snapshot on both apps, turn-model tier
 selection and load failures (`turnmodel`: tier, rung, error) on both apps,
 CallKit End-action routing state (`callkit.end_action`: mirrored owner and the
-live/video/agent machine states), and ScratchSweep findings (`scratchsweep`:
+live/video/agent machine states), CallKit routing skips (`callkit.route_skip`: peer, reason machines_busy / bar_fallback) and per-call Bar fallbacks (`callkit.bar_fallback`: peer, call), and ScratchSweep findings (`scratchsweep`:
 removed, freed_bytes) on both apps. Wake and registration flush immediately — a woken process can die
 within ~1.5 s.
 
