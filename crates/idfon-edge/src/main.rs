@@ -22,7 +22,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context};
 use idfon_core::{decode_signing_key, encode_signing_key, generate_identity, signing_key_bytes};
 use idfon_edge::{
-    run, ApnsConfig, ApnsSender, EdgeAuth, EdgeConfig, FilesRoutes, HttpApns, PushRoutes, PushStore,
+    run, AppLinksRoutes, ApnsConfig, ApnsSender, EdgeAuth, EdgeConfig, FilesRoutes, HttpApns, PushRoutes, PushStore,
 };
 use idfon_gateway::{LocalRoute, TlsConfig};
 
@@ -294,11 +294,15 @@ async fn main() -> anyhow::Result<()> {
         };
     let push_enabled = apns.is_some();
     let push_state = push_state.unwrap_or_else(|| key_file.with_extension("push.json"));
-    let mut local_routes: Vec<Arc<dyn LocalRoute>> = vec![Arc::new(PushRoutes::new(
-        Arc::new(PushStore::load(push_state)),
-        apns,
-        default_topic,
-    ))];
+    let mut local_routes: Vec<Arc<dyn LocalRoute>> = vec![
+        Arc::new(PushRoutes::new(
+            Arc::new(PushStore::load(push_state)),
+            apns,
+            default_topic,
+        )),
+        // iOS universal links: AASA + `/go/*` fallback page (apex only).
+        Arc::new(AppLinksRoutes::new(idfon_edge::applinks::DEFAULT_APP_ID)),
+    ];
     if let Some(dir) = &files_dir {
         let mut files =
             FilesRoutes::new(dir, files_quota_mb * 1024 * 1024, files_token.clone())
