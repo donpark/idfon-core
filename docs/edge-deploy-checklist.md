@@ -102,8 +102,11 @@ push channel needs more than the stock `compose.yaml` provides:
    `apns send failed`:
    `docker compose logs --since 10m idfon-edge | grep -E 'apns send failed|InvalidProviderToken'`.
 5. **Verify** — `curl https://idfon.net/healthz`, then one ring each way
-   (lock-screen + force-quit variants) before calling it done. The caller's
+   (lock-screen + force-quit variants) before calling it done. Use a person
+   call (ring score 80, above the default call threshold 70): the caller's
    app log must show `ring → 200 rung=1` or higher; `rung=0` means step 4.
+   A low-score (silent) call legitimately shows `rung=0`. For notify-range
+   calls (score 30–69) the edge log shows an alert push, not VoIP.
 
 ## Rules that keep the residue from recurring
 
