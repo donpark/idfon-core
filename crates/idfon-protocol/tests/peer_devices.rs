@@ -1,4 +1,4 @@
-use idfon_protocol::{IncomingCallMode, Peer, PeerDevice};
+use idfon_protocol::{Peer, PeerDevice};
 
 fn device(id: &str, addr: Option<&str>, class: Option<&str>) -> PeerDevice {
     PeerDevice {
@@ -23,7 +23,7 @@ fn sample() -> Peer {
             device("no-address", None, Some("mobile")),
         ],
         aliases: vec![],
-        call_mode: IncomingCallMode::default(),
+        call_mode: None,
         pinned: false,
         instant_call: false,
     }

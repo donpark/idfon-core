@@ -537,7 +537,7 @@ mod tests {
                 })
                 .collect(),
             aliases: Vec::new(),
-            call_mode: Default::default(),
+            call_mode: None,
             pinned: false,
             instant_call: false,
         }

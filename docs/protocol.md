@@ -67,11 +67,15 @@ include `invalid_request`, `capability_denied`, `cursor_too_old`,
 
 `ref` in every method matches peer id, name, alias, or endpoint id.
 
-`call_mode` selects how a shell surfaces an incoming call for that channel:
-`"bar"` (Live Activity Bar) or `"call_kit"` (CallKit). It defaults to `bar` on
-`peer.add` when omitted, and any other value is rejected with `invalid_request`.
-`peer.update` only changes it when the param is present. The auto-created
-reciprocal peer always takes the default.
+`call_mode` selects who owns and surfaces calls for that channel: `"bar"` (the
+in-app Bar) or `"call_kit"` (CallKit). It is **optional**: absent means unset,
+and the shell applies its default for the contact's kind (iOS: System call for
+people, the Bar for agents and stations). `peer.add` without it leaves it unset;
+`peer.update` only changes it when the param is present, and `"auto"` clears it
+back to unset. Any other value is rejected with `invalid_request`. The
+auto-created reciprocal peer is unset. Stores written before 2026-11-17 kept an
+implicit `"bar"` for every peer; the daemon clears those once on load
+(`call_mode_auto_v1`).
 
 | method | params | result |
 |---|---|---|

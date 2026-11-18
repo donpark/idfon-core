@@ -329,6 +329,12 @@ struct Store {
     /// store (see `ensure_presets`).
     #[serde(default)]
     presets_v1: bool,
+    /// One-shot marker: stored `call_mode: bar` values from before the field
+    /// became optional were the old implicit default, not a choice; they are
+    /// cleared once so each contact kind gets the shell's default (see
+    /// `ensure_call_mode_auto`).
+    #[serde(default)]
+    call_mode_auto_v1: bool,
     #[serde(skip)]
     data_dir: PathBuf,
 }
@@ -363,6 +369,7 @@ impl Store {
                 store.data_dir = data_dir.to_path_buf();
                 store.ensure_identity_keys(data_dir)?;
                 store.ensure_presets(data_dir)?;
+                store.ensure_call_mode_auto(data_dir)?;
                 return Ok(store);
             }
         }
@@ -373,6 +380,7 @@ impl Store {
                 store.data_dir = data_dir.to_path_buf();
                 store.ensure_identity_keys(data_dir)?;
                 store.ensure_presets(data_dir)?;
+                store.ensure_call_mode_auto(data_dir)?;
                 Ok(store)
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -397,6 +405,8 @@ impl Store {
                     mcp_command: None,
                     sessions: Vec::new(),
                     presets_v1: false,
+                    // A fresh store has no legacy implicit `bar` to clear.
+                    call_mode_auto_v1: true,
                     data_dir: data_dir.to_path_buf(),
                 };
                 let mut store = store;
@@ -406,6 +416,25 @@ impl Store {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// 2026-11-17: `call_mode` used to be stored as `bar` for every peer that
+    /// never chose (the serde default). It is optional now, and unset means
+    /// the shell's default for the contact's kind (people → System call), so
+    /// clear those implicit values once. Explicit `call_kit` choices stay. An
+    /// explicit `bar` chosen before this cannot be told apart and is reset
+    /// too; the user can set it again.
+    fn ensure_call_mode_auto(&mut self, data_dir: &Path) -> io::Result<()> {
+        if self.call_mode_auto_v1 {
+            return Ok(());
+        }
+        self.call_mode_auto_v1 = true;
+        for peer in &mut self.peers {
+            if peer.call_mode == Some(idfon_protocol::IncomingCallMode::Bar) {
+                peer.call_mode = None;
+            }
+        }
+        self.save(data_dir)
     }
 
     /// D4/D20: preset identities at first launch — Work / Personal / Private,
@@ -5545,10 +5574,12 @@ fn identity_delete(request: &Request, store: &Arc<Mutex<Store>>) -> Response {
     success(request, serde_json::json!({"deleted": id}))
 }
 
-/// `call_mode` param for `peer.add`/`peer.update`; `Ok(None)` when absent.
+/// `call_mode` param for `peer.add`/`peer.update`: `Ok(None)` when absent
+/// (leave it alone), `Ok(Some(None))` for `"auto"` (clear: the shell's
+/// default for the contact's kind), `Ok(Some(Some(mode)))` otherwise.
 fn requested_call_mode(
     request: &Request,
-) -> Result<Option<idfon_protocol::IncomingCallMode>, Response> {
+) -> Result<Option<Option<idfon_protocol::IncomingCallMode>>, Response> {
     let Some(value) = request
         .params
         .get("call_mode")
@@ -5556,14 +5587,17 @@ fn requested_call_mode(
     else {
         return Ok(None);
     };
+    if value.as_str() == Some("auto") {
+        return Ok(Some(None));
+    }
     serde_json::from_value(value.clone())
-        .map(Some)
+        .map(|mode| Some(Some(mode)))
         .map_err(|_| {
             error_response(
                 request.id.clone(),
                 &request.method,
                 ErrorCode::InvalidRequest,
-                "call_mode must be \"bar\" or \"call_kit\"".into(),
+                "call_mode must be \"auto\", \"bar\" or \"call_kit\"".into(),
                 false,
             )
         })
@@ -5655,7 +5689,7 @@ fn peer_add(
         .unwrap_or_else(|| id.clone());
     let identity = request_text(&request.params, "identity").unwrap_or_else(|| "default".into());
     let call_mode = match requested_call_mode(request) {
-        Ok(mode) => mode.unwrap_or_default(),
+        Ok(mode) => mode.flatten(),
         Err(response) => return response,
     };
     let mut state = store.lock().expect("store mutex poisoned");
@@ -5790,7 +5824,7 @@ fn peer_add(
                     .and_then(|bytes| String::from_utf8(bytes).ok()),
                 devices: Vec::new(),
                 aliases: Vec::new(),
-                call_mode: idfon_protocol::IncomingCallMode::default(),
+                call_mode: None,
                 pinned: false,
                 instant_call: false,
             };
@@ -7324,7 +7358,7 @@ mod tests {
                 endpoint_addr: None,
                 devices: Vec::new(),
                 aliases: vec![],
-                call_mode: idfon_protocol::IncomingCallMode::default(),
+                call_mode: None,
                 pinned: false,
                 instant_call: false,
             });
@@ -7364,7 +7398,7 @@ mod tests {
                 endpoint_addr: None,
                 devices: Vec::new(),
                 aliases: vec![],
-                call_mode: idfon_protocol::IncomingCallMode::default(),
+                call_mode: None,
                 pinned: false,
                 instant_call: false,
             });
@@ -7450,7 +7484,7 @@ mod tests {
                 endpoint_addr: None,
                 devices: Vec::new(),
                 aliases: vec![],
-                call_mode: idfon_protocol::IncomingCallMode::default(),
+                call_mode: None,
                 pinned: false,
                 instant_call: false,
             });
@@ -7669,7 +7703,7 @@ mod tests {
                 endpoint_addr: None,
                 devices: Vec::new(),
                 aliases: vec![],
-                call_mode: idfon_protocol::IncomingCallMode::default(),
+                call_mode: None,
                 pinned: false,
                 instant_call: false,
             });
@@ -7799,7 +7833,7 @@ mod tests {
                 endpoint_addr: Some(serde_json::to_string(&server.endpoint().addr()).unwrap()),
                 devices: Vec::new(),
                 aliases: Vec::new(),
-                call_mode: idfon_protocol::IncomingCallMode::default(),
+                call_mode: None,
                 pinned: false,
                 instant_call: false,
             };
@@ -7936,7 +7970,7 @@ mod tests {
                 endpoint_addr: Some(serde_json::to_string(&caller.endpoint().addr()).unwrap()),
                 devices: Vec::new(),
                 aliases: Vec::new(),
-                call_mode: idfon_protocol::IncomingCallMode::default(),
+                call_mode: None,
                 pinned: false,
                 instant_call: false,
             });
@@ -8085,7 +8119,7 @@ mod tests {
                 ),
                 devices: Vec::new(),
                 aliases: Vec::new(),
-                call_mode: idfon_protocol::IncomingCallMode::default(),
+                call_mode: None,
                 pinned: false,
                 instant_call: false,
             });
@@ -8144,7 +8178,7 @@ mod tests {
                 endpoint_addr: Some(serde_json::to_string(&producer_addr).unwrap()),
                 devices: Vec::new(),
                 aliases: Vec::new(),
-                call_mode: idfon_protocol::IncomingCallMode::default(),
+                call_mode: None,
                 pinned: false,
                 instant_call: false,
             };
@@ -8283,7 +8317,7 @@ mod tests {
             endpoint_addr: None,
             devices: Vec::new(),
             aliases: Vec::new(),
-            call_mode: idfon_protocol::IncomingCallMode::default(),
+            call_mode: None,
             pinned: false,
             instant_call: false,
         });
@@ -8351,7 +8385,7 @@ mod tests {
             endpoint_addr: None,
             devices: Vec::new(),
             aliases: Vec::new(),
-            call_mode: idfon_protocol::IncomingCallMode::default(),
+            call_mode: None,
             pinned: false,
             instant_call: false,
         });
@@ -8430,7 +8464,7 @@ mod tests {
             endpoint_addr: None,
             devices: Vec::new(),
             aliases: Vec::new(),
-            call_mode: idfon_protocol::IncomingCallMode::default(),
+            call_mode: None,
             pinned: false,
             instant_call: false,
         });
@@ -8523,7 +8557,7 @@ mod tests {
             endpoint_addr: None,
             devices: Vec::new(),
             aliases: Vec::new(),
-            call_mode: idfon_protocol::IncomingCallMode::default(),
+            call_mode: None,
             pinned: false,
             instant_call: false,
         });
@@ -8578,7 +8612,7 @@ mod tests {
             endpoint_addr: None,
             devices: Vec::new(),
             aliases: Vec::new(),
-            call_mode: idfon_protocol::IncomingCallMode::default(),
+            call_mode: None,
             pinned: false,
             instant_call: false,
         });
@@ -8675,7 +8709,7 @@ mod tests {
             endpoint_addr: None,
             devices: Vec::new(),
             aliases: vec![],
-            call_mode: idfon_protocol::IncomingCallMode::default(),
+            call_mode: None,
             pinned: false,
             instant_call: false,
         });
@@ -9059,7 +9093,7 @@ mod tests {
                 endpoint_addr: None,
                 devices: Vec::new(),
                 aliases: Vec::new(),
-                call_mode: Default::default(),
+                call_mode: None,
                 pinned: false,
                 instant_call: false,
             });
@@ -9169,7 +9203,7 @@ mod tests {
             )
         };
 
-        // absent call_mode -> bar
+        // absent call_mode -> unset (the shell's per-kind default)
         assert!(
             send(
                 "add-1",
@@ -9178,10 +9212,7 @@ mod tests {
             )
             .ok
         );
-        assert_eq!(
-            Store::load(&dir).unwrap().peers[0].call_mode,
-            IncomingCallMode::Bar
-        );
+        assert_eq!(Store::load(&dir).unwrap().peers[0].call_mode, None);
 
         // explicit call_kit is persisted and surfaced by `peers`
         let added = send(
@@ -9203,7 +9234,7 @@ mod tests {
                 .unwrap()
                 .call_mode
         };
-        assert_eq!(stored("Bob"), IncomingCallMode::CallKit);
+        assert_eq!(stored("Bob"), Some(IncomingCallMode::CallKit));
 
         // update flips it
         assert!(
@@ -9214,7 +9245,7 @@ mod tests {
             )
             .ok
         );
-        assert_eq!(stored("Bob"), IncomingCallMode::Bar);
+        assert_eq!(stored("Bob"), Some(IncomingCallMode::Bar));
 
         // update without call_mode leaves it alone
         assert!(
@@ -9225,7 +9256,18 @@ mod tests {
             )
             .ok
         );
-        assert_eq!(stored("Bobby"), IncomingCallMode::Bar);
+        assert_eq!(stored("Bobby"), Some(IncomingCallMode::Bar));
+
+        // "auto" clears it back to the per-kind default
+        assert!(
+            send(
+                "upd-auto",
+                "peer.update",
+                serde_json::json!({"ref": "peer-2", "call_mode": "auto"})
+            )
+            .ok
+        );
+        assert_eq!(stored("Bobby"), None);
 
         // invalid values are rejected, not defaulted
         for response in [
@@ -9254,6 +9296,45 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+
+    #[test]
+    fn legacy_implicit_bar_call_mode_is_cleared_once() {
+        use idfon_protocol::IncomingCallMode;
+        let dir = temp_dir("call-mode-auto");
+        {
+            let mut store = Store::load(&dir).unwrap();
+            for (id, mode) in [("p-bar", Some(IncomingCallMode::Bar)), ("p-kit", Some(IncomingCallMode::CallKit))] {
+                store.peers.push(idfon_protocol::Peer {
+                    id: id.into(),
+                    identity: "default".into(),
+                    name: id.into(),
+                    endpoint_id: None,
+                    endpoint_addr: None,
+                    devices: Vec::new(),
+                    aliases: Vec::new(),
+                    call_mode: mode,
+                    pinned: false,
+                    instant_call: false,
+                });
+            }
+            // A store written before the field became optional.
+            store.call_mode_auto_v1 = false;
+            store.save(&dir).unwrap();
+        }
+        let mode = |store: &Store, id: &str| store.peers.iter().find(|p| p.id == id).unwrap().call_mode;
+        let store = Store::load(&dir).unwrap();
+        assert_eq!(mode(&store, "p-bar"), None, "implicit bar becomes the per-kind default");
+        assert_eq!(mode(&store, "p-kit"), Some(IncomingCallMode::CallKit), "explicit call_kit stays");
+        assert!(store.call_mode_auto_v1);
+        drop(store);
+        // One-shot: an explicit bar set after the migration survives reloads.
+        {
+            let mut store = Store::load(&dir).unwrap();
+            store.peers.iter_mut().find(|p| p.id == "p-bar").unwrap().call_mode = Some(IncomingCallMode::Bar);
+            store.save(&dir).unwrap();
+        }
+        assert_eq!(mode(&Store::load(&dir).unwrap(), "p-bar"), Some(IncomingCallMode::Bar));
+    }
     #[test]
     fn sending_to_own_identity_is_rejected() {
         let dir = temp_dir("self-send");
@@ -9270,7 +9351,7 @@ mod tests {
                 endpoint_addr: Some("{}".into()),
                 devices: Vec::new(),
                 aliases: Vec::new(),
-                call_mode: idfon_protocol::IncomingCallMode::default(),
+                call_mode: None,
                 pinned: false,
                 instant_call: false,
             });
@@ -9455,7 +9536,7 @@ mod tests {
             endpoint_addr: Some("{\"id\":\"alice-phone\"}".into()),
             devices: Vec::new(),
             aliases: Vec::new(),
-            call_mode: Default::default(),
+            call_mode: None,
             pinned: false,
             instant_call: false,
         };
@@ -9805,7 +9886,7 @@ mod tests {
             endpoint_addr: None,
             devices: Vec::new(),
             aliases: vec!["alice@work".into()],
-            call_mode: idfon_protocol::IncomingCallMode::default(),
+            call_mode: None,
             pinned: false,
             instant_call: false,
         });
@@ -9840,7 +9921,7 @@ mod tests {
                 endpoint_addr: None,
                 devices: Vec::new(),
                 aliases: Vec::new(),
-                call_mode: idfon_protocol::IncomingCallMode::default(),
+                call_mode: None,
                 pinned: false,
                 instant_call: false,
             });
@@ -9884,7 +9965,7 @@ mod tests {
                 endpoint_addr: Some("{}".into()),
                 devices: Vec::new(),
                 aliases: Vec::new(),
-                call_mode: idfon_protocol::IncomingCallMode::default(),
+                call_mode: None,
                 pinned: false,
                 instant_call: false,
             });
