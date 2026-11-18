@@ -20,10 +20,21 @@
 //!   rate-limited, so a plain paired peer can ring before a contact ticket
 //!   exists). When the ticket has a `subject`, it must equal `caller_id`.
 //!
-//! Ring/cancel fan out one VoIP push (`apns-push-type: voip`) per registered
-//! token. The payload carries **identifiers only** (`call_uuid`, `caller_id`,
-//! `has_video`, `cancel`) — the device resolves display names from its own
-//! peer store, keeping peer names out of APNs logs.
+//! Ring scores (2026-11-17, `idfon_protocol::ring`): a ring carries the
+//! caller's `score` (0..=100; absent = an older caller = always ring). Each
+//! registered token carries its device's routing `thresholds` and its `kind`:
+//! a device registers a PushKit token (`voip_token`) and a regular APNs token
+//! (`alert_token`). Per token, the receiver's thresholds pick the route:
+//! `Call` → a VoIP push (`apns-push-type: voip`) to VoIP tokens, which the
+//! device must report to CallKit; `Notify` → an alert push to alert tokens (a
+//! notification that opens the caller's chat; `apns-collapse-id` = call uuid,
+//! and a missed call replaces it with "Missed call"); `Silent` → nothing. The
+//! edge never decides the route itself.
+//!
+//! Payloads carry **identifiers only** (`call_uuid`, `caller_id`, `has_video`,
+//! `cancel`) plus, for alerts, fixed generic text ("Incoming call") — the device
+//! resolves display names from its own peer store, keeping peer names out of
+//! APNs logs.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -51,7 +62,7 @@ pub trait ApnsSender: Send + Sync + 'static {
         token: &str,
         topic: &str,
         env: Option<TokenEnv>,
-        payload: serde_json::Value,
+        push: Push,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>;
 }
 
@@ -110,6 +121,34 @@ impl TokenEnv {
             Self::Sandbox => Self::Production,
         }
     }
+}
+
+/// Which APNs channel a token belongs to: PushKit (`voip`, topic
+/// `<bundle>.voip`) or regular notifications (`alert`, topic `<bundle>`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PushKind {
+    #[default]
+    Voip,
+    Alert,
+}
+
+impl PushKind {
+    fn is_voip(&self) -> bool {
+        *self == Self::Voip
+    }
+}
+
+/// One push to one token.
+#[derive(Clone, Debug)]
+pub struct Push {
+    pub kind: PushKind,
+    pub payload: serde_json::Value,
+    /// `apns-collapse-id`: a later push with the same id replaces the shown
+    /// notification (alerts only).
+    pub collapse_id: Option<String>,
+    /// Seconds until APNs drops an undelivered push.
+    pub expires_in: u64,
 }
 
 impl HttpApns {
@@ -215,20 +254,24 @@ impl HttpApns {
         host: &str,
         token: &str,
         topic: &str,
-        payload: &serde_json::Value,
+        push: &Push,
     ) -> anyhow::Result<()> {
         let url = format!("{}/3/device/{}", host, token);
-        let response = client
+        let mut request = client
             .post(url)
             .header("authorization", format!("bearer {authorization}"))
             .header("apns-topic", topic)
-            .header("apns-push-type", "voip")
-            .header("apns-priority", "10")
             .header(
-                "apns-expiration",
-                (now_seconds() + PUSH_EXPIRATION_SECS).to_string(),
+                "apns-push-type",
+                if push.kind == PushKind::Alert { "alert" } else { "voip" },
             )
-            .json(payload)
+            .header("apns-priority", "10")
+            .header("apns-expiration", (now_seconds() + push.expires_in).to_string());
+        if let Some(collapse_id) = &push.collapse_id {
+            request = request.header("apns-collapse-id", collapse_id);
+        }
+        let response = request
+            .json(&push.payload)
             .send()
             .await
             .map_err(|error| anyhow::anyhow!("apns request: {error}"))?;
@@ -247,7 +290,7 @@ impl ApnsSender for HttpApns {
         token: &str,
         topic: &str,
         declared: Option<TokenEnv>,
-        payload: serde_json::Value,
+        push: Push,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> {
         let client = self.client.clone();
         let hosts = self.hosts.clone();
@@ -269,7 +312,7 @@ impl ApnsSender for HttpApns {
             let authorization = authorization?;
             let host = if env == TokenEnv::Production { &hosts.0 } else { &hosts.1 };
             let refused =
-                match Self::post(&client, &authorization, host, &token, &topic, &payload).await {
+                match Self::post(&client, &authorization, host, &token, &topic, &push).await {
                     Ok(()) => return Ok(()),
                     Err(error) => error,
                 };
@@ -289,7 +332,7 @@ impl ApnsSender for HttpApns {
                     to = other_host,
                     "token refused by its environment; trying the counterpart"
                 );
-                return match Self::post(&client, &authorization, other_host, &token, &topic, &payload)
+                return match Self::post(&client, &authorization, other_host, &token, &topic, &push)
                     .await
                 {
                     Ok(()) => {
@@ -326,6 +369,12 @@ pub struct TokenRecord {
     pub topic: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub env: Option<TokenEnv>,
+    /// PushKit or alert token (absent in older registries = PushKit).
+    #[serde(default, skip_serializing_if = "PushKind::is_voip")]
+    pub kind: PushKind,
+    /// The device's routing thresholds (absent = the protocol defaults).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thresholds: Option<idfon_protocol::ring::Thresholds>,
 }
 
 impl<'de> serde::Deserialize<'de> for TokenRecord {
@@ -343,11 +392,22 @@ impl<'de> serde::Deserialize<'de> for TokenRecord {
                 topic: String,
                 #[serde(default)]
                 env: Option<TokenEnv>,
+                #[serde(default)]
+                kind: PushKind,
+                #[serde(default)]
+                thresholds: Option<idfon_protocol::ring::Thresholds>,
             },
         }
         Ok(match Stored::deserialize(deserializer)? {
-            Stored::Legacy(topic) => TokenRecord { topic, env: None },
-            Stored::Record { topic, env } => TokenRecord { topic, env },
+            Stored::Legacy(topic) => TokenRecord {
+                topic,
+                env: None,
+                kind: PushKind::Voip,
+                thresholds: None,
+            },
+            Stored::Record { topic, env, kind, thresholds } => {
+                TokenRecord { topic, env, kind, thresholds }
+            }
         })
     }
 }
@@ -373,13 +433,23 @@ impl PushStore {
         }
     }
 
-    pub fn register(&self, account: &str, token: &str, topic: &str, env: Option<TokenEnv>) {
+    pub fn register(
+        &self,
+        account: &str,
+        token: &str,
+        topic: &str,
+        env: Option<TokenEnv>,
+        kind: PushKind,
+        thresholds: Option<idfon_protocol::ring::Thresholds>,
+    ) {
         let mut tokens = self.lock();
         tokens.entry(account.to_owned()).or_default().insert(
             token.to_owned(),
             TokenRecord {
                 topic: topic.to_owned(),
                 env,
+                kind,
+                thresholds: thresholds.map(idfon_protocol::ring::Thresholds::normalized),
             },
         );
         self.persist(&tokens);
@@ -435,6 +505,74 @@ struct StoredOffer {
     expires: Instant,
 }
 
+/// Alert text is fixed and generic: payloads stay identifiers-only, and the
+/// device resolves who is calling.
+const ALERT_INCOMING: &str = "Incoming call";
+const ALERT_MISSED: &str = "Missed call";
+/// A missed-call notification is worth delivering later; an incoming-call
+/// one is not.
+const MISSED_EXPIRATION_SECS: u64 = 24 * 60 * 60;
+
+/// The push one token gets for a ring or cancel, or `None`. `route` is that
+/// token's route for the call's score (`None` = score unknown: a cancel the
+/// edge cannot match to its ring).
+fn ring_push(
+    action: &str,
+    kind: PushKind,
+    route: Option<idfon_protocol::ring::Route>,
+    call_uuid: &str,
+    caller_id: &str,
+    has_video: bool,
+    missed: bool,
+) -> Option<Push> {
+    use idfon_protocol::ring::Route;
+    let ring = action == "ring";
+    match kind {
+        PushKind::Voip => {
+            // Only a Call route rings VoIP (it must become a CallKit call);
+            // an unmatched cancel goes to every VoIP token, as before scores.
+            if !matches!(route, Some(Route::Call) | None) || (ring && route.is_none()) {
+                return None;
+            }
+            let payload = if ring {
+                serde_json::json!({ "call_uuid": call_uuid, "caller_id": caller_id, "has_video": has_video })
+            } else {
+                serde_json::json!({ "call_uuid": call_uuid, "cancel": true })
+            };
+            Some(Push { kind, payload, collapse_id: None, expires_in: PUSH_EXPIRATION_SECS })
+        }
+        PushKind::Alert => {
+            if route != Some(Route::Notify) || (!ring && !missed) {
+                return None;
+            }
+            let (body, expires_in) = if ring {
+                (ALERT_INCOMING, PUSH_EXPIRATION_SECS)
+            } else {
+                (ALERT_MISSED, MISSED_EXPIRATION_SECS)
+            };
+            // Groups a contact's notifications (an identifier, not a name).
+            let mut aps = serde_json::json!({ "alert": { "body": body }, "thread-id": caller_id });
+            if ring {
+                aps["sound"] = "default".into();
+            }
+            Some(Push {
+                kind,
+                payload: serde_json::json!({
+                    "aps": aps,
+                    "idfon": "call",
+                    "call_uuid": call_uuid,
+                    "caller_id": caller_id,
+                    "has_video": has_video,
+                    "missed": !ring,
+                }),
+                // The missed-call alert replaces the incoming one.
+                collapse_id: Some(call_uuid.to_owned()),
+                expires_in,
+            })
+        }
+    }
+}
+
 /// The edge's `/_push/*` routes. `apns: None` answers 503 (push unconfigured)
 /// instead of silently accepting rings nobody receives.
 pub struct PushRoutes {
@@ -447,6 +585,10 @@ pub struct PushRoutes {
     per_minute: u32,
     /// Pending invites by call uuid (see [`OFFER_TTL`]).
     offers: Mutex<HashMap<String, StoredOffer>>,
+    /// Each ring's score by call uuid, so its cancel reaches exactly the
+    /// tokens the ring did (a VoIP cancel to a device that never rang would
+    /// still have to be reported to CallKit).
+    rings: Mutex<HashMap<String, (u8, Instant)>>,
 }
 
 impl PushRoutes {
@@ -462,6 +604,7 @@ impl PushRoutes {
             limits: Mutex::new(HashMap::new()),
             per_minute: 30,
             offers: Mutex::new(HashMap::new()),
+            rings: Mutex::new(HashMap::new()),
         }
     }
 
@@ -546,17 +689,37 @@ impl PushRoutes {
                     if !issued_by_ref {
                         return json(StatusCode::FORBIDDEN, "ticket not issued by this ref");
                     }
-                    let Some(token) = value.get("voip_token").and_then(|v| v.as_str()) else {
-                        return json(StatusCode::BAD_REQUEST, "voip_token required");
+                    // A PushKit token (`voip_token`) or a regular APNs token
+                    // (`alert_token`, ring-score notifications).
+                    let (token, kind) = match (
+                        value.get("voip_token").and_then(|v| v.as_str()),
+                        value.get("alert_token").and_then(|v| v.as_str()),
+                    ) {
+                        (Some(token), None) => (token, PushKind::Voip),
+                        (None, Some(token)) => (token, PushKind::Alert),
+                        _ => {
+                            return json(
+                                StatusCode::BAD_REQUEST,
+                                "exactly one of voip_token / alert_token required",
+                            )
+                        }
                     };
                     if token.is_empty() || token.len() > 512 {
-                        return json(StatusCode::BAD_REQUEST, "voip_token invalid");
+                        return json(StatusCode::BAD_REQUEST, "token invalid");
                     }
                     if action == "register" {
-                        // The topic is the registering app's VoIP topic
-                        // (`<bundle-id>.voip`); tokens are per app bundle.
+                        // The topic is the registering app's topic: VoIP
+                        // tokens use `<bundle-id>.voip`, alert tokens the bare
+                        // bundle id. Tokens are per app bundle.
+                        let default_topic = match kind {
+                            PushKind::Voip => self.default_topic.clone(),
+                            PushKind::Alert => self
+                                .default_topic
+                                .trim_end_matches(".voip")
+                                .to_owned(),
+                        };
                         let topic = match value.get("topic") {
-                            None | Some(serde_json::Value::Null) => self.default_topic.clone(),
+                            None | Some(serde_json::Value::Null) => default_topic,
                             Some(value) => match value.as_str() {
                                 Some(topic) if !topic.is_empty() && topic.len() <= 200 => {
                                     topic.to_owned()
@@ -571,7 +734,20 @@ impl PushRoutes {
                                 Err(_) => return json(StatusCode::BAD_REQUEST, "env invalid"),
                             },
                         };
-                        self.store.register(account, token, &topic, env);
+                        // The device's routing thresholds (absent = defaults).
+                        let thresholds = match value.get("thresholds") {
+                            None | Some(serde_json::Value::Null) => None,
+                            Some(value) => match serde_json::from_value::<
+                                idfon_protocol::ring::Thresholds,
+                            >(value.clone())
+                            {
+                                Ok(thresholds) => Some(thresholds),
+                                Err(_) => {
+                                    return json(StatusCode::BAD_REQUEST, "thresholds invalid")
+                                }
+                            },
+                        };
+                        self.store.register(account, token, &topic, env, kind, thresholds);
                     } else {
                         self.store.unregister(account, token);
                     }
@@ -667,20 +843,43 @@ impl PushRoutes {
                             offers.remove(call_uuid);
                         }
                     }
-                    // Identifiers only: the device resolves the display name.
-                    let payload = if action == "ring" {
-                        serde_json::json!({
-                            "call_uuid": call_uuid,
-                            "caller_id": caller_id,
-                            "has_video": value.get("has_video").and_then(|v| v.as_bool()).unwrap_or(false),
-                        })
+                    // The caller's score: from the ring, or remembered for its
+                    // cancel. Absent on a ring = an older caller = always ring.
+                    // Unknown on a cancel (edge restarted, legacy) = cancel
+                    // every VoIP token, as before scores.
+                    let score = if action == "ring" {
+                        let score = match value.get("score") {
+                            None | Some(serde_json::Value::Null) => {
+                                idfon_protocol::ring::LEGACY_UNSCORED
+                            }
+                            Some(value) => match value.as_u64() {
+                                Some(score) if score <= u64::from(idfon_protocol::ring::MAX) => {
+                                    score as u8
+                                }
+                                _ => return json(StatusCode::BAD_REQUEST, "score invalid"),
+                            },
+                        };
+                        let mut rings = self.rings.lock().unwrap_or_else(|error| error.into_inner());
+                        rings.retain(|_, ring| ring.1 > Instant::now());
+                        rings.insert(call_uuid.to_owned(), (score, Instant::now() + OFFER_TTL));
+                        Some(score)
                     } else {
-                        serde_json::json!({ "call_uuid": call_uuid, "cancel": true })
+                        let mut rings = self.rings.lock().unwrap_or_else(|error| error.into_inner());
+                        rings.remove(call_uuid).map(|ring| ring.0)
                     };
+                    // `missed`: the caller gave up before anyone answered (vs a
+                    // ring retracted because the call connected).
+                    let missed = value.get("missed").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let has_video = value.get("has_video").and_then(|v| v.as_bool()).unwrap_or(false);
                     let entries = self.store.entries(account);
                     let mut sent = 0;
                     for (token, record) in &entries {
-                        match apns.send(token, &record.topic, record.env, payload.clone()).await {
+                        let route = score.map(|score| record.thresholds.unwrap_or_default().route(score));
+                        let Some(push) = ring_push(action, record.kind, route, call_uuid, caller_id, has_video, missed)
+                        else {
+                            continue;
+                        };
+                        match apns.send(token, &record.topic, record.env, push).await {
                             Ok(()) => sent += 1,
                             Err(error) if HttpApns::is_stale_token(&error) => {
                                 // 410 or both hosts refuse: the registration
@@ -819,7 +1018,7 @@ mod tests {
             _token: &str,
             _topic: &str,
             _env: Option<TokenEnv>,
-            _payload: serde_json::Value,
+            _push: Push,
         ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> {
             Box::pin(async {
                 Err(HttpApns::stale_token(&anyhow::anyhow!(
@@ -1041,7 +1240,7 @@ mod tests {
         let account = idfon_core::peer_id(&key);
         let apns = MockApns::new();
         let (store, routes) = routes(Some(apns.clone()));
-        store.register(&account, "tok-offer", "com.idfon.ios.voip", None);
+        store.register(&account, "tok-offer", "com.idfon.ios.voip", None, PushKind::Voip, None);
         let ticket = self_ticket(&key, None, Some("2999-01-01T00:00:00Z".to_owned()));
         let call = "33333333-3333-3333-3333-333333333333";
 
@@ -1105,7 +1304,7 @@ mod tests {
     }
 
     struct MockApns {
-        sent: Mutex<Vec<(String, String, serde_json::Value)>>,
+        sent: Mutex<Vec<(String, String, serde_json::Value, PushKind, Option<String>)>>,
     }
 
     impl MockApns {
@@ -1122,12 +1321,12 @@ mod tests {
             token: &str,
             topic: &str,
             _env: Option<TokenEnv>,
-            payload: serde_json::Value,
+            push: Push,
         ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> {
             self.sent
                 .lock()
                 .unwrap()
-                .push((token.to_owned(), topic.to_owned(), payload));
+                .push((token.to_owned(), topic.to_owned(), push.payload, push.kind, push.collapse_id));
             Box::pin(async { Ok(()) })
         }
     }
@@ -1224,6 +1423,127 @@ mod tests {
         // Each token is pushed with its own app's topic: one key, many bundles.
         assert_eq!(sent[0].1, "com.idfon.ios.voip");
         assert_eq!(sent[1].1, "com.idfon.mac.voip");
+    }
+
+    /// One device: a PushKit token and an alert token, optionally with its
+    /// own thresholds. Returns the mock and routes.
+    fn scored_device(
+        thresholds: Option<serde_json::Value>,
+    ) -> (Arc<MockApns>, PushRoutes, String, CapabilityTicket) {
+        let key = generate_identity();
+        let account = idfon_core::peer_id(&key);
+        let apns = MockApns::new();
+        let (_store, routes) = routes(Some(apns.clone()));
+        let ticket = self_ticket(&key, None, Some("2999-01-01T00:00:00Z".to_owned()));
+        for field in ["voip_token", "alert_token"] {
+            let mut body = serde_json::json!({ field: format!("tok-{field}") });
+            if let Some(thresholds) = &thresholds {
+                body["thresholds"] = thresholds.clone();
+            }
+            let (status, _) = post(&routes, &account, "/_push/register", Some(&ticket), body);
+            assert_eq!(status, StatusCode::OK);
+        }
+        (apns, routes, account, ticket)
+    }
+
+    fn ring(routes: &PushRoutes, account: &str, ticket: &CapabilityTicket, uuid: &str, score: Option<u8>) -> serde_json::Value {
+        let mut body = serde_json::json!({ "call_uuid": uuid, "caller_id": "caller" });
+        if let Some(score) = score {
+            body["score"] = score.into();
+        }
+        let (status, body) = post(routes, account, "/_push/ring", Some(ticket), body);
+        assert_eq!(status, StatusCode::OK);
+        body
+    }
+
+    #[test]
+    fn ring_score_routes_by_the_receivers_thresholds() {
+        use idfon_protocol::ring::{DEFAULT_AGENT, DEFAULT_PERSON};
+        // Default thresholds (call 70, notify 30).
+        let (apns, routes, account, ticket) = scored_device(None);
+        assert_eq!(ring(&routes, &account, &ticket, "u-person", Some(DEFAULT_PERSON))["rung"], 1);
+        assert_eq!(ring(&routes, &account, &ticket, "u-agent", Some(DEFAULT_AGENT))["rung"], 1);
+        assert_eq!(ring(&routes, &account, &ticket, "u-low", Some(10))["rung"], 0, "silent: no push");
+        assert_eq!(ring(&routes, &account, &ticket, "u-legacy", None)["rung"], 1);
+        let sent = apns.sent.lock().unwrap().clone();
+        let by_uuid = |uuid: &str| sent.iter().filter(|s| s.2["call_uuid"] == uuid).collect::<Vec<_>>();
+        let person = by_uuid("u-person");
+        assert_eq!((person[0].0.as_str(), person[0].3), ("tok-voip_token", PushKind::Voip));
+        assert_eq!(person[0].1, "com.idfon.ios.voip");
+        let agent = by_uuid("u-agent");
+        assert_eq!((agent[0].0.as_str(), agent[0].3), ("tok-alert_token", PushKind::Alert));
+        assert_eq!(agent[0].1, "com.idfon.ios", "alert tokens use the bare bundle topic");
+        assert_eq!(agent[0].2["aps"]["alert"]["body"], "Incoming call");
+        assert_eq!(agent[0].2["aps"]["thread-id"], "caller");
+        assert_eq!(agent[0].4.as_deref(), Some("u-agent"), "collapse id = call uuid");
+        assert!(agent[0].2.get("caller_name").is_none(), "identifiers only");
+        assert_eq!(by_uuid("u-legacy")[0].3, PushKind::Voip, "an unscored (older) caller always rings");
+
+        // A receiver that wants fewer rings: the same person score notifies.
+        let (apns, routes, account, ticket) =
+            scored_device(Some(serde_json::json!({ "call": 95, "notify": 60 })));
+        assert_eq!(ring(&routes, &account, &ticket, "q-person", Some(DEFAULT_PERSON))["rung"], 1);
+        assert_eq!(ring(&routes, &account, &ticket, "q-agent", Some(DEFAULT_AGENT))["rung"], 0);
+        assert_eq!(apns.sent.lock().unwrap()[0].3, PushKind::Alert);
+    }
+
+    #[test]
+    fn cancel_reaches_only_what_the_ring_did() {
+        let (apns, routes, account, ticket) = scored_device(None);
+        let cancel = |uuid: &str, missed: bool| {
+            let (status, body) = post(
+                &routes,
+                &account,
+                "/_push/cancel",
+                Some(&ticket),
+                serde_json::json!({ "call_uuid": uuid, "caller_id": "caller", "missed": missed }),
+            );
+            assert_eq!(status, StatusCode::OK);
+            body["rung"].as_u64().unwrap()
+        };
+        // A notified call: a missed cancel replaces the notification; an
+        // answered one sends nothing, and never a VoIP cancel (that device
+        // never rang and would have to report a call).
+        ring(&routes, &account, &ticket, "n-1", Some(50));
+        assert_eq!(cancel("n-1", true), 1);
+        ring(&routes, &account, &ticket, "n-2", Some(50));
+        assert_eq!(cancel("n-2", false), 0);
+        // A rung call: the cancel goes to the VoIP token only.
+        ring(&routes, &account, &ticket, "c-1", Some(80));
+        assert_eq!(cancel("c-1", true), 1);
+        // An unmatched cancel (edge restarted): every VoIP token, as before.
+        assert_eq!(cancel("unknown", true), 1);
+        let sent = apns.sent.lock().unwrap().clone();
+        let missed = sent.iter().find(|s| s.2["call_uuid"] == "n-1" && s.2["missed"] == true).unwrap();
+        assert_eq!(missed.3, PushKind::Alert);
+        assert_eq!(missed.2["aps"]["alert"]["body"], "Missed call");
+        assert!(missed.2["aps"].get("sound").is_none());
+        assert_eq!(missed.4.as_deref(), Some("n-1"));
+        assert!(sent.iter().filter(|s| s.2["call_uuid"] == "n-1" || s.2["call_uuid"] == "n-2").all(|s| s.3 == PushKind::Alert));
+        let c1: Vec<_> = sent.iter().filter(|s| s.2["call_uuid"] == "c-1").collect();
+        assert_eq!(c1.len(), 2, "ring + cancel");
+        assert!(c1.iter().all(|s| s.3 == PushKind::Voip));
+    }
+
+    #[test]
+    fn register_validates_tokens_scores_and_thresholds() {
+        let (_apns, routes, account, ticket) = scored_device(None);
+        for body in [
+            serde_json::json!({}),
+            serde_json::json!({ "voip_token": "a", "alert_token": "b" }),
+            serde_json::json!({ "alert_token": "a", "thresholds": { "call": "high" } }),
+        ] {
+            let (status, _) = post(&routes, &account, "/_push/register", Some(&ticket), body);
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+        let (status, _) = post(
+            &routes,
+            &account,
+            "/_push/ring",
+            Some(&ticket),
+            serde_json::json!({ "call_uuid": "u", "caller_id": "caller", "score": 101 }),
+        );
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[test]

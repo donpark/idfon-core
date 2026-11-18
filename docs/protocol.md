@@ -67,20 +67,37 @@ include `invalid_request`, `capability_denied`, `cursor_too_old`,
 
 `ref` in every method matches peer id, name, alias, or endpoint id.
 
-`call_mode` selects who owns and surfaces calls for that channel: `"bar"` (the
-in-app Bar) or `"call_kit"` (CallKit). It is **optional**: absent means unset,
-and the shell applies its default for the contact's kind (iOS: System call for
-people, the Bar for agents and stations). `peer.add` without it leaves it unset;
-`peer.update` only changes it when the param is present, and `"auto"` clears it
-back to unset. Any other value is rejected with `invalid_request`. The
-auto-created reciprocal peer is unset. Stores written before 2026-11-17 kept an
-implicit `"bar"` for every peer; the daemon clears those once on load
-(`call_mode_auto_v1`).
+`ring_score` (integer `0..=100`) is how urgent/important **this device's**
+calls to that peer are: the sender's default, sent with every call (invite
+`score=` line, edge ring `score`). It is **optional**: absent means unset, and
+the shell applies its default for the contact's kind (people 80, agents and
+stations 50). `peer.add` without it leaves it unset; `peer.update` only changes
+it when the param is present, and `"auto"` clears it. Anything else is rejected
+with `invalid_request`. The legacy `call_mode` param is still accepted
+(`call_kit` → 80, `bar` → 50, `auto` → unset); `call_mode` is never written.
+
+The **receiver** decides what a score does, with its own thresholds (default
+`call` 70, `notify` 30; `idfon_protocol::ring::Thresholds`):
+
+| score | delivery |
+|---|---|
+| `>= call` | VoIP push → the system call UI (CallKit owns the call) |
+| `>= notify` | alert push → a notification ("Incoming call") that opens the caller's chat |
+| below | no push; the call shows in the chat (and in-app if open) |
+
+A device registers its thresholds with the edge beside its push tokens and
+applies the same ones to invites that arrive over iroh. Filtering abusive
+contacts (e.g. a per-contact cap on the score a contact can reach you with)
+belongs on this receiver side and is future work.
+
+Migrations on load: stores from before 2026-11-17 kept an implicit `"bar"` for
+every peer, cleared once (`call_mode_auto_v1`); remaining legacy `call_mode`
+values fold into `ring_score` once (`ring_score_v1`).
 
 | method | params | result |
 |---|---|---|
-| `peers` | — | `{ peers: [Peer] }`; Peer = `{id, identity, name, aliases, endpoint_id, endpoint_addr, call_mode, ...}` |
-| `peer.add` | `{ ref, id, name, endpoint_id, endpoint_addr, aliases, call_mode?, mcp_ticket? }` | `{ peer }` |
+| `peers` | — | `{ peers: [Peer] }`; Peer = `{id, identity, name, aliases, endpoint_id, endpoint_addr, ring_score?, ...}` |
+| `peer.add` | `{ ref, id, name, endpoint_id, endpoint_addr, aliases, ring_score?, mcp_ticket? }` | `{ peer }` |
 
 `mcp_ticket` (M3) is an MCP contact ticket; when present it fills any omitted
 `id`/`endpoint_id`/`endpoint_addr`/`name` and caches the ticket's
