@@ -289,16 +289,109 @@ pub struct Identity {
     pub active: bool,
 }
 
-/// How calls with this connection are owned and surfaced by the shell: the
-/// in-app Bar, or the system call UI (CallKit), which then owns the call.
-/// A peer's `call_mode` is optional: unset means "the shell's default for this
-/// kind of contact" (iOS: System call for people, the Bar for agents and
-/// stations), so new contact kinds can bring their own default.
+/// Legacy per-contact call handling (before ring scores, 2026-11-17). Read
+/// from old stores and `call_mode` params only; mapped to a [`ring`] score.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IncomingCallMode {
     Bar,
     CallKit,
+}
+
+impl IncomingCallMode {
+    /// The ring score this legacy mode stands for.
+    pub fn ring_score(self) -> u8 {
+        match self {
+            Self::CallKit => ring::DEFAULT_PERSON,
+            Self::Bar => ring::DEFAULT_AGENT,
+        }
+    }
+}
+
+/// Ring scores: the sender says how urgent/important a call is with one number
+/// (`0..=100`); the **receiver's** thresholds decide how it is delivered
+/// (docs/protocol.md "Ring score"). A device registers its thresholds with the
+/// edge beside its push tokens, and applies the same ones to calls that arrive
+/// over iroh, so the receiver controls what a score means (and can later cap
+/// abusive contacts).
+pub mod ring {
+    use serde::{Deserialize, Serialize};
+
+    pub const MAX: u8 = 100;
+    /// Sender default for a person: rings as a phone call.
+    pub const DEFAULT_PERSON: u8 = 80;
+    /// Sender default for an agent/station: a notification.
+    pub const DEFAULT_AGENT: u8 = 50;
+    /// A ring request without a score comes from an older caller, which
+    /// always meant "ring": treat it as the top score.
+    pub const LEGACY_UNSCORED: u8 = MAX;
+
+    /// How one call is delivered to one device.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Route {
+        /// VoIP push → the system call UI (CallKit).
+        Call,
+        /// Alert push → a notification that opens the caller's chat.
+        Notify,
+        /// No push: the call shows in the chat (and in-app if open).
+        Silent,
+    }
+
+    /// A receiver's routing thresholds: `score >= call` rings,
+    /// `notify <= score < call` notifies, below `notify` is silent.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct Thresholds {
+        pub call: u8,
+        pub notify: u8,
+    }
+
+    impl Default for Thresholds {
+        fn default() -> Self {
+            Self { call: 70, notify: 30 }
+        }
+    }
+
+    impl Thresholds {
+        /// Clamps into range and keeps `notify <= call`.
+        pub fn normalized(self) -> Self {
+            let call = self.call.min(MAX);
+            Self { call, notify: self.notify.min(call) }
+        }
+
+        pub fn route(self, score: u8) -> Route {
+            let t = self.normalized();
+            let score = score.min(MAX);
+            if score >= t.call {
+                Route::Call
+            } else if score >= t.notify {
+                Route::Notify
+            } else {
+                Route::Silent
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn routes_by_receiver_thresholds() {
+            let t = Thresholds::default();
+            assert_eq!(t.route(DEFAULT_PERSON), Route::Call);
+            assert_eq!(t.route(DEFAULT_AGENT), Route::Notify);
+            assert_eq!(t.route(10), Route::Silent);
+            assert_eq!(t.route(70), Route::Call, "the call threshold is inclusive");
+            assert_eq!(t.route(30), Route::Notify, "the notify threshold is inclusive");
+            assert_eq!(t.route(255), Route::Call, "out-of-range scores clamp");
+            // A receiver that wants fewer rings raises its call threshold.
+            let quiet = Thresholds { call: 95, notify: 60 };
+            assert_eq!(quiet.route(DEFAULT_PERSON), Route::Notify);
+            assert_eq!(quiet.route(DEFAULT_AGENT), Route::Silent);
+            // notify above call is normalized, not inverted.
+            assert_eq!(Thresholds { call: 40, notify: 90 }.route(50), Route::Call);
+        }
+    }
 }
 
 /// One device endpoint of a peer's account. `Peer::endpoint_id`/`endpoint_addr`
@@ -351,9 +444,15 @@ pub struct Peer {
     #[serde(default)]
     pub devices: Vec<PeerDevice>,
     pub aliases: Vec<String>,
-    /// Explicit call handling for this contact; `None` = the shell's default
-    /// for the contact's kind (see [`IncomingCallMode`]).
+    /// The sender's default ring score for calls to this contact
+    /// (`0..=100`, see [`ring`]); `None` = the shell's default for the
+    /// contact's kind (people [`ring::DEFAULT_PERSON`], agents
+    /// [`ring::DEFAULT_AGENT`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ring_score: Option<u8>,
+    /// Legacy (pre-score) field, read from old stores only and folded into
+    /// `ring_score` on load; never written.
+    #[serde(default, skip_serializing)]
     pub call_mode: Option<IncomingCallMode>,
     /// Favorites pin (D7: Favorites = pinned contacts).
     #[serde(default)]

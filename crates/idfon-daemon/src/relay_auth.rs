@@ -537,6 +537,7 @@ mod tests {
                 })
                 .collect(),
             aliases: Vec::new(),
+            ring_score: None,
             call_mode: None,
             pinned: false,
             instant_call: false,

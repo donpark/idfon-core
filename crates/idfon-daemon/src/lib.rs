@@ -335,6 +335,10 @@ struct Store {
     /// `ensure_call_mode_auto`).
     #[serde(default)]
     call_mode_auto_v1: bool,
+    /// One-shot marker: legacy `call_mode` values are folded into
+    /// `ring_score` once (see `ensure_ring_scores`).
+    #[serde(default)]
+    ring_score_v1: bool,
     #[serde(skip)]
     data_dir: PathBuf,
 }
@@ -370,6 +374,7 @@ impl Store {
                 store.ensure_identity_keys(data_dir)?;
                 store.ensure_presets(data_dir)?;
                 store.ensure_call_mode_auto(data_dir)?;
+                store.ensure_ring_scores(data_dir)?;
                 return Ok(store);
             }
         }
@@ -381,6 +386,7 @@ impl Store {
                 store.ensure_identity_keys(data_dir)?;
                 store.ensure_presets(data_dir)?;
                 store.ensure_call_mode_auto(data_dir)?;
+                store.ensure_ring_scores(data_dir)?;
                 Ok(store)
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -407,6 +413,7 @@ impl Store {
                     presets_v1: false,
                     // A fresh store has no legacy implicit `bar` to clear.
                     call_mode_auto_v1: true,
+                    ring_score_v1: true,
                     data_dir: data_dir.to_path_buf(),
                 };
                 let mut store = store;
@@ -432,6 +439,23 @@ impl Store {
         for peer in &mut self.peers {
             if peer.call_mode == Some(idfon_protocol::IncomingCallMode::Bar) {
                 peer.call_mode = None;
+            }
+        }
+        self.save(data_dir)
+    }
+
+    /// 2026-11-17: per-contact handling became a ring score. Fold any legacy
+    /// `call_mode` left after `ensure_call_mode_auto` into `ring_score`
+    /// (`call_kit` → the person default, `bar` → the agent default) and drop
+    /// it. An existing `ring_score` wins.
+    fn ensure_ring_scores(&mut self, data_dir: &Path) -> io::Result<()> {
+        if self.ring_score_v1 {
+            return Ok(());
+        }
+        self.ring_score_v1 = true;
+        for peer in &mut self.peers {
+            if let Some(mode) = peer.call_mode.take() {
+                peer.ring_score.get_or_insert(mode.ring_score());
             }
         }
         self.save(data_dir)
@@ -5574,33 +5598,40 @@ fn identity_delete(request: &Request, store: &Arc<Mutex<Store>>) -> Response {
     success(request, serde_json::json!({"deleted": id}))
 }
 
-/// `call_mode` param for `peer.add`/`peer.update`: `Ok(None)` when absent
-/// (leave it alone), `Ok(Some(None))` for `"auto"` (clear: the shell's
-/// default for the contact's kind), `Ok(Some(Some(mode)))` otherwise.
-fn requested_call_mode(
-    request: &Request,
-) -> Result<Option<Option<idfon_protocol::IncomingCallMode>>, Response> {
-    let Some(value) = request
-        .params
-        .get("call_mode")
-        .filter(|value| !value.is_null())
-    else {
+/// The sender's ring score from `peer.add`/`peer.update`: `Ok(None)` when
+/// absent (leave it alone), `Ok(Some(None))` for `"auto"` (clear: the shell's
+/// default for the contact's kind), `Ok(Some(Some(score)))` otherwise.
+/// `ring_score` is an integer `0..=100`. The legacy `call_mode` param is still
+/// accepted (`bar`/`call_kit`/`auto`) and mapped to a score.
+fn requested_ring_score(request: &Request) -> Result<Option<Option<u8>>, Response> {
+    let invalid = |message: &str| {
+        error_response(
+            request.id.clone(),
+            &request.method,
+            ErrorCode::InvalidRequest,
+            message.into(),
+            false,
+        )
+    };
+    let param = |key: &str| request.params.get(key).filter(|value| !value.is_null());
+    if let Some(value) = param("ring_score") {
+        if value.as_str() == Some("auto") {
+            return Ok(Some(None));
+        }
+        return match value.as_u64() {
+            Some(score) if score <= u64::from(idfon_protocol::ring::MAX) => Ok(Some(Some(score as u8))),
+            _ => Err(invalid("ring_score must be an integer 0..=100 or \"auto\"")),
+        };
+    }
+    let Some(value) = param("call_mode") else {
         return Ok(None);
     };
     if value.as_str() == Some("auto") {
         return Ok(Some(None));
     }
-    serde_json::from_value(value.clone())
-        .map(|mode| Some(Some(mode)))
-        .map_err(|_| {
-            error_response(
-                request.id.clone(),
-                &request.method,
-                ErrorCode::InvalidRequest,
-                "call_mode must be \"auto\", \"bar\" or \"call_kit\"".into(),
-                false,
-            )
-        })
+    serde_json::from_value::<idfon_protocol::IncomingCallMode>(value.clone())
+        .map(|mode| Some(Some(mode.ring_score())))
+        .map_err(|_| invalid("call_mode must be \"auto\", \"bar\" or \"call_kit\""))
 }
 
 /// Parses an M3 contact ticket passed as a JSON object or a JSON string.
@@ -5688,8 +5719,8 @@ fn peer_add(
         .or_else(|| device_ticket.as_ref().and_then(|ticket| ticket.label.clone()))
         .unwrap_or_else(|| id.clone());
     let identity = request_text(&request.params, "identity").unwrap_or_else(|| "default".into());
-    let call_mode = match requested_call_mode(request) {
-        Ok(mode) => mode.flatten(),
+    let ring_score = match requested_ring_score(request) {
+        Ok(score) => score.flatten(),
         Err(response) => return response,
     };
     let mut state = store.lock().expect("store mutex poisoned");
@@ -5759,7 +5790,8 @@ fn peer_add(
                     .collect()
             })
             .unwrap_or_default(),
-        call_mode,
+        ring_score,
+        call_mode: None,
         pinned: false,
         instant_call: false,
     };
@@ -5824,6 +5856,7 @@ fn peer_add(
                     .and_then(|bytes| String::from_utf8(bytes).ok()),
                 devices: Vec::new(),
                 aliases: Vec::new(),
+                ring_score: None,
                 call_mode: None,
                 pinned: false,
                 instant_call: false,
@@ -5993,12 +6026,12 @@ fn peer_update(request: &Request, store: &Arc<Mutex<Store>>) -> Response {
             .map(str::to_owned)
             .collect();
     }
-    let call_mode = match requested_call_mode(request) {
-        Ok(mode) => mode,
+    let ring_score = match requested_ring_score(request) {
+        Ok(score) => score,
         Err(response) => return response,
     };
-    if let Some(call_mode) = call_mode {
-        peer.call_mode = call_mode;
+    if let Some(ring_score) = ring_score {
+        peer.ring_score = ring_score;
     }
     ensure_account_alias(peer);
     let updated = peer.clone();
@@ -7358,6 +7391,7 @@ mod tests {
                 endpoint_addr: None,
                 devices: Vec::new(),
                 aliases: vec![],
+                ring_score: None,
                 call_mode: None,
                 pinned: false,
                 instant_call: false,
@@ -7398,6 +7432,7 @@ mod tests {
                 endpoint_addr: None,
                 devices: Vec::new(),
                 aliases: vec![],
+                ring_score: None,
                 call_mode: None,
                 pinned: false,
                 instant_call: false,
@@ -7484,6 +7519,7 @@ mod tests {
                 endpoint_addr: None,
                 devices: Vec::new(),
                 aliases: vec![],
+                ring_score: None,
                 call_mode: None,
                 pinned: false,
                 instant_call: false,
@@ -7703,6 +7739,7 @@ mod tests {
                 endpoint_addr: None,
                 devices: Vec::new(),
                 aliases: vec![],
+                ring_score: None,
                 call_mode: None,
                 pinned: false,
                 instant_call: false,
@@ -7833,6 +7870,7 @@ mod tests {
                 endpoint_addr: Some(serde_json::to_string(&server.endpoint().addr()).unwrap()),
                 devices: Vec::new(),
                 aliases: Vec::new(),
+                ring_score: None,
                 call_mode: None,
                 pinned: false,
                 instant_call: false,
@@ -7970,6 +8008,7 @@ mod tests {
                 endpoint_addr: Some(serde_json::to_string(&caller.endpoint().addr()).unwrap()),
                 devices: Vec::new(),
                 aliases: Vec::new(),
+                ring_score: None,
                 call_mode: None,
                 pinned: false,
                 instant_call: false,
@@ -8119,6 +8158,7 @@ mod tests {
                 ),
                 devices: Vec::new(),
                 aliases: Vec::new(),
+                ring_score: None,
                 call_mode: None,
                 pinned: false,
                 instant_call: false,
@@ -8178,6 +8218,7 @@ mod tests {
                 endpoint_addr: Some(serde_json::to_string(&producer_addr).unwrap()),
                 devices: Vec::new(),
                 aliases: Vec::new(),
+                ring_score: None,
                 call_mode: None,
                 pinned: false,
                 instant_call: false,
@@ -8317,6 +8358,7 @@ mod tests {
             endpoint_addr: None,
             devices: Vec::new(),
             aliases: Vec::new(),
+            ring_score: None,
             call_mode: None,
             pinned: false,
             instant_call: false,
@@ -8385,6 +8427,7 @@ mod tests {
             endpoint_addr: None,
             devices: Vec::new(),
             aliases: Vec::new(),
+            ring_score: None,
             call_mode: None,
             pinned: false,
             instant_call: false,
@@ -8464,6 +8507,7 @@ mod tests {
             endpoint_addr: None,
             devices: Vec::new(),
             aliases: Vec::new(),
+            ring_score: None,
             call_mode: None,
             pinned: false,
             instant_call: false,
@@ -8557,6 +8601,7 @@ mod tests {
             endpoint_addr: None,
             devices: Vec::new(),
             aliases: Vec::new(),
+            ring_score: None,
             call_mode: None,
             pinned: false,
             instant_call: false,
@@ -8612,6 +8657,7 @@ mod tests {
             endpoint_addr: None,
             devices: Vec::new(),
             aliases: Vec::new(),
+            ring_score: None,
             call_mode: None,
             pinned: false,
             instant_call: false,
@@ -8709,6 +8755,7 @@ mod tests {
             endpoint_addr: None,
             devices: Vec::new(),
             aliases: vec![],
+            ring_score: None,
             call_mode: None,
             pinned: false,
             instant_call: false,
@@ -9093,6 +9140,7 @@ mod tests {
                 endpoint_addr: None,
                 devices: Vec::new(),
                 aliases: Vec::new(),
+                ring_score: None,
                 call_mode: None,
                 pinned: false,
                 instant_call: false,
@@ -9187,9 +9235,8 @@ mod tests {
     }
 
     #[test]
-    fn peer_call_mode_defaults_persists_updates_and_rejects_invalid() {
-        use idfon_protocol::IncomingCallMode;
-        let dir = temp_dir("call-mode");
+    fn peer_ring_score_defaults_persists_updates_and_rejects_invalid() {
+        let dir = temp_dir("ring-score");
         let store = Arc::new(Mutex::new(Store::load(&dir).unwrap()));
         let send = |id: &str, method: &str, params: serde_json::Value| {
             dispatch(
@@ -9202,108 +9249,87 @@ mod tests {
                 &store,
             )
         };
+        let stored = |id: &str| {
+            Store::load(&dir).unwrap().peers.iter().find(|peer| peer.id == id).unwrap().ring_score
+        };
 
-        // absent call_mode -> unset (the shell's per-kind default)
-        assert!(
-            send(
-                "add-1",
-                "peer.add",
-                serde_json::json!({"id": "peer-1", "name": "Alice"})
-            )
-            .ok
-        );
-        assert_eq!(Store::load(&dir).unwrap().peers[0].call_mode, None);
+        // absent -> unset (the shell's per-kind default)
+        assert!(send("add-1", "peer.add", serde_json::json!({"id": "peer-1", "name": "Alice"})).ok);
+        assert_eq!(stored("peer-1"), None);
 
-        // explicit call_kit is persisted and surfaced by `peers`
+        // explicit score is persisted and surfaced by `peers`
         let added = send(
             "add-2",
             "peer.add",
-            serde_json::json!({"id": "peer-2", "name": "Bob", "call_mode": "call_kit"}),
+            serde_json::json!({"id": "peer-2", "name": "Bob", "ring_score": 90}),
         );
         assert!(added.ok);
         let ResponseBody::Success { result, .. } = &added.body else {
             panic!("peer.add failed")
         };
-        assert_eq!(result["peer"]["call_mode"], serde_json::json!("call_kit"));
-        let stored = |name: &str| {
-            Store::load(&dir)
-                .unwrap()
-                .peers
-                .iter()
-                .find(|peer| peer.name == name)
-                .unwrap()
-                .call_mode
-        };
-        assert_eq!(stored("Bob"), Some(IncomingCallMode::CallKit));
+        assert_eq!(result["peer"]["ring_score"], serde_json::json!(90));
+        assert!(result["peer"].get("call_mode").is_none(), "the legacy field is never written");
+        assert_eq!(stored("peer-2"), Some(90));
 
-        // update flips it
-        assert!(
-            send(
-                "upd-1",
-                "peer.update",
-                serde_json::json!({"ref": "peer-2", "call_mode": "bar"})
-            )
-            .ok
-        );
-        assert_eq!(stored("Bob"), Some(IncomingCallMode::Bar));
-
-        // update without call_mode leaves it alone
-        assert!(
-            send(
-                "upd-2",
-                "peer.update",
-                serde_json::json!({"ref": "peer-2", "name": "Bobby"})
-            )
-            .ok
-        );
-        assert_eq!(stored("Bobby"), Some(IncomingCallMode::Bar));
+        // update changes it; an update without it leaves it alone
+        assert!(send("upd-1", "peer.update", serde_json::json!({"ref": "peer-2", "ring_score": 20})).ok);
+        assert_eq!(stored("peer-2"), Some(20));
+        assert!(send("upd-2", "peer.update", serde_json::json!({"ref": "peer-2", "name": "Bobby"})).ok);
+        assert_eq!(stored("peer-2"), Some(20));
 
         // "auto" clears it back to the per-kind default
-        assert!(
-            send(
-                "upd-auto",
-                "peer.update",
-                serde_json::json!({"ref": "peer-2", "call_mode": "auto"})
-            )
-            .ok
-        );
-        assert_eq!(stored("Bobby"), None);
+        assert!(send("upd-auto", "peer.update", serde_json::json!({"ref": "peer-2", "ring_score": "auto"})).ok);
+        assert_eq!(stored("peer-2"), None);
+
+        // the legacy call_mode param still works, mapped to a score
+        assert!(send("upd-legacy", "peer.update", serde_json::json!({"ref": "peer-2", "call_mode": "call_kit"})).ok);
+        assert_eq!(stored("peer-2"), Some(idfon_protocol::ring::DEFAULT_PERSON));
 
         // invalid values are rejected, not defaulted
         for response in [
-            send(
-                "add-bad",
-                "peer.add",
-                serde_json::json!({"id": "peer-3", "name": "Carol", "call_mode": "telephone"}),
-            ),
-            send(
-                "upd-bad",
-                "peer.update",
-                serde_json::json!({"ref": "peer-2", "call_mode": "telephone"}),
-            ),
+            send("bad-1", "peer.add", serde_json::json!({"id": "peer-3", "name": "Carol", "ring_score": 101})),
+            send("bad-2", "peer.update", serde_json::json!({"ref": "peer-2", "ring_score": "loud"})),
+            send("bad-3", "peer.update", serde_json::json!({"ref": "peer-2", "ring_score": -1})),
+            send("bad-4", "peer.update", serde_json::json!({"ref": "peer-2", "call_mode": "telephone"})),
         ] {
             assert!(matches!(
                 response.body,
-                ResponseBody::Failure {
-                    error: ApiError {
-                        code: ErrorCode::InvalidRequest,
-                        ..
-                    },
-                    ..
-                }
+                ResponseBody::Failure { error: ApiError { code: ErrorCode::InvalidRequest, .. }, .. }
             ));
         }
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
+    #[test]
+    fn legacy_call_modes_fold_into_ring_scores_once() {
+        // A store written after #217 (implicit `bar` already cleared).
+        let store = legacy_store_with_call_modes("ring-score-migrate", true);
+        let score = |id: &str| store.peers.iter().find(|p| p.id == id).unwrap().ring_score;
+        assert_eq!(score("p-bar"), Some(idfon_protocol::ring::DEFAULT_AGENT));
+        assert_eq!(score("p-kit"), Some(idfon_protocol::ring::DEFAULT_PERSON));
+        assert_eq!(score("p-none"), None);
+        assert!(store.peers.iter().all(|p| p.call_mode.is_none()), "legacy field dropped");
+        assert!(store.ring_score_v1);
+    }
 
     #[test]
-    fn legacy_implicit_bar_call_mode_is_cleared_once() {
+    fn pre_217_implicit_bar_becomes_unset_not_the_agent_score() {
+        // Every pre-#217 peer carried an implicit `bar`: it was never a choice.
+        let store = legacy_store_with_call_modes("ring-score-pre217", false);
+        let score = |id: &str| store.peers.iter().find(|p| p.id == id).unwrap().ring_score;
+        assert_eq!(score("p-bar"), None);
+        assert_eq!(score("p-kit"), Some(idfon_protocol::ring::DEFAULT_PERSON));
+    }
+
+    fn legacy_store_with_call_modes(name: &str, auto_v1: bool) -> Store {
         use idfon_protocol::IncomingCallMode;
-        let dir = temp_dir("call-mode-auto");
+        let dir = temp_dir(name);
         {
             let mut store = Store::load(&dir).unwrap();
-            for (id, mode) in [("p-bar", Some(IncomingCallMode::Bar)), ("p-kit", Some(IncomingCallMode::CallKit))] {
+            for (id, mode) in [
+                ("p-bar", Some(IncomingCallMode::Bar)),
+                ("p-kit", Some(IncomingCallMode::CallKit)),
+                ("p-none", None),
+            ] {
                 store.peers.push(idfon_protocol::Peer {
                     id: id.into(),
                     identity: "default".into(),
@@ -9312,29 +9338,37 @@ mod tests {
                     endpoint_addr: None,
                     devices: Vec::new(),
                     aliases: Vec::new(),
+                    ring_score: None,
                     call_mode: mode,
                     pinned: false,
                     instant_call: false,
                 });
             }
-            // A store written before the field became optional.
-            store.call_mode_auto_v1 = false;
             store.save(&dir).unwrap();
         }
-        let mode = |store: &Store, id: &str| store.peers.iter().find(|p| p.id == id).unwrap().call_mode;
-        let store = Store::load(&dir).unwrap();
-        assert_eq!(mode(&store, "p-bar"), None, "implicit bar becomes the per-kind default");
-        assert_eq!(mode(&store, "p-kit"), Some(IncomingCallMode::CallKit), "explicit call_kit stays");
-        assert!(store.call_mode_auto_v1);
-        drop(store);
-        // One-shot: an explicit bar set after the migration survives reloads.
-        {
-            let mut store = Store::load(&dir).unwrap();
-            store.peers.iter_mut().find(|p| p.id == "p-bar").unwrap().call_mode = Some(IncomingCallMode::Bar);
-            store.save(&dir).unwrap();
-        }
-        assert_eq!(mode(&Store::load(&dir).unwrap(), "p-bar"), Some(IncomingCallMode::Bar));
+        // `call_mode` is never serialized, so write the legacy JSON by hand:
+        // a store from before scores, with implicit `bar` already cleared.
+        let snapshot = {
+            let store = Store::load(&dir).unwrap();
+            let mut json = serde_json::to_value(&store).unwrap();
+            for peer in json["peers"].as_array_mut().unwrap() {
+                match peer["id"].as_str().unwrap() {
+                    "p-bar" => peer["call_mode"] = "bar".into(),
+                    "p-kit" => peer["call_mode"] = "call_kit".into(),
+                    _ => {}
+                }
+            }
+            json["ring_score_v1"] = false.into();
+            json["call_mode_auto_v1"] = auto_v1.into();
+            json.to_string()
+        };
+        Store::db(&dir)
+            .unwrap()
+            .execute("UPDATE state SET json = ?1 WHERE id = 1", rusqlite::params![snapshot])
+            .unwrap();
+        Store::load(&dir).unwrap()
     }
+
     #[test]
     fn sending_to_own_identity_is_rejected() {
         let dir = temp_dir("self-send");
@@ -9351,6 +9385,7 @@ mod tests {
                 endpoint_addr: Some("{}".into()),
                 devices: Vec::new(),
                 aliases: Vec::new(),
+                ring_score: None,
                 call_mode: None,
                 pinned: false,
                 instant_call: false,
@@ -9536,6 +9571,7 @@ mod tests {
             endpoint_addr: Some("{\"id\":\"alice-phone\"}".into()),
             devices: Vec::new(),
             aliases: Vec::new(),
+            ring_score: None,
             call_mode: None,
             pinned: false,
             instant_call: false,
@@ -9886,6 +9922,7 @@ mod tests {
             endpoint_addr: None,
             devices: Vec::new(),
             aliases: vec!["alice@work".into()],
+            ring_score: None,
             call_mode: None,
             pinned: false,
             instant_call: false,
@@ -9921,6 +9958,7 @@ mod tests {
                 endpoint_addr: None,
                 devices: Vec::new(),
                 aliases: Vec::new(),
+                ring_score: None,
                 call_mode: None,
                 pinned: false,
                 instant_call: false,
@@ -9965,6 +10003,7 @@ mod tests {
                 endpoint_addr: Some("{}".into()),
                 devices: Vec::new(),
                 aliases: Vec::new(),
+                ring_score: None,
                 call_mode: None,
                 pinned: false,
                 instant_call: false,

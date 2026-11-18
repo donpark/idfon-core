@@ -23,6 +23,7 @@ fn sample() -> Peer {
             device("no-address", None, Some("mobile")),
         ],
         aliases: vec![],
+        ring_score: None,
         call_mode: None,
         pinned: false,
         instant_call: false,
