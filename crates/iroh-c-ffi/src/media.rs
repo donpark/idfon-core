@@ -1311,6 +1311,7 @@ fn subscribe_inner(ticket: &str, addrs: Option<&str>) -> u8 {
             write_wav(&received_wav, &samples, decoded_channels)?;
             std::fs::write(&received_timing, timing)?;
             eprintln!("[media] live audio captures wav={} timing={}", received_wav.display(), received_timing.display());
+            archive_call_capture(&received_wav, &received_timing);
             PLAYBACK_CONTROL.lock().unwrap().take();
             result
         });
@@ -1840,6 +1841,54 @@ fn conn_paths_relay(subscription: &iroh_live::Subscription) -> bool {
 /// Expected pts gap in µs for one frame: f32 samples at 48 kHz over `channels`.
 fn frame_pts_gap_us(data: &[u8], channels: u32) -> u128 {
     (data.len() / 4) as u128 * 1_000_000 / (48_000 * channels as u128)
+}
+
+/// Calls whose received audio is kept in `<media_base>/call-captures/`.
+const KEPT_CALL_CAPTURES: usize = 5;
+
+/// Copy the call's `received.wav` and `received-timing.csv` to
+/// `call-captures/<unix_ms>-received.{wav,csv}`, and keep only the newest
+/// `KEPT_CALL_CAPTURES` calls. `received.wav` is overwritten by the next call;
+/// a tester who restarts the app to reset state still has the earlier calls.
+/// Best effort: a failed copy only logs.
+fn archive_call_capture(wav: &std::path::Path, timing: &std::path::Path) {
+    let dir = media_base().join("call-captures");
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let result = (|| -> std::io::Result<()> {
+        std::fs::create_dir_all(&dir)?;
+        std::fs::copy(wav, dir.join(format!("{stamp:013}-received.wav")))?;
+        std::fs::copy(timing, dir.join(format!("{stamp:013}-received-timing.csv")))?;
+        Ok(())
+    })();
+    if let Err(err) = result {
+        eprintln!("[media] call capture archive failed: {err}");
+        return;
+    }
+    prune_call_captures(&dir, KEPT_CALL_CAPTURES);
+}
+
+/// Remove all but the newest `keep` calls in `dir`. A call is the files that
+/// share a `<unix_ms>-` prefix; the zero-padded stamp sorts by name.
+fn prune_call_captures(dir: &std::path::Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut by_call: std::collections::BTreeMap<String, Vec<PathBuf>> = Default::default();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Some((stamp, _)) = name.split_once('-') {
+            if !stamp.is_empty() && stamp.bytes().all(|b| b.is_ascii_digit()) {
+                by_call.entry(stamp.to_owned()).or_default().push(entry.path());
+            }
+        }
+    }
+    let excess = by_call.len().saturating_sub(keep);
+    for files in by_call.into_values().take(excess) {
+        for file in files {
+            let _ = std::fs::remove_file(file);
+        }
+    }
 }
 
 fn write_wav(
@@ -2606,6 +2655,29 @@ mod tests {
         assert!(super::supported_audio_profile(AudioCodec::Opus, 24_000));
         assert!(!super::supported_audio_profile(AudioCodec::Pcm, 48_000));
         assert!(!super::supported_audio_profile(AudioCodec::Opus, 16_000));
+    }
+
+    #[test]
+    fn call_captures_keep_the_newest_calls() {
+        let dir = std::env::temp_dir().join(format!("idfon-capture-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for stamp in 1..=7u64 {
+            for suffix in ["received.wav", "received-timing.csv"] {
+                std::fs::write(dir.join(format!("{stamp:013}-{suffix}")), b"x").unwrap();
+            }
+        }
+        std::fs::write(dir.join("notes.txt"), b"x").unwrap();
+        super::prune_call_captures(&dir, 5);
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left.len(), 11);
+        assert!(left[0].starts_with("0000000000003-"));
+        assert!(left.contains(&"notes.txt".to_owned()));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

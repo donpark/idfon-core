@@ -24,8 +24,12 @@ Most triage starts by joining one flow across processes. See
   "app.idfon"'`. Each run also writes a per-run marker log the phone hands
   over **without root**: `xcrun devicectl device copy from --device <UDID>
   --domain-type appDataContainer --domain-identifier com.idfon.ios --source
-  tmp/idfon-app-<pid>.log` (stale logs from earlier runs are deleted at app
-  startup; it pairs by pid with the daemon's `tmp/idfon-<pid>.log`). Pull
+  tmp/idfon-app-<pid>.log` (it pairs by pid with the daemon's
+  `tmp/idfon-<pid>.log`; startup keeps the 5 newest earlier runs, so a run
+  survives an app restart — the newest modification time is the latest run).
+  Each call's received audio is also kept, for the last 5 calls, as
+  `tmp/idfon/call-captures/<unix_ms>-received.wav` + `-received-timing.csv`
+  (`tmp/idfon/received.wav` is the latest call only). Pull
   **per file**: a whole-directory copy (`--source tmp`) silently omits
   `idfon-app-*.log` — observed 2026-10-21, the dir pull showed only the daemon
   log while the per-file pull of the same pid's log succeeded, and the lost
