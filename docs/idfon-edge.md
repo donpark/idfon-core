@@ -254,6 +254,28 @@ verified **caller context**, not just `(account, path)`.
 - Follow-ups: cross-edge ring discovery (an edge hint on the capability
   ticket); token GC on APNs 410/Unregistered.
 
+### P8 — iOS universal links
+
+- **Landed:** `idfon-edge::applinks`, a `LocalRoute` on the apex only (never
+  `<ref>.idfon.net`). It serves two things, with no auth:
+  - `GET /.well-known/apple-app-site-association`: the AASA file (app id
+    `<team>.com.idfon.ios`, paths `/go/*` only).
+  - `GET /go/<rest>`: a fallback page with an "Open in idfon" button to
+    `idfon://<rest>`. iOS shows it when the app does not take the link.
+- The app has `applinks:idfon.net` in `Idfon.entitlements`. `IdfonURL` parses
+  `https://idfon.net/go/<rest>` as `idfon://<rest>`, and `SceneDelegate`
+  handles `NSUserActivityTypeBrowsingWeb` on cold and warm launch.
+- Privacy: when the app does not take a link, the full `/go/...` path reaches
+  the edge and its access log. This includes an `add/<ticket>` payload. Links
+  that the app opens never reach the edge, because iOS reads the cached AASA.
+- Deployment: redeploy the droplet edge, then check
+  `curl -i https://idfon.net/.well-known/apple-app-site-association`. It must
+  return 200, `application/json`, and no redirect. Apple's CDN caches it, so
+  a new install can take a while to see it. Test on a device:
+  `swcutil dl -d idfon.net` (macOS), or tap a link in Notes or Messages.
+  Safari does not open the app for a link typed into the address bar.
+  Tests: `crates/idfon-edge/src/applinks.rs`, `IdfonWebTests`.
+
 ## Decisions
 
 Settled 2026-10-09, grounded in what P0–P6 landed plus the live device/edge E2E

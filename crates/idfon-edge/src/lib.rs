@@ -35,6 +35,8 @@ use idfon_core::CapabilityTicket;
 use idfon_protocol::Capability;
 use iroh::{EndpointAddr, EndpointId};
 
+pub mod applinks;
+pub use applinks::AppLinksRoutes;
 pub mod files;
 pub use files::FilesRoutes;
 pub mod push;
