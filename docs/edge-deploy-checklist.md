@@ -86,10 +86,32 @@ push channel needs more than the stock `compose.yaml` provides:
 3. **Apps on production** — mac: `defaults write com.idfon.mac idfon.edge.url
    https://idfon.net` + `idfon.edge.ticket <prod ticket>`; iPhone: relaunch
    with `-edgeurl https://idfon.net -edgeticket <prod ticket>`.
-4. **Verify** — `curl https://idfon.net/healthz`, then one ring each way
-   (lock-screen + force-quit variants) before calling it done.
+4. **Verify the APNs key id — after every deploy, recreate or `.env` edit.**
+   `register` and `ring` answer `200` even when every APNs send fails, so a
+   wrong key id is invisible from the apps (`rung=0`; C26, regressed as C28).
+   On the droplet:
+   ```sh
+   docker inspect idfon-edge-idfon-edge-1 --format '{{json .Args}}' \
+     | grep -o '"--push-apns-key-id","[A-Z0-9]*"'
+   ```
+   It must equal `~/.idfon/edge.apns.keyid`, the id of `edge.apns.p8`. Never
+   commit that id: this repo is public. Locally, against the key file (the
+   same file as the droplet's; compare `sha256sum`), run
+   `node scripts/apns-key-probe.mjs ~/.idfon/edge.apns.p8`. It must answer
+   `400 BadDeviceToken` on **both** hosts. After the first real ring, the edge log must have no
+   `apns send failed`:
+   `docker compose logs --since 10m idfon-edge | grep -E 'apns send failed|InvalidProviderToken'`.
+5. **Verify** — `curl https://idfon.net/healthz`, then one ring each way
+   (lock-screen + force-quit variants) before calling it done. The caller's
+   app log must show `ring → 200 rung=1` or higher; `rung=0` means step 4.
 
 ## Rules that keep the residue from recurring
+
+- **No production fix lives only on the droplet.** Anything set by hand in
+  `/srv/idfon-edge/.env` or compose overrides is lost the next time the file
+  is rewritten or the stack is re-provisioned. Make the repo's
+  `deploy/digitalocean/compose.yaml` default correct and keep `.env` for
+  secrets and per-host values (C28: the C26 key-id fix was `.env`-only).
 
 - The test rig lives in `/tmp` and dies at session end (§B) — never let a
   scratch daemon outlive its session: a stale daemon on a scratch profile

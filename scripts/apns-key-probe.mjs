@@ -16,12 +16,17 @@
 // that TestFlight + dev-installed builds both need.
 //
 // Usage:
-//   node scripts/apns-key-probe.mjs ~/.idfon/edge.apns.p8 A9R2SP5259 [TEAM] [TOPIC]
-//   node scripts/apns-key-probe.mjs key.p8 KEYID RV27HPQNMF com.idfon.ios.voip
+//   node scripts/apns-key-probe.mjs ~/.idfon/edge.apns.p8 [KEYID] [TEAM] [TOPIC]
+// KEYID defaults to ~/.idfon/edge.apns.keyid, kept beside the key and never
+// committed (this repo is public).
 import crypto from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
-const [keyFile, kid, team = "RV27HPQNMF", topic = "com.idfon.ios.voip"] = process.argv.slice(2);
+const [keyFile, kidArg, team = "RV27HPQNMF", topic = "com.idfon.ios.voip"] = process.argv.slice(2);
+const kidFile = path.join(os.homedir(), ".idfon", "edge.apns.keyid");
+const kid = kidArg || (fs.existsSync(kidFile) ? fs.readFileSync(kidFile, "utf8").trim() : "");
 if (!keyFile || !kid) {
   console.error("usage: node scripts/apns-key-probe.mjs <key.p8> <key-id> [team] [topic]");
   process.exit(2);
