@@ -289,12 +289,14 @@ pub struct Identity {
     pub active: bool,
 }
 
-/// How an incoming call for this connection is surfaced by the shell.
-/// Default is `Bar` (Live Activity Bar) until CallKit is available.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// How calls with this connection are owned and surfaced by the shell: the
+/// in-app Bar, or the system call UI (CallKit), which then owns the call.
+/// A peer's `call_mode` is optional: unset means "the shell's default for this
+/// kind of contact" (iOS: System call for people, the Bar for agents and
+/// stations), so new contact kinds can bring their own default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IncomingCallMode {
-    #[default]
     Bar,
     CallKit,
 }
@@ -349,8 +351,10 @@ pub struct Peer {
     #[serde(default)]
     pub devices: Vec<PeerDevice>,
     pub aliases: Vec<String>,
-    #[serde(default)]
-    pub call_mode: IncomingCallMode,
+    /// Explicit call handling for this contact; `None` = the shell's default
+    /// for the contact's kind (see [`IncomingCallMode`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_mode: Option<IncomingCallMode>,
     /// Favorites pin (D7: Favorites = pinned contacts).
     #[serde(default)]
     pub pinned: bool,
