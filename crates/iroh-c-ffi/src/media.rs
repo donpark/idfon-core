@@ -1312,15 +1312,17 @@ pub fn media_live_path_changed() {
 
 /// How long a silent subscription is tolerated before it is rebuilt.
 ///
-/// 500 ms right after a path change or a foreground kick (someone already
-/// knows the network moved); otherwise the wait depends on the path: a
+/// 1.5 s right after a path change or a foreground kick (someone already
+/// knows the network moved; 500 ms ended attempts during ordinary LiquidCodec
+/// jitter in the round-2 device test, 2026-11-18); otherwise the wait depends on the path: a
 /// **direct** path going quiet is usually a cell handover that comes back in
 /// ~2 s, and rebuilding costs another second on top (2026-11-04 drive: two
 /// ~3 s holes, ~2 s of each the blackhole itself), so wait 4 s for it. A
 /// relay path has no such resume behavior — 2 s.
 ///
-/// A selected path that *closes* does not wait at all: the path-event watcher
-/// ends the attempt immediately.
+/// A selected path that closes does not end the attempt: iroh migrates the
+/// connection to another path by itself. It only decides, at a stall, whether
+/// to redial (see `subscribe_decode_once`).
 /// The stall window without the post-path-change shortening: 4 s direct, 2 s relay.
 fn normal_stall_window(relay: bool) -> std::time::Duration {
     if relay {
@@ -1337,7 +1339,7 @@ fn stall_window(relay: bool) -> std::time::Duration {
         .map(|at| at.elapsed() < std::time::Duration::from_secs(15))
         .unwrap_or(false);
     if recent_path || SUB_KICK.load(Ordering::Relaxed) {
-        std::time::Duration::from_millis(500)
+        std::time::Duration::from_millis(1_500)
     } else if relay {
         std::time::Duration::from_secs(2)
     } else {
@@ -1417,6 +1419,9 @@ fn start_listen_leg(session: SessionHandle, ticket: BroadcastTicket, addr: Optio
             let mut decoded_total = 0usize;
             let capture_started = std::time::Instant::now();
             let mut attempt = 0u32;
+            // Stalls since the last attempt that delivered audio. The first
+            // resubscribes on the same connection; a second in a row redials.
+            let mut stalls_in_row = 0u32;
             let result: anyhow::Result<()>;
             loop {
                 if thread_stop.load(Ordering::Relaxed) {
@@ -1438,6 +1443,7 @@ fn start_listen_leg(session: SessionHandle, ticket: BroadcastTicket, addr: Optio
                     capture_started,
                     attempt,
                     &mut decoded_channels,
+                    &mut stalls_in_row,
                 )
                 .await;
                 match res {
@@ -1598,6 +1604,7 @@ async fn subscribe_decode_once(
     capture_started: std::time::Instant,
     attempt: u32,
     channels_out: &mut u32,
+    stalls_in_row: &mut u32,
 ) -> anyhow::Result<bool> {
     // The endpoint is the session's, not the attempt's: a retry after a path
     // change dials from a warm endpoint instead of bootstrapping one
@@ -1607,6 +1614,12 @@ async fn subscribe_decode_once(
     // died (Wi-Fi to cellular) stays open until QUIC's idle timeout, so retries would otherwise
     // keep subscribing over the dead one (iroh-live upgrade, two-iPhone test 2026-11-18).
     let mut used_session: Option<iroh_live::Session> = None;
+    // Set when this attempt should close its connection so the retry redials.
+    // Both call directions share the connection, so closing it also cuts the
+    // peer's leg; the round-2 device test (2026-11-18) showed each phone's
+    // close ending the other's attempt, back and forth. Only a stall with no
+    // selected path left, or a second stall in a row, closes it now.
+    let mut redial = false;
     let attempt_started = std::time::Instant::now();
     let res = async {
         // Dial the known address first: a bare-id dial waits on discovery,
@@ -1633,10 +1646,10 @@ async fn subscribe_decode_once(
         if let Some(serving) = subscription.session() {
             used_session = Some(serving);
         }
-        // Event-driven detection: when the *selected* path closes, rebuild
-        // now instead of waiting out the silence window. A non-selected path
-        // closing (the relay after a direct path wins, an old candidate) is
-        // normal and must be ignored — hence tracking Selected.
+        // `path_down`: the selected path closed and no other path has been
+        // selected since. It does not end the attempt (iroh opens, closes and
+        // migrates paths routinely); at a stall it means the connection is
+        // likely dead, so redial at once instead of resubscribing over it.
         let path_down = std::sync::Arc::new(AtomicBool::new(false));
         let peer_conn = subscription
             .session()
@@ -1653,24 +1666,24 @@ async fn subscribe_decode_once(
                 use n0_future::StreamExt;
                 let mut events = conn.path_events();
                 while let Some(event) = events.next().await {
-                    if watch_stop.load(Ordering::Relaxed) {
+                    // Stop with the call, or once this attempt is gone: a
+                    // resubscribe on the same connection runs its own watcher.
+                    if watch_stop.load(Ordering::Relaxed) || std::sync::Arc::strong_count(&flag) == 1 {
                         break;
                     }
                     match event {
                         iroh::endpoint::PathEvent::Selected { id, .. } => {
                             tracing::info!(target: "idfon.media", path = ?id, "path selected");
                             selected = Some(id);
+                            flag.store(false, Ordering::Relaxed);
                         }
                         iroh::endpoint::PathEvent::Closed { id, .. } if selected == Some(id) => {
                             tracing::info!(target: "idfon.media", path = ?id, "selected path closed");
+                            selected = None;
                             flag.store(true, Ordering::Relaxed);
-                            break;
                         }
-                        // Events were dropped: assume the worst and let the
-                        // retry rebuild rather than sit on a stale stream.
                         iroh::endpoint::PathEvent::Lagged { .. } => {
-                            flag.store(true, Ordering::Relaxed);
-                            break;
+                            tracing::info!(target: "idfon.media", "path events lagged");
                         }
                         _ => {}
                     }
@@ -1866,16 +1879,6 @@ async fn subscribe_decode_once(
                 }
                 return Ok(true);
             }
-            if path_down.load(Ordering::Relaxed) {
-                tracing::warn!(
-                    attempt,
-                    decoded = *decoded_total,
-                    media_secs = samples.len() as f64 / (48_000.0 * input.channels as f64),
-                    "selected path closed; treating as early track end"
-                );
-                set_sub_state(SUB_RECONNECTING);
-                return Err(anyhow::anyhow!(SubscribeEndError::Transient));
-            }
             let relay = subscription
                 .serving_link()
                 .is_some_and(|link| link.sample.relayed);
@@ -1888,11 +1891,19 @@ async fn subscribe_decode_once(
                 stall_window(relay).max(normal_stall_window(relay))
             };
             if last_frame.elapsed() >= window {
+                *stalls_in_row += 1;
+                let no_path = path_down.load(Ordering::Relaxed);
+                let conn_closed = peer_conn.as_ref().is_some_and(|conn| conn.close_reason().is_some());
+                redial = no_path || conn_closed || *stalls_in_row >= 2;
                 tracing::warn!(
                     attempt,
                     decoded = *decoded_total,
                     media_secs = samples.len() as f64 / (48_000.0 * input.channels as f64),
                     stall_secs = last_frame.elapsed().as_secs_f64(),
+                    stalls_in_row = *stalls_in_row,
+                    no_path,
+                    conn_closed,
+                    redial,
                     "subscribe stalled: no frames within the window; treating as early track end"
                 );
                 set_sub_state(SUB_RECONNECTING);
@@ -2010,6 +2021,7 @@ async fn subscribe_decode_once(
             last_frame = std::time::Instant::now();
             if !first_frame_seen {
                 first_frame_seen = true;
+                *stalls_in_row = 0;
                 tracing::info!(
                     target: "idfon.media",
                     attempt,
@@ -2100,7 +2112,7 @@ async fn subscribe_decode_once(
         }
     };
     let result = res.await;
-    if result.is_err() {
+    if result.is_err() && redial {
         if let Some(peer_session) = used_session.take() {
             tracing::info!(
                 target: "idfon.media",
@@ -2114,6 +2126,13 @@ async fn subscribe_decode_once(
                 .connection()
                 .close(0u32.into(), b"subscribe stalled; redialing");
         }
+    } else if result.is_err() {
+        tracing::info!(
+            target: "idfon.media",
+            attempt,
+            elapsed_ms = attempt_started.elapsed().as_millis() as u64,
+            "subscribe attempt ended early; resubscribing on the same session"
+        );
     }
     result
 }
@@ -3022,7 +3041,7 @@ mod tests {
         assert!(super::media_path("x").ends_with("x"));
     }
 
-    /// The stall watchdog is 2 s normally and 500 ms after the shell asks for
+    /// The stall watchdog is 4 s direct / 2 s relay normally and 1.5 s after the shell asks for
     /// an immediate answer (foreground return) or the OS reports a path
     /// change. That shortening is what turns a 6 s transition hole into ~2 s.
     #[test]
@@ -3038,13 +3057,13 @@ mod tests {
         assert_eq!(super::stall_window(true), std::time::Duration::from_secs(2));
 
         super::media_live_reconnect();
-        assert_eq!(super::stall_window(false), std::time::Duration::from_millis(500));
-        assert_eq!(super::stall_window(true), std::time::Duration::from_millis(500));
+        assert_eq!(super::stall_window(false), std::time::Duration::from_millis(1_500));
+        assert_eq!(super::stall_window(true), std::time::Duration::from_millis(1_500));
         super::SUB_KICK.store(false, std::sync::atomic::Ordering::Relaxed);
 
         super::media_live_path_changed();
-        assert_eq!(super::stall_window(false), std::time::Duration::from_millis(500));
-        assert_eq!(super::stall_window(true), std::time::Duration::from_millis(500));
+        assert_eq!(super::stall_window(false), std::time::Duration::from_millis(1_500));
+        assert_eq!(super::stall_window(true), std::time::Duration::from_millis(1_500));
 
         // The state the shell polls maps to the documented wire values.
         super::set_sub_state(super::SUB_RECONNECTING);
@@ -3358,6 +3377,7 @@ mod tests {
                 std::time::Instant::now(),
                 1,
                 &mut channels,
+                &mut 0u32,
             )
             .await
         });
@@ -3556,6 +3576,7 @@ mod tests {
                 std::time::Instant::now(),
                 1,
                 &mut channels,
+                &mut 0u32,
             )
             .await
         });
@@ -3767,6 +3788,7 @@ mod tests {
             (Vec::new(), String::new(), 0, 0u32);
         let mut codec_seen = Vec::new();
         let ended = super::tokio_executor(async {
+            let mut stalls = 0u32;
             let decode = super::subscribe_decode_once(
                 listener.clone(),
                 ticket,
@@ -3778,6 +3800,7 @@ mod tests {
                 std::time::Instant::now(),
                 1,
                 &mut channels,
+                &mut stalls,
             );
             tokio::pin!(decode);
             loop {
@@ -3969,6 +3992,7 @@ mod tests {
             std::time::Instant::now(),
             1,
             &mut channels,
+            &mut 0u32,
         ));
         let codec = super::INCOMING_AUDIO_CODEC.lock().unwrap().clone();
         pusher.join().unwrap();
@@ -4075,6 +4099,7 @@ mod tests {
                         std::time::Instant::now(),
                         attempt,
                         &mut channels,
+                        &mut 0u32,
                     )
                     .await
                     {
