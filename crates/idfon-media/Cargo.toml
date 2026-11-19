@@ -26,10 +26,13 @@ iroh = "1"
 # idfon-cli or a caller-linked source, never as a feature here.
 # Current moq-video owns codec/backend selection. Idfon supplies frames and
 # chooses renditions; the upstream encoder selects the available backend.
-iroh-live = { git = "https://github.com/n0-computer/iroh-live", rev = "dd80d44efb587f31deed14fc11eeaa12946c9fd2", default-features = false }
-moq-media = { git = "https://github.com/n0-computer/iroh-live", rev = "dd80d44efb587f31deed14fc11eeaa12946c9fd2", package = "moq-media", default-features = false, features = ["capture", "playback"] }
-moq-audio = { version = "0.1", default-features = false, features = ["aac", "capture", "playback"] }
-moq-video = "0.1"
+iroh-live = { git = "https://github.com/n0-computer/iroh-live", rev = "60a3fcfc0dd2416f640496a2787404552b45cdb3", default-features = false }
+moq-ext-publisher = { git = "https://github.com/n0-computer/iroh-live", rev = "60a3fcfc0dd2416f640496a2787404552b45cdb3", default-features = false, features = ["capture"] }
+moq-ext-player = { git = "https://github.com/n0-computer/iroh-live", rev = "60a3fcfc0dd2416f640496a2787404552b45cdb3", default-features = false, features = ["playback"] }
+moq-ext-sources = { git = "https://github.com/n0-computer/iroh-live", rev = "60a3fcfc0dd2416f640496a2787404552b45cdb3", default-features = false, features = ["capture"] }
+moq-ext-adaptive = { git = "https://github.com/n0-computer/iroh-live", rev = "60a3fcfc0dd2416f640496a2787404552b45cdb3" }
+moq-audio = { git = "https://github.com/moq-dev/moq", rev = "4a6f522483168ace392718d68b58a402533c897d", default-features = false, features = ["capture", "playback"] }
+moq-video = { git = "https://github.com/moq-dev/moq", rev = "4a6f522483168ace392718d68b58a402533c897d" }
 n0-future = "0.3.2"
 # rustix was pinned here (1.1.5 broke under hick's limited feature set:
 # iroh-live -> iroh-mdns-peer-lookup -> hick -> agnostic-net/hick-udp, and
@@ -44,7 +47,7 @@ libc = "=0.2.189"
 # fMP4/MKV/TS/FLV/H.264 import (video file demuxing) and the in-memory
 # broadcast pair used to replay imported tracks. Versions must stay in lock
 # with what iroh-live resolves to (see Cargo.lock).
-moq-mux = "0.10"
+moq-mux = { git = "https://github.com/moq-dev/moq", rev = "4a6f522483168ace392718d68b58a402533c897d" }
 idfon-core = { path = "../idfon-core" }
 idfon-protocol = { path = "../idfon-protocol" }
 thiserror = "2"
@@ -64,7 +67,7 @@ opusic-sys = { version = "0.7", features = ["dred"] }
 # Target-gated because moq-media's `vaapi` feature pulls `cros-codecs`
 # unconditionally, which does not build on non-Linux.
 [target.'cfg(target_os = "macos")'.dependencies]
-iroh-live = { git = "https://github.com/n0-computer/iroh-live", rev = "dd80d44efb587f31deed14fc11eeaa12946c9fd2", default-features = false }
+iroh-live = { git = "https://github.com/n0-computer/iroh-live", rev = "60a3fcfc0dd2416f640496a2787404552b45cdb3", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-iroh-live = { git = "https://github.com/n0-computer/iroh-live", rev = "dd80d44efb587f31deed14fc11eeaa12946c9fd2", default-features = false }
+iroh-live = { git = "https://github.com/n0-computer/iroh-live", rev = "60a3fcfc0dd2416f640496a2787404552b45cdb3", default-features = false }

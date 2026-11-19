@@ -32,7 +32,7 @@ iroh-blobs = "0.104"
 # so capture-camera/rusty-capture/v4l2r/nokhwa are compiled nowhere: the
 # v4l2r 0.0.7 bindgen also fails against Ubuntu 22.04 kernel headers
 # (missing AV1/VP9 stateless controls).
-iroh-live = { git = "https://github.com/n0-computer/iroh-live", rev = "dd80d44efb587f31deed14fc11eeaa12946c9fd2", default-features = false }
+iroh-live = { git = "https://github.com/n0-computer/iroh-live", rev = "60a3fcfc0dd2416f640496a2787404552b45cdb3", default-features = false }
 # macOS camera permission request (camera access is also requested from the
 # Swift shells; this covers daemon-side starts). objc2 hard-fails to compile
 # on non-Apple platforms, hence the target gate; ensure_camera_access is
@@ -49,11 +49,14 @@ url = "2.5"
 n0-future = "0.3.0"
 data-encoding = "2.9.0"
 iroh-mdns-address-lookup = "0.6"
-moq-media = { git = "https://github.com/n0-computer/iroh-live", rev = "dd80d44efb587f31deed14fc11eeaa12946c9fd2", package = "moq-media", default-features = false, features = ["capture"] }
-moq-audio = { git = "https://github.com/donpark/moq", branch = "liquid-codec", default-features = false, features = ["aac", "capture", "playback"] }
-moq-video = { git = "https://github.com/donpark/moq", branch = "liquid-codec" }
-moq-net = { git = "https://github.com/donpark/moq", branch = "liquid-codec" }
-moq-mux = { git = "https://github.com/donpark/moq", branch = "liquid-codec" }
+moq-ext-publisher = { git = "https://github.com/n0-computer/iroh-live", rev = "60a3fcfc0dd2416f640496a2787404552b45cdb3", default-features = false, features = ["capture"] }
+moq-ext-player = { git = "https://github.com/n0-computer/iroh-live", rev = "60a3fcfc0dd2416f640496a2787404552b45cdb3", default-features = false }
+moq-ext-sources = { git = "https://github.com/n0-computer/iroh-live", rev = "60a3fcfc0dd2416f640496a2787404552b45cdb3", default-features = false, features = ["capture"] }
+moq-ext-adaptive = { git = "https://github.com/n0-computer/iroh-live", rev = "60a3fcfc0dd2416f640496a2787404552b45cdb3" }
+moq-audio = { git = "https://github.com/moq-dev/moq", rev = "4a6f522483168ace392718d68b58a402533c897d", default-features = false, features = ["capture", "playback"] }
+moq-video = { git = "https://github.com/moq-dev/moq", rev = "4a6f522483168ace392718d68b58a402533c897d" }
+moq-net = { git = "https://github.com/moq-dev/moq", rev = "4a6f522483168ace392718d68b58a402533c897d" }
+moq-mux = { git = "https://github.com/moq-dev/moq", rev = "4a6f522483168ace392718d68b58a402533c897d" }
 idfon-protocol = { path = "../idfon-protocol" }
 idfon-core = { path = "../idfon-core" }
 idfon-client = { path = "../idfon-client" }
@@ -72,7 +75,7 @@ block2 = "0.6"
 # Target-gated because moq-media's `vaapi` feature pulls `cros-codecs`
 # unconditionally, which does not build on non-Linux.
 [target.'cfg(target_os = "macos")'.dependencies]
-iroh-live = { git = "https://github.com/n0-computer/iroh-live", rev = "dd80d44efb587f31deed14fc11eeaa12946c9fd2", default-features = false }
+iroh-live = { git = "https://github.com/n0-computer/iroh-live", rev = "60a3fcfc0dd2416f640496a2787404552b45cdb3", default-features = false }
 # P5 barge-in/echo filters for the mac shell (see src/voice.rs).
 idfon-voice = { path = "../idfon-voice" }
 
@@ -84,7 +87,7 @@ idfon-voice = { path = "../idfon-voice" }
 idfon-voice = { path = "../idfon-voice", features = ["apple-ffi"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-iroh-live = { git = "https://github.com/n0-computer/iroh-live", rev = "dd80d44efb587f31deed14fc11eeaa12946c9fd2", default-features = false }
+iroh-live = { git = "https://github.com/n0-computer/iroh-live", rev = "60a3fcfc0dd2416f640496a2787404552b45cdb3", default-features = false }
 
 # ponytail note: a 4f94b3e regression put tokio and the idfon-* deps inside
 # a not(linux) target section and silently broke the Linux dylib (tokio
