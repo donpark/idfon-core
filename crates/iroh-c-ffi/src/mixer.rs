@@ -35,9 +35,14 @@ const MAX_QUEUE_FRAMES: usize = (RATE as usize) / 10;
 pub(crate) type Sink = Box<dyn Fn(&[f32], u32) + Send + Sync>;
 
 struct Member {
+    /// Who this is (the leg's endpoint id), for levels.
+    label: String,
     queue: VecDeque<f32>,
     started: bool,
     largest_chunk: usize,
+    /// Smoothed RMS of the member's recent audio, for speaking indicators:
+    /// rises at once, decays about 20% per 20 ms chunk.
+    level: f32,
 }
 
 struct Inner {
@@ -81,8 +86,8 @@ impl Mixer {
         }
     }
 
-    /// Add a member whose audio arrives with `channels` channels.
-    pub(crate) fn add(&self, channels: u32) -> MemberInput {
+    /// Add a member, named `label`, whose audio arrives with `channels` channels.
+    pub(crate) fn add(&self, label: impl Into<String>, channels: u32) -> MemberInput {
         self.inner
             .channels
             .lock()
@@ -96,15 +101,26 @@ impl Mixer {
             .insert(
                 id,
                 Member {
+                    label: label.into(),
                     queue: VecDeque::new(),
                     started: false,
                     largest_chunk: 0,
+                    level: 0.0,
                 },
             );
         MemberInput {
             id,
             inner: self.inner.clone(),
         }
+    }
+
+    /// Each member's current level (smoothed RMS, 0..1), by label.
+    pub(crate) fn levels(&self) -> Vec<(String, f32)> {
+        let members = self.inner.members.lock().unwrap_or_else(|poison| poison.into_inner());
+        let mut levels: Vec<(String, f32)> =
+            members.values().map(|member| (member.label.clone(), member.level)).collect();
+        levels.sort_by(|a, b| a.0.cmp(&b.0));
+        levels
     }
 
     pub(crate) fn member_count(&self) -> usize {
@@ -146,6 +162,11 @@ impl MemberInput {
         };
         let channels = channels.max(1) as usize;
         let out = out as usize;
+        if !pcm.is_empty() {
+            let rms = (pcm.iter().map(|x| x * x).sum::<f32>() / pcm.len() as f32).sqrt();
+            let chunks = (pcm.len() / channels) as f32 / 960.0;
+            member.level = rms.max(member.level * 0.8f32.powf(chunks));
+        }
         if solo {
             // Pass through: drop anything queued while others were in the mix.
             member.queue.clear();
@@ -285,8 +306,8 @@ mod tests {
     fn two_members_sum_and_a_removed_member_leaves_the_mix() {
         let (sink, out) = collect();
         let mixer = Mixer::start(sink);
-        let a = mixer.add(1);
-        let b = mixer.add(1);
+        let a = mixer.add("m", 1);
+        let b = mixer.add("m", 1);
         // 100 ms (the queue cap) of constant 0.25 from each, in 20 ms chunks.
         for _ in 0..5 {
             a.push(&[0.25; 960], 1);
@@ -308,8 +329,8 @@ mod tests {
     fn stereo_member_folds_into_a_mono_mix() {
         let (sink, out) = collect();
         let mixer = Mixer::start(sink);
-        let mono = mixer.add(1);
-        let stereo = mixer.add(2);
+        let mono = mixer.add("m", 1);
+        let stereo = mixer.add("s", 2);
         let frame: Vec<f32> = [0.2f32, 0.4].repeat(960);
         // The mix's channel count stays the first member's after it leaves.
         drop(mono);
@@ -323,7 +344,7 @@ mod tests {
     fn a_lone_member_passes_straight_through() {
         let (sink, out) = collect();
         let mixer = Mixer::start(sink);
-        let a = mixer.add(1);
+        let a = mixer.add("m", 1);
         a.push(&[0.25; 960], 1);
         // Delivered at once, on the pushing thread: no prebuffer, no tick.
         assert_eq!(out.lock().unwrap().len(), 960);
@@ -331,11 +352,29 @@ mod tests {
     }
 
     #[test]
+    fn levels_follow_each_member_and_decay() {
+        let (sink, _out) = collect();
+        let mixer = Mixer::start(sink);
+        let loud = mixer.add("loud", 1);
+        let quiet = mixer.add("quiet", 1);
+        loud.push(&[0.5; 960], 1);
+        quiet.push(&[0.05; 960], 1);
+        let levels = mixer.levels();
+        assert_eq!(levels[0].0, "loud");
+        assert!((levels[0].1 - 0.5).abs() < 1e-3 && (levels[1].1 - 0.05).abs() < 1e-3, "{levels:?}");
+        for _ in 0..10 {
+            loud.push(&[0.0; 960], 1);
+        }
+        let after = mixer.levels()[0].1;
+        assert!(after < 0.06, "decays in silence: {after}");
+    }
+
+    #[test]
     fn a_member_queue_is_capped() {
         let (sink, _out) = collect();
         let mixer = Mixer::start(sink);
-        let a = mixer.add(1);
-        let _b = mixer.add(1);
+        let a = mixer.add("m", 1);
+        let _b = mixer.add("m", 1);
         for _ in 0..100 {
             a.push(&[0.1; 960], 1);
         }

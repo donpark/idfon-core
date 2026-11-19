@@ -994,6 +994,16 @@ uint32_t
 media_live_member_count (void);
 
 /** \brief
+ *  Each remote member's audio level, for speaking indicators: JSON
+ *  `{"<broadcast ticket>": level}` (the ticket the room roster carries), level
+ *  a smoothed RMS in 0..1 (speech is
+ *  roughly 0.02 and up). Empty `{}` without a group mix (the device fallback
+ *  keeps no levels). Cheap; poll it from the call UI.
+ */
+char *
+media_live_member_levels (void);
+
+/** \brief
  *  The selected path as one short line for the call UI: `direct 192.168.1.42`
  *  or `relay`. Empty when no connection is attached. The local IP is what
  *  says which network carries the call (192.168.x vs a cellular address) —

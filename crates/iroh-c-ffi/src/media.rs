@@ -422,7 +422,7 @@ fn is_group_peer(peer: &EndpointId) -> bool {
 }
 
 /// A mixer input for one leg, starting the mixer on the shell callback if none runs.
-fn mixer_member(ctx: usize, cb: AudioPlaybackFn, channels: u32) -> crate::mixer::MemberInput {
+fn mixer_member(ctx: usize, cb: AudioPlaybackFn, label: String, channels: u32) -> crate::mixer::MemberInput {
     let mut slot = MIXER.lock().unwrap_or_else(|poison| poison.into_inner());
     let mixer = slot.get_or_insert_with(|| {
         crate::mixer::Mixer::start(Box::new(move |pcm: &[f32], channels: u32| {
@@ -440,7 +440,7 @@ fn mixer_member(ctx: usize, cb: AudioPlaybackFn, channels: u32) -> crate::mixer:
             }
         }))
     });
-    mixer.add(channels)
+    mixer.add(label, channels)
 }
 
 /// Drop the mixer once no leg feeds it.
@@ -1869,7 +1869,7 @@ async fn subscribe_decode_once(
             Some((ctx, cb)) => {
                 // Every leg feeds the mixer, which hands the shell one stream
                 // (a 1:1 call is a mix of one).
-                let member = mixer_member(ctx, cb, input.channels);
+                let member = mixer_member(ctx, cb, ticket.to_string(), input.channels);
                 let channels = input.channels;
                 let paced = PacedPlayback::new(
                     input,
@@ -2474,6 +2474,31 @@ pub fn media_live_remove_member(peer: char_p::Ref<'_>) -> u8 {
     release_mixer_if_idle();
     release_session_if_idle();
     0
+}
+
+/// Each remote member's audio level, for speaking indicators: JSON
+/// `{"<broadcast ticket>": level}` (the ticket the room roster carries), level
+/// a smoothed RMS in 0..1 (speech is
+/// roughly 0.02 and up). Empty `{}` without a group mix (the device fallback
+/// keeps no levels). Cheap; poll it from the call UI.
+#[ffi_export]
+pub fn media_live_member_levels() -> char_p::Box {
+    let levels: serde_json::Map<String, serde_json::Value> = MIXER
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .as_ref()
+        .map(|mixer| {
+            mixer
+                .levels()
+                .into_iter()
+                .map(|(label, level)| (label, serde_json::json!((level * 1000.0).round() / 1000.0)))
+                .collect()
+        })
+        .unwrap_or_default();
+    serde_json::Value::Object(levels)
+        .to_string()
+        .try_into()
+        .unwrap_or_else(|_| char_p::new("{}"))
 }
 
 /// How many remote members the call holds (listen legs).
@@ -4414,6 +4439,13 @@ mod tests {
         eprintln!("DIAG all members: samples={} powers={powers:?}", all.len());
         assert!(all.len() >= 48_000, "the mix kept flowing: {} samples", all.len());
         assert!(tones.iter().all(|&hz| heard(&all, hz)), "every member in the mix: {powers:?}");
+        // Every member reports a level, named by its ticket as the roster carries it.
+        let levels: serde_json::Value =
+            serde_json::from_str(super::media_live_member_levels().to_str()).expect("levels json");
+        for member in &members {
+            let level = levels[member.ticket.as_str()].as_f64().unwrap_or(0.0);
+            assert!(level > 0.02, "a speaking member's level: {levels}");
+        }
 
         // The 660 Hz member leaves, named by its ticket as the room roster carries it.
         let leaving = members[1].ticket.clone();
