@@ -25,7 +25,7 @@ pub(crate) struct Rendition {
 /// Whether this side can decode `codec` right now.
 pub(crate) fn decodable(codec: &str) -> bool {
     match codec {
-        "liquid" => crate::liquid::liquid_available(),
+        "liquid" => moq_audio::external::liquid_available(),
         "opus" | "pcm" => true,
         _ => false,
     }

@@ -174,6 +174,10 @@ fn call_options(
         tracing::debug!(target: "idfon.media", mode, "redundancy mode not available upstream; sending without");
     }
     let _ = (DRED_COVER, PARITY_WINDOW);
+    if codec == AudioCodec::Liquid {
+        // Fixed 80 ms frames; the codec carries its own redundancy, not the encoder knobs.
+        options.frame_duration = std::time::Duration::from_millis(80);
+    }
     Ok(options)
 }
 
@@ -297,18 +301,43 @@ const LIQUID_PLAYOUT_FLOOR_MS: u64 = 120;
 /// The call's audio renditions: the chosen codec first, plus an alternate so
 /// each subscriber can pick (and switch mid-call) by what it can decode and
 /// what its network affords.
-///
-/// TODO(iroh-live-next): fork. `LocalBroadcast::set_audio` takes one encoding,
-/// so the call publishes the chosen codec alone until step 4 brings audio
-/// renditions to `moq-ext-publisher`. LiquidCodec never reaches here (it is
-/// refused at start while the moq fork is out).
+/// Voice-agent PCM stays single. Each rendition is a track named after its
+/// codec (`AudioRendition::from_config`); one source feeds every encoder,
+/// resampled per rendition by moq-audio.
 fn call_renditions(
     codec: AudioCodec,
     sample_rate: u32,
     channels: u32,
     video: bool,
 ) -> anyhow::Result<Vec<AudioOptions>> {
-    Ok(vec![call_options(codec, sample_rate, channels, video)?])
+    let mut renditions = vec![call_options(codec, sample_rate, channels, video)?];
+    match codec {
+        AudioCodec::Liquid => renditions.push(call_options(
+            AudioCodec::Opus,
+            sample_rate,
+            channels,
+            video,
+        )?),
+        AudioCodec::Opus if moq_audio::external::liquid_available() => {
+            renditions.push(call_options(
+                AudioCodec::Liquid,
+                moq_audio::external::liquid::SAMPLE_RATE,
+                1,
+                video,
+            )?)
+        }
+        _ => {}
+    }
+    Ok(renditions)
+}
+
+fn audio_renditions_of(
+    renditions: Vec<AudioOptions>,
+) -> Vec<iroh_live::media::AudioRendition> {
+    renditions
+        .into_iter()
+        .map(iroh_live::media::AudioRendition::from_config)
+        .collect()
 }
 
 /// Stored as `usize` so the function pointer survives a static `Mutex`.
@@ -813,11 +842,7 @@ fn start_live(
                     INPUT_DEVICE.lock().unwrap().clone(),
                 ))
             };
-            let encoding = renditions
-                .into_iter()
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("no audio encoding"))?;
-            broadcast.set_audio(capture.into_source(), encoding)?;
+            broadcast.set_audio_renditions(capture.into_source(), audio_renditions_of(renditions))?;
         }
         if video {
             VIDEO_ENABLED.store(true, Ordering::Relaxed);
@@ -919,7 +944,10 @@ pub fn media_live_start_with_source(audio: u8, video: u8, source: char_p::Ref<'_
 fn supported_audio_profile(codec: AudioCodec, sample_rate: u32) -> bool {
     matches!(
         (codec, sample_rate),
-        (AudioCodec::Opus, 48_000) | (AudioCodec::Opus, 24_000) | (AudioCodec::Pcm, 24_000)
+        (AudioCodec::Opus, 48_000)
+            | (AudioCodec::Opus, 24_000)
+            | (AudioCodec::Pcm, 24_000)
+            | (AudioCodec::Liquid, 24_000)
     )
 }
 
@@ -935,15 +963,7 @@ pub fn media_live_start_with_profile(
     let codec = match codec.to_str() {
         "opus" => AudioCodec::Opus,
         "pcm" => AudioCodec::Pcm,
-        // TODO(iroh-live-next): fork. LiquidCodec needs the moq fork's external
-        // codec (step 3); until then the profile is refused, as with nothing registered.
-        "liquid" => {
-            *LAST_ERROR.lock().unwrap() = Some(
-                "liquid codec unavailable: no implementation registered (media_liquid_register)"
-                    .into(),
-            );
-            return String::new().try_into().unwrap();
-        }
+        "liquid" => AudioCodec::Liquid,
         other => {
             *LAST_ERROR.lock().unwrap() = Some(format!("unknown live audio codec: {other}"));
             return String::new().try_into().unwrap();
@@ -962,6 +982,16 @@ pub fn media_live_start_with_profile(
     }
     if codec == AudioCodec::Pcm && channels != 1 {
         *LAST_ERROR.lock().unwrap() = Some("pcm24k voice-agent calls are mono".into());
+        return String::new().try_into().unwrap();
+    }
+    if codec == AudioCodec::Liquid && channels != 1 {
+        *LAST_ERROR.lock().unwrap() = Some("liquid calls are mono".into());
+        return String::new().try_into().unwrap();
+    }
+    if codec == AudioCodec::Liquid && !moq_audio::external::liquid_available() {
+        *LAST_ERROR.lock().unwrap() = Some(
+            "liquid codec unavailable: no implementation registered (media_liquid_register)".into(),
+        );
         return String::new().try_into().unwrap();
     }
     let source = source.to_str();
@@ -2309,9 +2339,6 @@ fn rebuild_audio_track() -> u8 {
         let Ok(renditions) = call_renditions(codec, sample_rate, channels, video) else {
             return 1;
         };
-        let Some(encoding) = renditions.into_iter().next() else {
-            return 1;
-        };
         // The shell queue is shared across replaces, so a push source keeps
         // whatever it holds; a device source re-opens.
         let capture: Box<dyn AudioCapture> = if push_audio {
@@ -2335,7 +2362,11 @@ fn rebuild_audio_track() -> u8 {
         else {
             return 1;
         };
-        if publication.broadcast.set_audio(source, encoding).is_err() {
+        if publication
+            .broadcast
+            .set_audio_renditions(source, audio_renditions_of(renditions))
+            .is_err()
+        {
             return 1;
         }
         0
@@ -2721,7 +2752,10 @@ mod tests {
     }
 
     #[test]
-    fn liquid_profile_is_refused_until_the_fork_returns() {
+    fn liquid_profile_is_refused_without_an_implementation() {
+        let _guard = crate::util::MEDIA_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         crate::liquid::media_liquid_unregister();
         let refused =
             super::media_live_start_with_profile(1, 0, c"push".into(), c"liquid".into(), 24_000, 1);
@@ -3175,9 +3209,6 @@ mod tests {
     /// LiquidCodec through the real MoQ publish → decode path, with a stand-in codec registered through the same C
     /// callbacks the shell uses: a packet is the frame's mean, decoding yields a constant frame of it. Checks the
     /// 80 ms framing, the catalog, the decoder, and that the profile is refused before registration.
-    // TODO(iroh-live-next): fork. Needs the moq fork's external codec (step 3)
-    // and audio renditions (step 4); compiled out until they return.
-    #[cfg(any())]
     #[test]
     fn liquid_profile_roundtrips_through_the_registered_codec() {
         use std::ffi::c_void;
@@ -3272,15 +3303,9 @@ mod tests {
 
         let ticket_text = super::start_live(true, false, true, None, AudioCodec::Liquid, 24_000, 1)
             .expect("publish liquid");
-        let mut ticket = super::LiveTicket::deserialize(&ticket_text).expect("ticket");
-        ticket.endpoint = super::LIVE
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .live
-            .endpoint()
-            .addr();
+        let ticket: super::BroadcastTicket = ticket_text.parse().expect("ticket");
+        let addr = publisher_addr();
+        let listener = remote_listener();
 
         // 0.25 for the whole push, in 20 ms chunks as the shell does, a little faster than real time so the
         // 20 ms pump never pads a chunk with silence (the capture-side trim bounds the backlog).
@@ -3310,10 +3335,10 @@ mod tests {
         let mut decoded_total = 0;
         let mut channels = 0u32;
         let ended = super::tokio_executor(async {
-            let live = super::subscriber_live().await.expect("listen endpoint");
             super::subscribe_decode_once(
-                live,
+                listener.clone(),
                 ticket,
+                Some(addr),
                 &stop,
                 &mut samples,
                 &mut timing,
@@ -3330,9 +3355,10 @@ mod tests {
         super::media_live_stop();
         super::media_audio_clear_playback_cb();
         crate::liquid::media_liquid_unregister();
-        if let Some(live) = super::SUBSCRIBER_LIVE.lock().unwrap().take() {
-            super::tokio_executor(live.shutdown());
-        }
+        super::tokio_executor(async move {
+            listener.node.shutdown().await;
+            listener.endpoint.close().await;
+        });
         assert!(ended.expect("decode"), "watchdog should end the decode");
         assert_eq!(channels, 1, "liquid decodes mono");
         // Output is 48 kHz (resampled from the codec's 24 kHz). Skip the start (silence, then the resampler's ramp).
@@ -3375,9 +3401,6 @@ mod tests {
     /// Two audio renditions through the real MoQ path: the publisher offers LiquidCodec (a stand-in that
     /// carries each frame's RMS) and Opus; the subscriber prefers LiquidCodec, then — when the codec goes
     /// away mid-call — switches to Opus on its own, without a gap the listener would hear.
-    // TODO(iroh-live-next): fork. Needs the moq fork's external codec (step 3)
-    // and audio renditions (step 4); compiled out until they return.
-    #[cfg(any())]
     #[test]
     fn audio_renditions_switch_mid_call_without_a_gap() {
         use std::ffi::c_void;
@@ -3461,25 +3484,20 @@ mod tests {
 
         let ticket_text = super::start_live(true, false, true, None, AudioCodec::Liquid, 24_000, 1)
             .expect("publish");
-        let mut ticket = super::LiveTicket::deserialize(&ticket_text).expect("ticket");
-        ticket.endpoint = super::LIVE
+        let ticket: super::BroadcastTicket = ticket_text.parse().expect("ticket");
+        let addr = publisher_addr();
+        let listener = remote_listener();
+        let status = super::SESSION
             .lock()
             .unwrap()
             .as_ref()
             .unwrap()
-            .live
-            .endpoint()
-            .addr();
-        let published = super::LIVE
-            .lock()
-            .unwrap()
+            .publication
             .as_ref()
             .unwrap()
-            ._audio
-            .as_ref()
-            .unwrap()
-            .audio()
-            .renditions();
+            .broadcast
+            .status();
+        let published: Vec<String> = status.borrow().renditions.keys().cloned().collect();
         assert_eq!(
             published,
             vec!["liquid".to_string(), "opus".to_string()],
@@ -3521,10 +3539,10 @@ mod tests {
             (Vec::new(), String::new(), 0, 0u32);
         let mut codec_seen = Vec::new();
         let ended = super::tokio_executor(async {
-            let live = super::subscriber_live().await.expect("listen endpoint");
             let decode = super::subscribe_decode_once(
-                live,
+                listener.clone(),
                 ticket,
+                Some(addr),
                 &stop,
                 &mut samples,
                 &mut timing,
@@ -3551,9 +3569,10 @@ mod tests {
         super::media_live_stop();
         super::media_audio_clear_playback_cb();
         super::media_live_set_audio_preference(c"".into());
-        if let Some(live) = super::SUBSCRIBER_LIVE.lock().unwrap().take() {
-            super::tokio_executor(live.shutdown());
-        }
+        super::tokio_executor(async move {
+            listener.node.shutdown().await;
+            listener.endpoint.close().await;
+        });
         assert!(ended.expect("decode"), "watchdog should end the decode");
         let codecs: Vec<String> = codec_seen.into_iter().flatten().collect();
         eprintln!("DIAG codecs over time: {codecs:?}");
