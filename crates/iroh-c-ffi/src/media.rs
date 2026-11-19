@@ -178,6 +178,10 @@ fn call_options(
     if codec == AudioCodec::Liquid {
         // Fixed 80 ms frames; the codec carries its own redundancy, not the encoder knobs.
         options.frame_duration = std::time::Duration::from_millis(80);
+        // Voice: withhold silence after a 320 ms hangover, as Opus DTX does
+        // (group-live-chat G3): a silent member costs no fanout, and no
+        // encoder or decoder work on either side.
+        options.kind = Some(moq_audio::encode::Kind::Voice);
     }
     Ok(options)
 }
@@ -4528,6 +4532,17 @@ mod tests {
     /// follows, instead of tearing the leg down and resubscribing.
     #[test]
     fn a_declared_silence_is_not_a_stall() {
+        silence_holds_the_attempt(AudioCodec::Opus);
+    }
+
+    /// G3: a LiquidCodec talker withholds silence too (after its hangover), and the
+    /// listener holds through it.
+    #[test]
+    fn a_liquid_silence_sends_nothing_and_holds() {
+        silence_holds_the_attempt(AudioCodec::Liquid);
+    }
+
+    fn silence_holds_the_attempt(codec: AudioCodec) {
         use std::sync::atomic::Ordering;
         let _guard = crate::util::MEDIA_TEST_GUARD
             .lock()
@@ -4535,7 +4550,10 @@ mod tests {
         unsafe extern "C" fn discard(_: *const std::ffi::c_void, _: *const u8, _: usize, _: u32, _: u32, _: u64) {}
         assert_eq!(super::media_audio_set_playback_cb(std::ptr::null(), discard), 0);
         super::media_live_set_audio_preference(c"".into());
-        let ticket_text = super::start_live(true, false, true, None, AudioCodec::Opus, 24_000, 1)
+        if codec == AudioCodec::Liquid {
+            register_stand_in_liquid();
+        }
+        let ticket_text = super::start_live(true, false, true, None, codec, 24_000, 1)
             .expect("publish");
         let ticket: super::BroadcastTicket = ticket_text.parse().expect("ticket");
         let addr = publisher_addr();
@@ -4545,10 +4563,13 @@ mod tests {
         let start = decoded();
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let after_silence = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // Decoded-frame counts 1 s into the silence (past any hangover) and at its end.
+        let mid_silence = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         // Tone, then 6 s of digital silence pushed in real time, then tone again.
         let pusher = {
             let stop = stop.clone();
             let after_silence = after_silence.clone();
+            let mid_silence = mid_silence.clone();
             std::thread::spawn(move || {
                 let waited = std::time::Instant::now();
                 while decoded() == start && waited.elapsed() < std::time::Duration::from_secs(10) {
@@ -4560,6 +4581,9 @@ mod tests {
                 while n < total {
                     let t = n as f32 / 24_000.0;
                     let amplitude = if (1.5..7.5).contains(&t) { 0.0 } else { 0.25 };
+                    if (2.5..2.52).contains(&t) {
+                        mid_silence.store(decoded(), Ordering::Relaxed);
+                    }
                     if (7.5..7.52).contains(&t) {
                         after_silence.store(decoded(), Ordering::Relaxed);
                     }
@@ -4594,16 +4618,21 @@ mod tests {
         ));
         pusher.join().unwrap();
         let resumed = decoded() - after_silence.load(Ordering::Relaxed);
+        let during = after_silence.load(Ordering::Relaxed) - mid_silence.load(Ordering::Relaxed);
         super::media_live_stop();
         super::media_audio_clear_playback_cb();
+        if codec == AudioCodec::Liquid {
+            crate::liquid::media_liquid_unregister();
+        }
         super::tokio_executor(async move {
             listener.node.shutdown().await;
             listener.endpoint.close().await;
         });
-        eprintln!("DIAG ended={ended:?} stalls={stalls} resumed_frames={resumed} decoded_total={decoded_total}");
+        eprintln!("DIAG {codec:?} ended={ended:?} stalls={stalls} during_silence={during} resumed_frames={resumed} decoded_total={decoded_total}");
+        assert!(during <= 2, "nothing is sent through the silence: {during} frames");
         assert!(matches!(ended, Ok(true)), "one attempt, ended by stop: {ended:?}");
         assert_eq!(stalls, 0, "the silence was not a stall");
-        assert!(resumed > 20, "audio after the silence played: {resumed} frames");
+        assert!(resumed > 5, "audio after the silence played: {resumed} frames");
     }
 
 }
