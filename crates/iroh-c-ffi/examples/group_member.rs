@@ -165,6 +165,7 @@ fn main() {
     let mut members_max = 0usize;
     let started = Instant::now();
     let mut left = false;
+    let mut rejoins = 0usize;
     while started.elapsed() < Duration::from_secs(args.seconds) {
         if let Some(after) = args.leave_after {
             if !left && started.elapsed() >= Duration::from_secs(after) {
@@ -178,6 +179,18 @@ fn main() {
         }
         if !left {
             let status = cli(&args, &["room", "call", "status", &args.room]);
+            // The daemon forgot us (it restarted) while we still want in: re-join
+            // with the same broadcast, as the apps do.
+            let call = &status["result"]["call"];
+            let daemon_up = status["ok"].as_bool() == Some(true);
+            if daemon_up && call["joined"].as_bool() != Some(true) && call["refused"].is_null() {
+                eprintln!("[group_member {}] daemon no longer has us in the call; re-joining", args.hz);
+                rejoins += 1;
+                cli(
+                    &args,
+                    &["room", "call", "join", &args.room, "--ticket", &ticket, "--addr", &addr, "--audio-codec", &args.codec],
+                );
+            }
             let roster: std::collections::BTreeMap<String, (String, String)> = status["result"]["call"]["members"]
                 .as_array()
                 .map(|members| {
@@ -232,7 +245,7 @@ fn main() {
     println!(
         "{}",
         serde_json::json!({
-            "hz": args.hz, "heard": report, "members_max": members_max, "members_final": members_final,
+            "hz": args.hz, "heard": report, "members_max": members_max, "members_final": members_final, "rejoins": rejoins,
             "mix_samples": mix.len(), "left": left, "ok": ok,
         })
     );
