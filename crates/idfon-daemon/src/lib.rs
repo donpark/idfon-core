@@ -14,6 +14,7 @@ mod diag_views;
 mod live;
 mod mcp;
 mod relay_auth;
+mod room_calls;
 
 use axum::{
     extract::{Path as AxumPath, State},
@@ -179,11 +180,17 @@ impl TransportMode {
         // The fake transport dials a fixed placeholder; the real one tries
         // each device of the peer's account until one acknowledges.
         if matches!(self, Self::Fake(_)) {
-            return self.send_to(
-                identity,
-                "0000000000000000000000000000000000000000000000000000000000000000",
-                message,
-            );
+            // The peer's first device when it has one, so tests can route by
+            // target; otherwise the placeholder.
+            let target = peer
+                .dial_targets_with(policy)
+                .into_iter()
+                .next()
+                .map(|(_, address)| address)
+                .unwrap_or_else(|| {
+                    "0000000000000000000000000000000000000000000000000000000000000000".to_string()
+                });
+            return self.send_to(identity, &target, message);
         }
         let targets = peer.dial_targets_with(policy);
         deliver(policy, targets, |endpoint_id, address| {
@@ -341,6 +348,9 @@ struct Store {
     ring_score_v1: bool,
     #[serde(skip)]
     data_dir: PathBuf,
+    /// Group-call sessions (G1): runtime only, rebuilt as members re-announce.
+    #[serde(skip)]
+    room_calls: room_calls::RoomCalls,
 }
 
 impl Store {
@@ -415,6 +425,7 @@ impl Store {
                     call_mode_auto_v1: true,
                     ring_score_v1: true,
                     data_dir: data_dir.to_path_buf(),
+                    room_calls: Default::default(),
                 };
                 let mut store = store;
                 store.ensure_identity_keys(data_dir)?;
@@ -1288,6 +1299,7 @@ fn wire_identity(transport: Arc<TransportMode>, store: Arc<Mutex<Store>>, identi
     let TransportMode::Iroh(manager) = transport.as_ref() else {
         return;
     };
+    room_calls::set_live_transport(&store, Arc::clone(&transport));
     let manager = Arc::clone(manager);
     spawn_receiver(Arc::clone(&manager), Arc::clone(&store), identity.clone());
     let mcp_manager = Arc::clone(&manager);
@@ -2491,6 +2503,10 @@ fn dispatch_with_transport(
         "room.list" => room_list(&request, store),
         "room.send" => room_send(&request, store, transport),
         "room.leave" => room_leave(&request, store),
+        "room.call.join" => room_calls::join(&request, store, transport),
+        "room.call.leave" => room_calls::leave(&request, store, transport),
+        "room.call.status" => room_calls::status(&request, store),
+        "room.call.peer_lost" => room_calls::peer_lost(&request, store),
         "operation.get" => operation_get(&request, store),
         "operation.wait" => operation_wait(&request, store),
         "operation.cancel" => operation_cancel(&request, store),
@@ -3111,6 +3127,7 @@ fn room_create(
     let kind = request_text(&request.params, "kind").unwrap_or_else(|| "project".into());
     let icon = request_text(&request.params, "icon");
     let repo = request_text(&request.params, "repo");
+    let call_auto_close = request.params.get("call_auto_close").and_then(serde_json::Value::as_bool);
     let member_refs: Vec<String> = request
         .params
         .get("members")
@@ -3163,6 +3180,7 @@ fn room_create(
         kind,
         icon,
         repo,
+        call_auto_close,
     };
     state.rooms.push(room.clone());
     record_state_event(
@@ -4121,8 +4139,20 @@ fn receive_message(request: &Request, store: &Arc<Mutex<Store>>) -> Response {
         let excess = state.events.len() - EVENT_RETENTION;
         state.events.drain(..excess);
     }
+    // Group-call signaling (G1): room controls update the room's call.
+    let idfon_protocol::MessageContent::Text { text } = &envelope.content;
+    let room_control = room_calls::on_received(
+        &mut state,
+        &receiving_identity,
+        &envelope.sender.peer_id,
+        envelope.conversation.as_deref(),
+        text,
+    );
     let result = state.save(&state.data_dir);
     drop(state);
+    if room_control {
+        room_calls::flush_live(store);
+    }
     if let Err(error) = result {
         return error_response(
             request.id.clone(),
@@ -10072,4 +10102,178 @@ mod tests {
         assert!(Store::load(&dir).unwrap().rooms.is_empty());
         std::fs::remove_dir_all(dir).unwrap();
     }
+
+    /// G1: group-call signaling across daemons. Each store's sends are routed
+    /// to the target store as `message.receive`, and the receiver's replies
+    /// drain from its outbox, as the live transport would send them.
+    #[test]
+    fn room_call_signaling_across_daemons() {
+        // Sends deliver on spawned tasks.
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        struct Node {
+            store: Arc<Mutex<Store>>,
+            fake: FakeTransport,
+            transport: Arc<TransportMode>,
+            peer_id: String,
+            endpoint: String,
+            dir: PathBuf,
+        }
+        let node = |name: &str| {
+            let dir = temp_dir(name);
+            let store = Arc::new(Mutex::new(Store::load(&dir).unwrap()));
+            let (peer_id, endpoint) = {
+                let state = store.lock().unwrap();
+                let peer_id = idfon_core::peer_id(&state.identity_key("default").unwrap());
+                let endpoint_key = state.endpoint_key("default").unwrap();
+                let endpoint = iroh::SecretKey::from_bytes(&endpoint_key.to_bytes()).public();
+                (peer_id, endpoint.to_string())
+            };
+            let fake = FakeTransport::default();
+            let transport = Arc::new(TransportMode::Fake(fake.clone()));
+            Node { store, fake, transport, peer_id, endpoint, dir }
+        };
+        let nodes: Vec<Node> = ["call-a", "call-b", "call-c", "call-d"].iter().map(|n| node(n)).collect();
+        // Everyone knows everyone; a, b and c share room r_call; d is outside it.
+        for me in &nodes {
+            let mut state = me.store.lock().unwrap();
+            for other in nodes.iter().filter(|o| o.peer_id != me.peer_id) {
+                let endpoint: iroh::EndpointId = other.endpoint.parse().unwrap();
+                state.peers.push(idfon_protocol::Peer {
+                    id: other.peer_id.clone(),
+                    identity: "default".into(),
+                    name: other.peer_id[..8].to_string(),
+                    endpoint_id: Some(other.endpoint.clone()),
+                    endpoint_addr: Some(serde_json::to_string(&EndpointAddr::new(endpoint)).unwrap()),
+                    devices: Vec::new(),
+                    aliases: Vec::new(),
+                    ring_score: None,
+                    call_mode: None,
+                    pinned: false,
+                    instant_call: false,
+                });
+                for capability in [idfon_protocol::Capability::MessageSend, idfon_protocol::Capability::MessageReceive] {
+                    state.grants.push(idfon_protocol::CapabilityGrant {
+                        capability,
+                        identity: "default".into(),
+                        subject: other.peer_id.clone(),
+                        conversation: None,
+                        active_at: "0".into(),
+                        expires_at: None,
+                        revision: 1,
+                        revoked_at: None,
+                    });
+                }
+            }
+        }
+        let rpc = |node: &Node, method: &str, params: serde_json::Value| -> serde_json::Value {
+            let response = dispatch_with_transport(
+                Request { version: PROTOCOL_VERSION, id: method.into(), method: method.into(), params },
+                &node.store,
+                Some(&node.transport),
+            );
+            match response.body {
+                ResponseBody::Success { result, .. } => result,
+                ResponseBody::Failure { error, .. } => panic!("{method} failed: {}", error.message),
+            }
+        };
+        let room_members = |me: usize, members: &[usize]| {
+            let ids: Vec<String> = members.iter().filter(|m| **m != me).map(|m| nodes[*m].peer_id.clone()).collect();
+            rpc(&nodes[me], "room.create", serde_json::json!({"id": "r_call", "members": ids}));
+        };
+        for me in 0..3 {
+            room_members(me, &[0, 1, 2]);
+        }
+        // d's own view of "r_call" includes a, but a's room does not include d.
+        room_members(3, &[0, 3]);
+        // Deliver every pending send until the network is quiet.
+        let route = || {
+            let mut quiet = 0;
+            for _round in 0..200 {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                let mut moved = false;
+                for from in &nodes {
+                    for (target, envelope) in from.fake.take_sent_to() {
+                        let to = nodes.iter().find(|n| n.endpoint == target).expect("routed to a known node");
+                        moved = true;
+                        let mut params = serde_json::to_value(&envelope).unwrap();
+                        params["identity"] = "default".into();
+                        let response = dispatch_with_transport(
+                            Request { version: PROTOCOL_VERSION, id: "rx".into(), method: "message.receive".into(), params },
+                            &to.store,
+                            Some(&to.transport),
+                        );
+                        assert!(response.ok, "receive failed: {response:?}");
+                        room_calls::flush(&to.store, &to.transport);
+                    }
+                }
+                quiet = if moved { 0 } else { quiet + 1 };
+                if quiet >= 8 {
+                    return;
+                }
+            }
+            panic!("signaling did not settle");
+        };
+        let status = |me: usize| rpc(&nodes[me], "room.call.status", serde_json::json!({"room": "r_call"}))["call"].clone();
+        let members_of = |me: usize| -> Vec<String> {
+            let mut peers: Vec<String> = status(me)["members"]
+                .as_array()
+                .map(|m| m.iter().map(|m| m["peer"].as_str().unwrap().to_string()).collect())
+                .unwrap_or_default();
+            peers.sort();
+            peers
+        };
+        let ids = |list: &[usize]| -> Vec<String> {
+            let mut v: Vec<String> = list.iter().map(|i| nodes[*i].peer_id.clone()).collect();
+            v.sort();
+            v
+        };
+        let join = |me: usize| {
+            rpc(&nodes[me], "room.call.join", serde_json::json!({
+                "room": "r_call", "ticket": format!("ilv1:{me}"), "addr": "{}", "audio_codec": "liquid"
+            }))
+        };
+
+        join(0);
+        route();
+        join(1);
+        route();
+        join(2);
+        route();
+        let call_id = status(0)["call_id"].clone();
+        assert!(call_id.is_string());
+        for me in 0..3 {
+            assert_eq!(status(me)["call_id"], call_id, "node {me} in one session");
+            assert_eq!(status(me)["people"], 3, "node {me}");
+            let others: Vec<usize> = (0..3).filter(|o| *o != me).collect();
+            assert_eq!(members_of(me), ids(&others), "node {me} hears the other two");
+        }
+        // The app learns the roster from events.
+        let events = rpc(&nodes[2], "events", serde_json::json!({"type": "room.call.updated"}));
+        assert!(!events["events"].as_array().unwrap().is_empty());
+
+        // d is not a member of a's room: its join is ignored.
+        join(3);
+        route();
+        assert_eq!(status(0)["people"], 3, "a ignores a join from outside its room");
+        assert!(!members_of(0).contains(&nodes[3].peer_id));
+
+        // b leaves; a and c drop it.
+        rpc(&nodes[1], "room.call.leave", serde_json::json!({"room": "r_call"}));
+        route();
+        assert_eq!(members_of(0), ids(&[2]));
+        assert_eq!(members_of(2), ids(&[0]));
+        // a and c leave: auto-close ends the session for everyone.
+        rpc(&nodes[0], "room.call.leave", serde_json::json!({"room": "r_call"}));
+        route();
+        rpc(&nodes[2], "room.call.leave", serde_json::json!({"room": "r_call"}));
+        route();
+        for me in 0..3 {
+            assert!(status(me)["call_id"].is_null(), "node {me}: session closed");
+        }
+        for node in nodes {
+            let _ = std::fs::remove_dir_all(node.dir);
+        }
+    }
+
 }
