@@ -73,6 +73,35 @@ fn new_call_id() -> String {
     unique_key("call")
 }
 
+/// Wall clock in ms: the state machine's time (join order, refresh, expiry).
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+/// This identity's peer id as other members see it (the sender id on its
+/// messages): the cap's tie-break.
+fn self_peer(state: &Store, identity: &str) -> String {
+    state
+        .identities
+        .iter()
+        .find(|candidate| candidate.id == identity)
+        .and_then(|candidate| candidate.public_key.clone())
+        .unwrap_or_else(|| identity.to_string())
+}
+
+/// The room's call, created on first use.
+fn call_for<'a>(state: &'a mut Store, identity: &str, room: &idfon_protocol::Room) -> &'a mut RoomCall {
+    let me = self_peer(state, identity);
+    state
+        .room_calls
+        .calls
+        .entry(key(identity, &room.id))
+        .or_insert_with(|| RoomCall::new(room.id.clone(), me, room.call_auto_close()))
+}
+
 /// The event payload: the roster and this side's place in it.
 fn call_json(call: &RoomCall, ended: bool) -> serde_json::Value {
     serde_json::json!({
@@ -83,19 +112,50 @@ fn call_json(call: &RoomCall, ended: bool) -> serde_json::Value {
         "members": call.members.values().collect::<Vec<_>>(),
         "auto_close": call.auto_close,
         "refused": call.refused,
+        "waiting": call.waiting.is_some(),
         "ended": ended,
     })
 }
 
-/// Queue the sends, and publish the new state as `room.call.updated`.
-fn apply(state: &mut Store, identity: &str, call: &RoomCall, effects: Vec<Effect>) {
+/// Queue the sends, and publish the new state as `room.call.updated` when
+/// what the app sees changed (`before`: the call's JSON before the change).
+fn apply(state: &mut Store, identity: &str, call: &RoomCall, effects: Vec<Effect>, before: Option<serde_json::Value>) {
     let ended = effects.iter().any(|effect| *effect == Effect::Ended);
     for effect in effects {
         if matches!(effect, Effect::SendRoom(_) | Effect::SendDirect { .. }) {
             state.room_calls.outbox.push((identity.to_string(), call.room.clone(), effect));
         }
     }
-    record_state_event(state, identity, "room.call.updated", call_json(call, ended));
+    let after = call_json(call, ended);
+    if before.as_ref() != Some(&after) {
+        record_state_event(state, identity, "room.call.updated", after);
+    }
+}
+
+/// Run every call's clock: refreshes and expiry. Called about once a second.
+pub(super) fn tick_all(store: &Arc<Mutex<Store>>) {
+    let now = now_ms();
+    let any = {
+        let mut state = store.lock().expect("store mutex poisoned");
+        let keys: Vec<String> = state.room_calls.calls.keys().cloned().collect();
+        let mut any = false;
+        for key in keys {
+            let Some(call) = state.room_calls.calls.get_mut(&key) else { continue };
+            let before = call_json(call, false);
+            let effects = call.tick(now);
+            if effects.is_empty() {
+                continue;
+            }
+            any = true;
+            let call = call.clone();
+            let identity = key.split_once(':').map(|(identity, _)| identity.to_string()).unwrap_or_default();
+            apply(&mut state, &identity, &call, effects, Some(before));
+        }
+        any
+    };
+    if any {
+        flush_live(store);
+    }
 }
 
 /// A received message, under the store lock. Feeds room controls from room
@@ -127,15 +187,12 @@ pub(super) fn on_received(
         tracing::warn!(target: "idfon.daemon", room = %room.id, sender = %sender, "room call control from outside the room; ignored");
         return true;
     }
-    let call = state
-        .room_calls
-        .calls
-        .entry(key(identity, &room.id))
-        .or_insert_with(|| RoomCall::new(room.id.clone(), room.call_auto_close()));
-    let effects = call.receive(sender, &control);
+    let call = call_for(state, identity, &room);
+    let before = call_json(call, false);
+    let effects = call.receive(sender, &control, now_ms());
     let call = call.clone();
     tracing::info!(target: "idfon.daemon", room = %room.id, sender = %sender, action = ?control.action, people = call.people(), "room call control");
-    apply(state, identity, &call, effects);
+    apply(state, identity, &call, effects, Some(before));
     true
 }
 
@@ -248,15 +305,12 @@ pub(super) fn join(
             Ok(found) => found,
             Err(response) => return response,
         };
-        let call = state
-            .room_calls
-            .calls
-            .entry(key(&identity, &room.id))
-            .or_insert_with(|| RoomCall::new(room.id.clone(), room.call_auto_close()));
+        let call = call_for(&mut state, &identity, &room);
         call.room_auto_close = room.call_auto_close();
-        let effects = call.join(local, new_call_id);
+        let before = call_json(call, false);
+        let effects = call.join(local, now_ms(), new_call_id);
         let call = call.clone();
-        apply(&mut state, &identity, &call, effects);
+        apply(&mut state, &identity, &call, effects, Some(before));
         let dir = state.data_dir.clone();
         let _ = state.save(&dir);
         call
@@ -284,9 +338,10 @@ pub(super) fn leave(
         let Some(call) = state.room_calls.calls.get_mut(&key(&identity, &room.id)) else {
             return success(request, serde_json::json!({ "call": null }));
         };
-        let effects = call.leave();
+        let before = call_json(call, false);
+        let effects = call.leave(now_ms());
         let call = call.clone();
-        apply(&mut state, &identity, &call, effects);
+        apply(&mut state, &identity, &call, effects, Some(before));
         let dir = state.data_dir.clone();
         let _ = state.save(&dir);
         call
@@ -307,9 +362,10 @@ pub(super) fn peer_lost(request: &Request, store: &Arc<Mutex<Store>>) -> Respons
     let Some(call) = state.room_calls.calls.get_mut(&key(&identity, &room.id)) else {
         return success(request, serde_json::json!({ "call": null }));
     };
-    let effects = call.peer_lost(&peer);
+    let before = call_json(call, false);
+    let effects = call.peer_lost(&peer, now_ms());
     let call = call.clone();
-    apply(&mut state, &identity, &call, effects);
+    apply(&mut state, &identity, &call, effects, Some(before));
     drop(state);
     flush_live(store);
     success(request, serde_json::json!({ "call": call_json(&call, call.call_id.is_none()) }))

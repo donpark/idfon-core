@@ -1300,6 +1300,19 @@ fn wire_identity(transport: Arc<TransportMode>, store: Arc<Mutex<Store>>, identi
         return;
     };
     room_calls::set_live_transport(&store, Arc::clone(&transport));
+    // Group-call clock: refreshes and expiry, one ticker per daemon.
+    static ROOM_CALL_TICKER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !ROOM_CALL_TICKER.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        let store = Arc::clone(&store);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                let store = Arc::clone(&store);
+                let _ = tokio::task::spawn_blocking(move || room_calls::tick_all(&store)).await;
+            }
+        });
+    }
     let manager = Arc::clone(manager);
     spawn_receiver(Arc::clone(&manager), Arc::clone(&store), identity.clone());
     let mcp_manager = Arc::clone(&manager);
