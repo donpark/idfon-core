@@ -200,16 +200,18 @@ pub fn media_live_set_audio_preference(codec: char_p::Ref<'_>) -> u8 {
 
 /// The catalog's audio renditions, for crate::audio_rendition.
 fn audio_renditions(catalog: &iroh_live::media::Catalog) -> Vec<crate::audio_rendition::Rendition> {
-    catalog
-        .audio
-        .renditions
-        .iter()
-        .map(|(name, config)| crate::audio_rendition::Rendition {
-            name: name.clone(),
-            codec: config.codec.to_string(),
-            bitrate: config.bitrate,
-        })
-        .collect()
+    crate::audio_rendition::in_publisher_order(
+        catalog
+            .audio
+            .renditions
+            .iter()
+            .map(|(name, config)| crate::audio_rendition::Rendition {
+                name: name.clone(),
+                codec: config.codec.to_string(),
+                bitrate: config.bitrate,
+            })
+            .collect(),
+    )
 }
 
 /// The codec of the audio track being decoded, for the call's status line.
@@ -302,8 +304,8 @@ const LIQUID_PLAYOUT_FLOOR_MS: u64 = 120;
 /// The call's audio renditions: the chosen codec first, plus an alternate so
 /// each subscriber can pick (and switch mid-call) by what it can decode and
 /// what its network affords.
-/// Voice-agent PCM stays single. Each rendition is a track named after its
-/// codec (`AudioRendition::from_config`); one source feeds every encoder,
+/// Voice-agent PCM stays single. Each rendition is a track named by its
+/// position and codec (`rendition_name`); one source feeds every encoder,
 /// resampled per rendition by moq-audio.
 fn call_renditions(
     codec: AudioCodec,
@@ -332,13 +334,40 @@ fn call_renditions(
     Ok(renditions)
 }
 
+/// The track name of the `index`th call rendition: `{index}.{codec}` (`0.opus`, `1.liquid`).
+///
+/// The catalog lists renditions in a map keyed by name, so the publisher's order (its chosen codec
+/// first) survives only in the names; a subscriber sorts by name to recover it.
+fn rendition_name(index: usize, options: &AudioOptions) -> String {
+    let codec = iroh_live::media::AudioRendition::from_config(options.clone()).name;
+    format!("{index}.{codec}")
+}
+
 fn audio_renditions_of(
     renditions: Vec<AudioOptions>,
 ) -> Vec<iroh_live::media::AudioRendition> {
     renditions
         .into_iter()
-        .map(iroh_live::media::AudioRendition::from_config)
+        .enumerate()
+        .map(|(index, options)| {
+            iroh_live::media::AudioRendition::new(rendition_name(index, &options), options)
+        })
         .collect()
+}
+
+/// The Opus rendition's track name, its configured bitrate and its channel count, for audio ABR.
+fn opus_abr_target(renditions: &[AudioOptions]) -> Option<(String, u64, u32)> {
+    renditions
+        .iter()
+        .enumerate()
+        .find(|(_, o)| o.codec == AudioCodec::Opus)
+        .map(|(index, opus)| {
+            (
+                rendition_name(index, opus),
+                opus.bitrate.as_ref().map_or(0, |rate| rate.as_bps()),
+                opus.layout.channels(),
+            )
+        })
 }
 
 /// Stored as `usize` so the function pointer survives a static `Mutex`.
@@ -842,16 +871,7 @@ fn start_live(
             let renditions = call_renditions(codec, sample_rate, channels, video)?;
             // Audio ABR (docs/media-adaptation.md §C5): the Opus rendition follows the
             // sessions' send estimates (crate::abr). Started after the audio is set.
-            let abr = renditions
-                .iter()
-                .find(|o| o.codec == AudioCodec::Opus)
-                .map(|opus| {
-                    (
-                        iroh_live::media::AudioRendition::from_config(opus.clone()).name,
-                        opus.bitrate.as_ref().map_or(0, |rate| rate.as_bps()),
-                        opus.layout.channels(),
-                    )
-                });
+            let abr = opus_abr_target(&renditions);
             // Capture device is the default live source; shell-pushed PCM
             // remains available through `media_audio_push_samples`.
             let capture: Box<dyn AudioCapture> = if push_audio {
@@ -1153,12 +1173,14 @@ pub fn media_live_last_error() -> char_p::Box {
 /// when no live session is running.
 #[ffi_export]
 pub fn media_live_endpoint_addr() -> char_p::Box {
-    let json = SESSION
+    let endpoint = SESSION
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
         .as_ref()
         .filter(|session| session.publication.is_some())
-        .and_then(|session| serde_json::to_string(&session.endpoint.addr()).ok())
+        .map(|session| session.endpoint.clone());
+    let json = endpoint
+        .map(|endpoint| serde_json::to_string(&addr_with_relay(&endpoint)).unwrap_or_default())
         .unwrap_or_default();
     if !json.is_empty() {
         // Logged so device traces show whether the addr carried a Relay
@@ -1167,6 +1189,31 @@ pub fn media_live_endpoint_addr() -> char_p::Box {
     }
     json.try_into().unwrap()
 }
+/// How long [`addr_with_relay`] waits for a fresh endpoint to pick its home relay.
+const HOME_RELAY_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The endpoint's address, waiting up to [`HOME_RELAY_WAIT`] for it to carry a relay URL.
+///
+/// A call endpoint is fresh, and its home relay arrives a few hundred ms after it binds. An invite
+/// sent before then carries only direct addresses, so when the network changes (Wi-Fi to cellular)
+/// the far side has no way back: the 2026-11-18 two-iPhone test lost a call for good that way. The
+/// wait is a poll, because the shells call this from plain threads. A relay-less setup (relay off)
+/// returns after the wait with direct addresses only.
+fn addr_with_relay(endpoint: &Endpoint) -> EndpointAddr {
+    let started = std::time::Instant::now();
+    loop {
+        let addr = endpoint.addr();
+        if addr.relay_urls().next().is_some() || started.elapsed() >= HOME_RELAY_WAIT {
+            if addr.relay_urls().next().is_none() {
+                tracing::warn!(target: "idfon.media", waited_ms = started.elapsed().as_millis() as u64,
+                    "live endpoint addr has no relay yet; the far side can only dial direct addresses");
+            }
+            return addr;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 #[ffi_export]
 pub fn media_live_stop() {
     // Fold the per-call report before the counters reset (health §B2.2).
@@ -1274,6 +1321,15 @@ pub fn media_live_path_changed() {
 ///
 /// A selected path that *closes* does not wait at all: the path-event watcher
 /// ends the attempt immediately.
+/// The stall window without the post-path-change shortening: 4 s direct, 2 s relay.
+fn normal_stall_window(relay: bool) -> std::time::Duration {
+    if relay {
+        std::time::Duration::from_secs(2)
+    } else {
+        std::time::Duration::from_secs(4)
+    }
+}
+
 fn stall_window(relay: bool) -> std::time::Duration {
     let recent_path = PATH_CHANGED_AT
         .lock()
@@ -1546,18 +1602,37 @@ async fn subscribe_decode_once(
     // The endpoint is the session's, not the attempt's: a retry after a path
     // change dials from a warm endpoint instead of bootstrapping one
     // (docs/media-adaptation.md §C2, the 4.2 s hole).
+    // The peer session this attempt used. An attempt that ends early closes it, so the retry
+    // redials: `Node::connect` hands back an existing session as it is, and a session whose path
+    // died (Wi-Fi to cellular) stays open until QUIC's idle timeout, so retries would otherwise
+    // keep subscribing over the dead one (iroh-live upgrade, two-iPhone test 2026-11-18).
+    let mut used_session: Option<iroh_live::Session> = None;
+    let attempt_started = std::time::Instant::now();
     let res = async {
         // Dial the known address first: a bare-id dial waits on discovery,
         // which failed outright with the relay off (iroh-live upgrade, step 1).
         if let Some(addr) = addr {
-            tokio::time::timeout(std::time::Duration::from_secs(8), session.node.connect(addr))
-                .await
-                .map_err(|_| anyhow::anyhow!("dial timed out"))??;
+            tracing::info!(
+                target: "idfon.media",
+                attempt,
+                peer = %addr.id.fmt_short(),
+                relays = addr.relay_urls().count(),
+                ips = addr.ip_addrs().count(),
+                "subscribe dial"
+            );
+            let dialed =
+                tokio::time::timeout(std::time::Duration::from_secs(8), session.node.connect(addr))
+                    .await
+                    .map_err(|_| anyhow::anyhow!("dial timed out"))??;
+            used_session = Some(dialed);
         }
         let subscription = session
             .node
             .subscribe(ticket.path().clone(), Reach::Direct(ticket.peer()))
             .await?;
+        if let Some(serving) = subscription.session() {
+            used_session = Some(serving);
+        }
         // Event-driven detection: when the *selected* path closes, rebuild
         // now instead of waiting out the silence window. A non-selected path
         // closing (the relay after a direct path wins, an old candidate) is
@@ -1582,8 +1657,12 @@ async fn subscribe_decode_once(
                         break;
                     }
                     match event {
-                        iroh::endpoint::PathEvent::Selected { id, .. } => selected = Some(id),
+                        iroh::endpoint::PathEvent::Selected { id, .. } => {
+                            tracing::info!(target: "idfon.media", path = ?id, "path selected");
+                            selected = Some(id);
+                        }
                         iroh::endpoint::PathEvent::Closed { id, .. } if selected == Some(id) => {
+                            tracing::info!(target: "idfon.media", path = ?id, "selected path closed");
                             flag.store(true, Ordering::Relaxed);
                             break;
                         }
@@ -1635,16 +1714,25 @@ async fn subscribe_decode_once(
             .clone();
         let mut policy = crate::audio_rendition::Policy::new();
         let renditions = audio_renditions(&catalog);
-        let Some(chosen) = policy
-            .choose(
+        let Some((chosen, reason)) = policy
+            .choose_with_reason(
                 &renditions,
                 preferred.as_deref(),
                 crate::audio_rendition::decodable,
             )
-            .cloned()
+            .map(|(chosen, reason)| (chosen.clone(), reason))
         else {
             anyhow::bail!("broadcast has no audio track this side can decode");
         };
+        tracing::info!(
+            target: "idfon.media",
+            offered = ?renditions.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            preference = preferred.as_deref().unwrap_or("none"),
+            chosen = %chosen.name,
+            %reason,
+            attempt,
+            "audio rendition chosen"
+        );
         let config = catalog
             .audio
             .renditions
@@ -1756,6 +1844,7 @@ async fn subscribe_decode_once(
         // died without SUBSCRIBE_END, and consumer.read() then never returns
         // — neither frames nor a track end). Treat it like an early end.
         let mut last_frame = std::time::Instant::now();
+        let mut first_frame_seen = false;
         let mut last_choice = std::time::Instant::now();
         type PendingSwitch = std::pin::Pin<
             Box<
@@ -1790,7 +1879,15 @@ async fn subscribe_decode_once(
             let relay = subscription
                 .serving_link()
                 .is_some_and(|link| link.sample.relayed);
-            if last_frame.elapsed() >= stall_window(relay) {
+            // A fresh attempt gets the full window before its first frame: the 500 ms window after a
+            // path change is for noticing a stream that went quiet, and a resubscribe needs longer
+            // than that to deliver anything, so it used to end every retry before audio could arrive.
+            let window = if first_frame_seen {
+                stall_window(relay)
+            } else {
+                stall_window(relay).max(normal_stall_window(relay))
+            };
+            if last_frame.elapsed() >= window {
                 tracing::warn!(
                     attempt,
                     decoded = *decoded_total,
@@ -1911,6 +2008,16 @@ async fn subscribe_decode_once(
                 return Err(anyhow::anyhow!(SubscribeEndError::Transient));
             };
             last_frame = std::time::Instant::now();
+            if !first_frame_seen {
+                first_frame_seen = true;
+                tracing::info!(
+                    target: "idfon.media",
+                    attempt,
+                    elapsed_ms = attempt_started.elapsed().as_millis() as u64,
+                    codec = %current.codec,
+                    "first audio frame of attempt"
+                );
+            }
             // Frames flow again: the foreground kick has done its job.
             SUB_KICK.store(false, Ordering::Relaxed);
             let decoded = AUDIO_FRAMES_DECODED.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1992,7 +2099,23 @@ async fn subscribe_decode_once(
             }
         }
     };
-    res.await
+    let result = res.await;
+    if result.is_err() {
+        if let Some(peer_session) = used_session.take() {
+            tracing::info!(
+                target: "idfon.media",
+                attempt,
+                peer = %peer_session.peer().fmt_short(),
+                elapsed_ms = attempt_started.elapsed().as_millis() as u64,
+                "subscribe attempt ended early; closing its session so the retry redials"
+            );
+            peer_session.close(moq_net::Error::Cancel);
+            peer_session
+                .connection()
+                .close(0u32.into(), b"subscribe stalled; redialing");
+        }
+    }
+    result
 }
 
 /// The next decoded frame, skipping the track-boundary events (`Read::Gap`,
@@ -2395,16 +2518,7 @@ fn rebuild_audio_track() -> u8 {
             ))
         };
         let source = capture.into_source();
-        let abr = renditions
-            .iter()
-            .find(|o| o.codec == AudioCodec::Opus)
-            .map(|opus| {
-                (
-                    iroh_live::media::AudioRendition::from_config(opus.clone()).name,
-                    opus.bitrate.as_ref().map_or(0, |rate| rate.as_bps()),
-                    opus.layout.channels(),
-                )
-            });
+        let abr = opus_abr_target(&renditions);
         let session = SESSION.lock().unwrap_or_else(|poison| poison.into_inner());
         let Some(publication) = session.as_ref().and_then(|session| session.publication.as_ref())
         else {
@@ -3596,8 +3710,8 @@ mod tests {
         let published: Vec<String> = status.borrow().renditions.keys().cloned().collect();
         assert_eq!(
             published,
-            vec!["liquid".to_string(), "opus".to_string()],
-            "both renditions published"
+            vec!["0.liquid".to_string(), "1.opus".to_string()],
+            "both renditions published, named in publisher order"
         );
 
         // Every timing below runs from the subscriber's first decoded frame, not from the
@@ -3727,4 +3841,265 @@ mod tests {
             "{quiet} silent 100 ms windows around the switch"
         );
     }
+
+    /// A tone pusher for the e2e tests: `bursts` 80 ms frames of 24 kHz mono at RMS ~0.177, a little
+    /// faster than real time, starting once `start` returns.
+    fn push_tone(bursts: u32, start: impl FnOnce() + Send + 'static) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            start();
+            for burst in 0..bursts {
+                let frame: Vec<f32> = (0..1920)
+                    .map(|n| {
+                        let t = (burst as usize * 1920 + n) as f32 / 24_000.0;
+                        (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.25
+                    })
+                    .collect();
+                super::media_audio_push_frames(frame.as_ptr(), 1920, 1);
+                std::thread::sleep(std::time::Duration::from_millis(70));
+            }
+        })
+    }
+
+    /// A LiquidCodec stand-in that encodes nothing and decodes a constant: enough to be offered.
+    fn register_stand_in_liquid() {
+        use std::ffi::c_void;
+        unsafe extern "C" fn new(_: *const c_void) -> *const c_void {
+            Box::into_raw(Box::new(0f32)) as *const c_void
+        }
+        unsafe extern "C" fn free(h: *const c_void) {
+            drop(unsafe { Box::from_raw(h as *mut f32) });
+        }
+        unsafe extern "C" fn encode(_: *const c_void, _: *const f32, _: usize, out: *mut u8, _: usize) -> i32 {
+            unsafe { *out = 1 };
+            1
+        }
+        unsafe extern "C" fn decode(_: *const c_void, _: *const u8, _: usize, out: *mut f32, cap: usize) -> i32 {
+            let out = unsafe { std::slice::from_raw_parts_mut(out, cap) };
+            out[..1920].fill(0.1);
+            1920
+        }
+        unsafe extern "C" fn recover(
+            _: *const c_void,
+            _: *const u8,
+            _: usize,
+            _: u32,
+            out: *mut f32,
+            cap: usize,
+        ) -> i32 {
+            let out = unsafe { std::slice::from_raw_parts_mut(out, cap) };
+            out[..1920].fill(0.1);
+            1920
+        }
+        crate::liquid::media_liquid_register(std::ptr::null(), new, encode, free, new, decode, recover, free, 400);
+    }
+
+    /// The two-iPhone test of 2026-11-18 played LiquidCodec on a call whose publisher offered
+    /// `[opus, liquid]`: the catalog map lists "liquid" first. With no preference the subscriber
+    /// must play the publisher's first rendition.
+    #[test]
+    fn subscriber_plays_the_publishers_first_rendition_without_a_preference() {
+        use std::sync::atomic::Ordering;
+        let _guard = crate::util::MEDIA_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        unsafe extern "C" fn discard(
+            _: *const std::ffi::c_void,
+            _: *const u8,
+            _: usize,
+            _: u32,
+            _: u32,
+            _: u64,
+        ) {
+        }
+        register_stand_in_liquid();
+        assert_eq!(super::media_audio_set_playback_cb(std::ptr::null(), discard), 0);
+        super::media_live_set_audio_preference(c"".into());
+
+        let ticket_text = super::start_live(true, false, true, None, AudioCodec::Opus, 24_000, 1)
+            .expect("publish");
+        let ticket: super::BroadcastTicket = ticket_text.parse().expect("ticket");
+        let addr = publisher_addr();
+        let listener = remote_listener();
+        let published: Vec<String> = super::SESSION
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .publication
+            .as_ref()
+            .unwrap()
+            .broadcast
+            .status()
+            .borrow()
+            .renditions
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(published, vec!["0.opus".to_string(), "1.liquid".to_string()]);
+
+        let decoded_before = super::AUDIO_FRAMES_DECODED.load(Ordering::Relaxed);
+        let decoding = move || {
+            let waited = std::time::Instant::now();
+            while super::AUDIO_FRAMES_DECODED.load(Ordering::Relaxed) == decoded_before
+                && waited.elapsed() < std::time::Duration::from_secs(10)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+        let pusher = push_tone(60, || {});
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watchdog = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                decoding();
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                stop.store(true, Ordering::Relaxed);
+            })
+        };
+        let (mut samples, mut timing, mut decoded_total, mut channels) =
+            (Vec::new(), String::new(), 0, 0u32);
+        let ended = super::tokio_executor(super::subscribe_decode_once(
+            listener.clone(),
+            ticket,
+            Some(addr),
+            &stop,
+            &mut samples,
+            &mut timing,
+            &mut decoded_total,
+            std::time::Instant::now(),
+            1,
+            &mut channels,
+        ));
+        let codec = super::INCOMING_AUDIO_CODEC.lock().unwrap().clone();
+        pusher.join().unwrap();
+        watchdog.join().unwrap();
+        super::media_live_stop();
+        super::media_audio_clear_playback_cb();
+        crate::liquid::media_liquid_unregister();
+        super::tokio_executor(async move {
+            listener.node.shutdown().await;
+            listener.endpoint.close().await;
+        });
+        assert!(ended.expect("decode"));
+        assert_eq!(codec.as_deref(), Some("opus"), "plays the publisher's first rendition");
+        // Opus decodes in 20 ms frames (960 samples at 48 kHz); LiquidCodec in 80 ms ones.
+        let sizes: std::collections::BTreeSet<String> =
+            timing.lines().skip(1).filter_map(|l| l.split(',').nth(5)).map(str::to_string).collect();
+        eprintln!("DIAG decoded frame sizes: {sizes:?}");
+        assert!(sizes.contains("960"), "20 ms Opus frames, got {sizes:?}");
+    }
+
+    /// The handoff bug of 2026-11-18: after the phone's path died, every retry reused the dead
+    /// session and the call never came back. Closing the session from the publisher's side must end
+    /// the attempt, and the retry must redial and play again.
+    #[test]
+    fn subscriber_recovers_after_its_session_is_closed() {
+        use std::sync::atomic::Ordering;
+        let _guard = crate::util::MEDIA_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        unsafe extern "C" fn discard(
+            _: *const std::ffi::c_void,
+            _: *const u8,
+            _: usize,
+            _: u32,
+            _: u32,
+            _: u64,
+        ) {
+        }
+        assert_eq!(super::media_audio_set_playback_cb(std::ptr::null(), discard), 0);
+        super::media_live_set_audio_preference(c"".into());
+        let ticket_text = super::start_live(true, false, true, None, AudioCodec::Opus, 24_000, 1)
+            .expect("publish");
+        let ticket: super::BroadcastTicket = ticket_text.parse().expect("ticket");
+        let addr = publisher_addr();
+        let listener = remote_listener();
+        let listener_id = listener.endpoint.id();
+        let publisher_node = super::SESSION.lock().unwrap().as_ref().unwrap().node.clone();
+
+        let decoded = || super::AUDIO_FRAMES_DECODED.load(Ordering::Relaxed);
+        let start = decoded();
+        let pusher = push_tone(130, move || {
+            let waited = std::time::Instant::now();
+            while decoded() == start && waited.elapsed() < std::time::Duration::from_secs(10) {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        });
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let recovered_ms = std::sync::Arc::new(std::sync::Mutex::new(None::<u128>));
+        let killer = {
+            let stop = stop.clone();
+            let recovered_ms = recovered_ms.clone();
+            std::thread::spawn(move || {
+                let waited = std::time::Instant::now();
+                while decoded() < start + 25 && waited.elapsed() < std::time::Duration::from_secs(10) {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                // Close the listener's session from the publisher's side, as a dead path would.
+                let closed_at = super::tokio_executor(async move {
+                    let sessions = { use iroh::Watcher as _; publisher_node.sessions().get() };
+                    for session in sessions.iter().filter(|s| s.peer() == listener_id) {
+                        session.connection().close(0u32.into(), b"test: path died");
+                    }
+                    std::time::Instant::now()
+                });
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                let before = decoded();
+                while decoded() < before + 5 && closed_at.elapsed() < std::time::Duration::from_secs(8) {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                if decoded() >= before + 5 {
+                    *recovered_ms.lock().unwrap() = Some(closed_at.elapsed().as_millis());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                stop.store(true, Ordering::Relaxed);
+            })
+        };
+        let attempts = super::tokio_executor({
+            let stop = stop.clone();
+            let listener = listener.clone();
+            async move {
+                let (mut samples, mut timing, mut decoded_total, mut channels) =
+                    (Vec::new(), String::new(), 0, 0u32);
+                let mut attempt = 0u32;
+                loop {
+                    attempt += 1;
+                    match super::subscribe_decode_once(
+                        listener.clone(),
+                        ticket.clone(),
+                        Some(addr.clone()),
+                        &stop,
+                        &mut samples,
+                        &mut timing,
+                        &mut decoded_total,
+                        std::time::Instant::now(),
+                        attempt,
+                        &mut channels,
+                    )
+                    .await
+                    {
+                        Ok(_) => break attempt,
+                        Err(_) if attempt < 10 => {
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await
+                        }
+                        Err(err) => panic!("no recovery after {attempt} attempts: {err:#}"),
+                    }
+                }
+            }
+        });
+        pusher.join().unwrap();
+        killer.join().unwrap();
+        super::media_live_stop();
+        super::media_audio_clear_playback_cb();
+        super::tokio_executor(async move {
+            listener.node.shutdown().await;
+            listener.endpoint.close().await;
+        });
+        let recovered = *recovered_ms.lock().unwrap();
+        eprintln!("DIAG attempts={attempts} recovered_after_ms={recovered:?}");
+        assert!(attempts >= 2, "the close should end the first attempt");
+        let recovered = recovered.expect("audio came back after the session closed");
+        assert!(recovered < 6_000, "recovery took {recovered} ms");
+    }
+
 }
