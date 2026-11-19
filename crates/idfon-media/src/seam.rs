@@ -1,8 +1,8 @@
 //! Platform adapter seam for media capture and rendering.
 //!
 //! idfon code depends on these traits and constructors. Only this module (and
-//! the concrete adapter impls) references upstream `moq_media`/`moq_audio`
-//! source and sink enums, so a moq change lands here instead of in every shell.
+//! the concrete adapter impls) references upstream `moq-ext-sources`/`moq_audio`
+//! source types, so a moq change lands here instead of in every shell.
 //!
 //! Capture adapters are constructed once and consumed into a source; render
 //! adapters are live sinks invoked per decoded frame.
@@ -12,10 +12,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use iroh_live::media::{AudioFormat, AudioSource, FileEnd, VideoFormat, VideoSource};
 use moq_audio::{Format, Frame as AudioFrame};
-use moq_media::publish::{AudioSource, VideoSource};
 use moq_video::Frame as VideoFrame;
-use n0_future::boxed::BoxStream;
+use n0_future::{boxed::BoxStream, StreamExt as _};
 
 /// Audio format the capture side produces / the playback side consumes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -344,51 +344,97 @@ impl AudioPlayback for PacedPlayback {
     }
 }
 
+/// A frame-stream audio source (shell push or a decoded file).
+///
+/// Upstream push sources take interleaved f32; S16 input is converted here.
+/// Other formats are refused at runtime by dropping the stream (the source
+/// then ends at once). Must be called inside a Tokio runtime: a task pumps
+/// `frames` into the source.
 pub fn audio_frames(input: AudioInput, frames: BoxStream<AudioFrame>) -> AudioSource {
     // shortcut: channels outside 1..=8 label as Mono instead of erroring at
     // encode open; upgrade audio_frames to Result if a caller needs the error.
     let layout = moq_audio::Layout::from_channels(input.channels).unwrap_or(moq_audio::Layout::Mono);
-    let mut encode_input = moq_audio::encode::Input::new(input.sample_rate, layout);
-    encode_input.format = input.format;
-    AudioSource::Frames {
-        input: encode_input,
-        frames,
+    let (sender, source) = AudioSource::push(AudioFormat {
+        sample_rate: input.sample_rate,
+        layout,
+    });
+    let format = input.format;
+    tokio::spawn(async move {
+        let mut frames = frames;
+        while let Some(mut frame) = frames.next().await {
+            match format {
+                Format::F32 => {}
+                Format::S16 => frame.data = s16_to_f32(&frame.data),
+                other => {
+                    tracing_warn(&format!("audio_frames: unsupported input format {other:?}"));
+                    break;
+                }
+            }
+            if sender.push(frame).is_err() {
+                break;
+            }
+        }
+    });
+    source
+}
+
+fn tracing_warn(message: &str) {
+    eprintln!("[idfon-media] {message}");
+}
+
+/// Interleaved s16le to interleaved f32le.
+pub fn s16_to_f32(data: &[u8]) -> bytes::Bytes {
+    let mut out = Vec::with_capacity(data.len() * 2);
+    for pair in data.chunks_exact(2) {
+        let value = f32::from(i16::from_le_bytes([pair[0], pair[1]])) / 32768.0;
+        out.extend_from_slice(&value.to_le_bytes());
     }
+    bytes::Bytes::from(out)
 }
 
-/// A frame-stream video source (shell push).
-pub fn video_frames(frames: BoxStream<VideoFrame>) -> VideoSource {
-    VideoSource::Frames(frames)
+/// A frame-stream video source (shell push). `format` is the size and cadence
+/// the shell will push; frames of another size are scaled.
+pub fn video_frames(format: VideoFormat, frames: BoxStream<VideoFrame>) -> VideoSource {
+    let (sender, source) = VideoSource::push(format);
+    tokio::spawn(async move {
+        let mut frames = frames;
+        while let Some(frame) = frames.next().await {
+            if sender.push(frame).is_err() {
+                break;
+            }
+        }
+    });
+    source
 }
 
-/// Bundled fallback: a decoded audio file (WAV/MP3/FLAC) as a capture source.
+/// Bundled fallback: a decoded audio file (WAV/MP3) as a capture source.
+///
+/// Upstream's file source decodes WAV and MP3; FLAC (supported by the old
+/// symphonia-based reader) is not.
 pub struct FileAudioCapture {
-    input: moq_audio::encode::Input,
-    frames: BoxStream<AudioFrame>,
+    source: AudioSource,
 }
 
 impl FileAudioCapture {
-    pub fn open(path: &Path, loop_playback: bool) -> anyhow::Result<Self> {
-        let source = moq_media::audio_file::AudioFile::open(path, loop_playback)?;
-        Ok(Self {
-            input: source.input(),
-            frames: source.into_stream(),
-        })
+    pub async fn open(path: &Path, loop_playback: bool) -> anyhow::Result<Self> {
+        let at_end = if loop_playback { FileEnd::Restart } else { FileEnd::Stop };
+        let source = AudioSource::file(path, at_end)
+            .await
+            .map_err(|err| anyhow::anyhow!("cannot open {}: {err}", path.display()))?;
+        Ok(Self { source })
     }
 }
 
 impl AudioCapture for FileAudioCapture {
     fn into_source(self: Box<Self>) -> AudioSource {
-        AudioSource::Frames {
-            input: self.input,
-            frames: self.frames,
-        }
+        self.source
     }
 }
 
-/// Bundled fallback: pre-encoded Annex-B H.264 as a capture source.
+/// Bundled fallback: pre-encoded Annex-B H.264, published as-is (one rendition,
+/// no transcode) through `LocalBroadcast::set_encoded_video`.
 pub struct FileVideoCapture {
-    source: VideoSource,
+    data: bytes::Bytes,
 }
 
 impl FileVideoCapture {
@@ -398,17 +444,14 @@ impl FileVideoCapture {
         if !data.windows(4).any(|w| w == [0, 0, 0, 1]) {
             anyhow::bail!("video source must be Annex-B H.264 or a supported container");
         }
-        let stream: BoxStream<bytes::Bytes> =
-            Box::pin(n0_future::stream::iter([bytes::Bytes::from(data)]));
         Ok(Self {
-            source: VideoSource::AnnexB(stream),
+            data: bytes::Bytes::from(data),
         })
     }
-}
 
-impl VideoCapture for FileVideoCapture {
-    fn into_source(self: Box<Self>) -> VideoSource {
-        self.source
+    /// The Annex-B byte stream, for `LocalBroadcast::set_encoded_video`.
+    pub fn into_annexb_stream(self) -> BoxStream<bytes::Bytes> {
+        Box::pin(n0_future::stream::iter([self.data]))
     }
 }
 
@@ -427,7 +470,7 @@ impl AudioCapture for DeviceAudioCapture {
     fn into_source(self: Box<Self>) -> AudioSource {
         let mut config = moq_audio::capture::Config::default();
         config.source = moq_audio::capture::Source::Microphone(self.device);
-        AudioSource::Device(config)
+        AudioSource::microphone_unchecked(config)
     }
 }
 
@@ -436,16 +479,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn annexb_capture_is_a_video_source() {
+    fn annexb_capture_keeps_the_stream() {
         let dir = std::env::temp_dir().join("idfon-seam-test");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("clip.h264");
         std::fs::write(&path, [0u8, 0, 0, 1, 0x67, 0x42]).unwrap();
         let capture = FileVideoCapture::annexb(&path).unwrap();
-        assert!(matches!(
-            Box::new(capture).into_source(),
-            VideoSource::AnnexB(_)
-        ));
+        let chunks: Vec<bytes::Bytes> = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(capture.into_annexb_stream().collect());
+        assert_eq!(chunks.concat(), vec![0u8, 0, 0, 1, 0x67, 0x42]);
+    }
+
+    #[test]
+    fn s16_converts_to_f32() {
+        let out = s16_to_f32(&[0x00, 0x40, 0x00, 0xC0]);
+        let a = f32::from_le_bytes(out[0..4].try_into().unwrap());
+        let b = f32::from_le_bytes(out[4..8].try_into().unwrap());
+        assert_eq!((a, b), (0.5, -0.5));
     }
 
     #[test]

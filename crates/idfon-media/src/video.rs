@@ -1,19 +1,18 @@
 //! Current MoQ video integration.
 //!
-//! Video is built from the current `moq-media` source model. Pre-encoded Annex-B
-//! H.264 uses `FileVideoCapture`; MP4/MKV/TS/FLV inputs use the current
-//! `moq_mux::import::Container` path.
+//! Pre-encoded Annex-B H.264 uses `FileVideoCapture` and is published as-is
+//! (`LocalBroadcast::set_encoded_video`: one rendition, no transcode);
+//! MP4/MKV/TS/FLV inputs use the `moq_mux::import::Container` path.
 
 use std::path::Path;
 
-use iroh::protocol::ProtocolHandler as _;
-use iroh_live::{ticket::LiveTicket, Call, Live};
-use moq_media::{publish::VideoRendition, video::Size};
+use iroh_live::layout::LiveLayout;
+use iroh_live::media::{LocalBroadcast, SubscriptionExt as _};
+use iroh_live::{Audience, BroadcastTicket, Node, NodeConfig, Reach};
 use moq_video::encode::{Config as EncodeConfig, Encoder};
 
-use crate::live::build_endpoint;
+use crate::live::{build_endpoint, mount_side_channels, MountedNode, CALL_NAME};
 use crate::seam::FileVideoCapture;
-use crate::seam::VideoCapture;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Quality { Low, Mid, High, Highest }
@@ -36,8 +35,8 @@ impl std::str::FromStr for VideoPreset {
 
 pub struct VideoPublisher {
     runtime: tokio::runtime::Runtime,
-    live: Live,
-    broadcast: Option<moq_media::publish::LocalBroadcast>,
+    live: MountedNode,
+    broadcast: Option<LocalBroadcast>,
     catalog: Option<moq_mux::catalog::Producer>,
     import_task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -55,10 +54,13 @@ impl VideoPublisher {
         let runtime = tokio::runtime::Runtime::new()?;
         let (live, broadcast, catalog, import_task, ticket) = runtime.block_on(async move {
             let endpoint = build_endpoint(relay).await?;
-            let live = Live::builder(endpoint).with_router().spawn();
+            let live = MountedNode::spawn(endpoint);
             let extension = path.extension().and_then(|value| value.to_str()).unwrap_or_default().to_ascii_lowercase();
             if matches!(extension.as_str(), "mp4" | "m4v" | "mov" | "cmfv" | "mkv" | "webm" | "ts" | "m2ts" | "flv") {
-                let mut raw = live.publish_raw(&name)?;
+                let broadcast_path = live.layout.path(live.node.id(), &name)?;
+                let (_publication, mut raw) = live
+                    .node
+                    .publish_with(broadcast_path, Audience::Granted, |producer| Ok::<_, std::convert::Infallible>(producer.clone()))?;
                 let catalog = moq_mux::catalog::Producer::new(&mut raw, moq_mux::catalog::Config::default())?;
                 let reserve = catalog.reserve();
                 let data = std::fs::read(&path)?;
@@ -71,7 +73,7 @@ impl VideoPublisher {
                 };
                 let init = moq_mux::import::ContainerInit::new(format, data[..first_chunk_len].to_vec());
                 let mut container = moq_mux::import::Container::new(raw, reserve, &init)?;
-                let ticket = LiveTicket::new(live.endpoint().id(), &name).serialize();
+                let ticket = live.ticket(&name)?;
                 let import_task = tokio::spawn(async move {
                     for chunk in data[first_chunk_len..].chunks(256 * 1024) {
                         if container.decode(chunk).is_err() { return; }
@@ -81,21 +83,12 @@ impl VideoPublisher {
                 });
                 Ok::<_, anyhow::Error>((live, None, Some(catalog), Some(import_task), ticket))
             } else {
-                let broadcast = live.publish(&name)?;
-                let capture = FileVideoCapture::annexb(&path)?;
-                broadcast.video().set_renditions(
-                    Box::new(capture).into_source(),
-                    presets.iter().map(|preset| {
-                        let (name, size) = match preset {
-                            VideoPreset::P180 => ("180p", Size { width: 320, height: 180 }),
-                            VideoPreset::P360 => ("360p", Size { width: 640, height: 360 }),
-                            VideoPreset::P720 => ("720p", Size { width: 1280, height: 720 }),
-                            VideoPreset::P1080 => ("1080p", Size { width: 1920, height: 1080 }),
-                        };
-                        VideoRendition::new(name).with_size(size)
-                    }).collect(),
-                )?;
-                let ticket = LiveTicket::new(live.endpoint().id(), &name).serialize();
+                let broadcast: LocalBroadcast = live.layout.publish(&live.node, &name)?;
+                // Pre-encoded H.264 goes out as its one rendition; the preset
+                // ladder needs a decoded source (not wired for files yet).
+                let _ = &presets;
+                broadcast.set_encoded_video(FileVideoCapture::annexb(&path)?.into_annexb_stream())?;
+                let ticket = live.ticket(&name)?;
                 Ok::<_, anyhow::Error>((live, Some(broadcast), None, None, ticket))
             }
         })?;
@@ -106,7 +99,7 @@ impl VideoPublisher {
         if let Some(task) = self.import_task { task.abort(); }
         drop(self.broadcast);
         drop(self.catalog);
-        let _ = self.runtime.block_on(self.live.shutdown());
+        self.runtime.block_on(self.live.shutdown());
     }
 }
 
@@ -117,47 +110,25 @@ pub fn listen_to_h264(
     _relay: bool,
     quality: Option<Quality>,
 ) -> anyhow::Result<VideoStats> {
-    let ticket = ticket.parse::<LiveTicket>()?;
+    let ticket = ticket.parse::<BroadcastTicket>()?;
     let out = out.to_path_buf();
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Runtime::new()?;
         runtime.block_on(async move {
-            let live = Live::from_env().await?.spawn();
-            let subscription = live.subscribe(ticket.endpoint, &ticket.broadcast_name).await?;
-            let track = if let Some(quality) = quality {
-                let catalog = subscription.broadcast().catalog();
-                let wanted = match quality {
-                    Quality::Low => "180p",
-                    Quality::Mid => "360p",
-                    Quality::High => "720p",
-                    Quality::Highest => "1080p",
-                };
-                if catalog.video().contains_key(wanted) {
-                    subscription.broadcast().video_rendition(wanted).await?
-                } else {
-                    subscription.broadcast().video().await?
-                }
-            } else {
-                subscription.broadcast().video().await?
-            };
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(seconds);
-            let mut encoder: Option<Encoder> = None;
-            let mut encoded = Vec::new();
-            let mut frames = 0usize;
-            while tokio::time::Instant::now() < deadline {
-                let Some(frame) = track.recv().await else { break; };
-                if encoder.is_none() {
-                    let size = frame.size();
-                    encoder = Some(Encoder::new(&EncodeConfig::new(size.width, size.height, moq_video::Rate::new(30, 1)?))?);
-                }
-                if let Some(encoder) = encoder.as_mut() {
-                    for unit in encoder.encode(&frame)? { encoded.extend_from_slice(&unit.payload); }
-                }
-                frames += 1;
-            }
-            std::fs::write(&out, &encoded)?;
-            live.shutdown().await;
-            Ok(VideoStats { duration_ms: seconds * 1000, packets: frames, subscribe_ms: 0, out: out.display().to_string(), frames, bytes: encoded.len() as u64 })
+            let endpoint = iroh_live::EndpointConfig::from_env()?.bind().await?;
+            let node = Node::new(endpoint.clone(), NodeConfig::default());
+            let subscription = node.subscribe_ticket(&ticket).await?;
+            let wanted = quality.map(|quality| match quality {
+                Quality::Low => "180p",
+                Quality::Mid => "360p",
+                Quality::High => "720p",
+                Quality::Highest => "1080p",
+            });
+            let result = record_video(&subscription, wanted, &out, seconds).await;
+            drop(subscription);
+            node.shutdown().await;
+            endpoint.close().await;
+            result
         })
     }).join().map_err(|_| anyhow::anyhow!("video listener thread panicked"))?
 }
@@ -173,23 +144,25 @@ pub fn dial_to_peer(
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Runtime::new()?;
         runtime.block_on(async move {
-            let endpoint = build_endpoint(relay).await?;
-            let live = Live::builder(endpoint).with_router().spawn();
-            let call_path = Call::path(live.endpoint().id());
-            let broadcast = live.publish(&call_path)?;
-            broadcast.video().set_renditions(
-                Box::new(FileVideoCapture::annexb(&path)?).into_source(),
-                vec![VideoRendition::new("video")],
-            )?;
             let addr: iroh::EndpointAddr = serde_json::from_str(&peer_addr)?;
-            let call = Call::dial(&live, addr).await.map_err(|err| anyhow::anyhow!("dial: {err}"))?;
+            let peer = addr.id;
+            let endpoint = build_endpoint(relay).await?;
+            let live = MountedNode::spawn(endpoint);
+            let call_path = live.layout.path(live.node.id(), CALL_NAME)?;
+            let (_publication, broadcast) = live.node.publish_with(
+                call_path,
+                Audience::peers([peer]),
+                |producer| LocalBroadcast::try_from(producer.clone()),
+            )?;
+            broadcast.set_encoded_video(FileVideoCapture::annexb(&path)?.into_annexb_stream())?;
+            let session = live.node.connect(addr).await.map_err(|err| anyhow::anyhow!("dial: {err}"))?;
             let started = std::time::Instant::now();
             match seconds {
                 Some(seconds) => tokio::time::sleep(std::time::Duration::from_secs(seconds)).await,
-                None => { call.closed().await; }
+                None => { session.closed().await; }
             }
             let elapsed = started.elapsed().as_millis() as u64;
-            call.close();
+            drop(broadcast);
             live.shutdown().await;
             Ok(elapsed)
         })
@@ -209,49 +182,81 @@ pub fn answer_to_h264(
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Runtime::new()?;
         runtime.block_on(async move {
-            let moq = iroh_live::moq::Moq::new(transport.endpoint().clone());
-            let handler = moq.protocol_handler();
-            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-            let _side = transport.add_side_channel(iroh_live::moq::ALPN, tx);
-            tokio::spawn(async move {
-                while let Some(connection) = rx.recv().await {
-                    let handler = handler.clone();
-                    tokio::spawn(async move { let _ = handler.accept(connection).await; });
-                }
-            });
-            let wanted = from.as_deref().map(str::parse).transpose()?;
-            let mut incoming = moq.incoming_sessions();
+            let layout = LiveLayout::default();
+            let node = Node::new(transport.endpoint().clone(), layout.config());
+            let side = mount_side_channels(&transport, &node);
+            let wanted: Option<iroh::EndpointId> = from.as_deref().map(str::parse).transpose()?;
+            let mut accepted = node.accepted();
             let session = tokio::time::timeout(std::time::Duration::from_secs(wait), async {
+                use n0_future::StreamExt as _;
                 loop {
-                    let Some(session) = incoming.next().await else { anyhow::bail!("live transport shut down"); };
-                    if wanted.is_none_or(|id| session.remote_id() == id) { break Ok::<_, anyhow::Error>(session); }
+                    let Some(session) = accepted.next().await else { anyhow::bail!("live transport shut down"); };
+                    if wanted.is_none_or(|id| session.peer() == id) { break Ok::<_, anyhow::Error>(session); }
                 }
             }).await.map_err(|_| anyhow::anyhow!("no incoming call within {wait}s"))??;
-            let call = Call::accept(session).await.map_err(|err| anyhow::anyhow!("accept: {err}"))?;
-            let track = call.remote().video().await.map_err(|err| anyhow::anyhow!("video: {err}"))?;
-            let result = record_video_track(track, &out, seconds).await;
-            call.close();
+            let caller = session.peer();
+            let subscription = node
+                .subscribe(layout.path(caller, CALL_NAME)?, Reach::Direct(caller))
+                .await
+                .map_err(|err| anyhow::anyhow!("accept: {err}"))?;
+            let result = record_video(&subscription, None, &out, seconds).await;
+            drop(subscription);
+            session.connection().close(0u32.into(), b"hangup");
+            node.shutdown().await;
+            drop(side);
             result
         })
     }).join().map_err(|_| anyhow::anyhow!("video answer thread panicked"))?
 }
 
-async fn record_video_track(
-    track: moq_media::subscribe::VideoTrack,
+/// Decodes the subscription's video (rendition `wanted` when the catalog has
+/// it, else the publisher's first) and re-encodes it to an Annex-B file.
+async fn record_video(
+    subscription: &iroh_live::Subscription,
+    wanted: Option<&str>,
     out: &Path,
     seconds: u64,
 ) -> anyhow::Result<VideoStats> {
+    let catalog = subscription
+        .remote_broadcast()
+        .catalog_within(std::time::Duration::from_secs(10))
+        .await
+        .map_err(|err| anyhow::anyhow!("video catalog: {err}"))?;
+    let (name, config) = wanted
+        .and_then(|name| catalog.video.renditions.get_key_value(name))
+        .or_else(|| catalog.video.ranked().next())
+        .ok_or_else(|| anyhow::anyhow!("broadcast has no video track"))?;
+    let mut consumer = moq_video::decode::Consumer::new(
+        &subscription.broadcast(),
+        config,
+        name.clone(),
+        moq_video::decode::Options::new(),
+    )
+    .await?;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(seconds);
-    let mut encoder = None;
+    let mut encoder: Option<Encoder> = None;
     let mut bytes = Vec::new();
     let mut frames = 0;
-    while tokio::time::Instant::now() < deadline {
-        let Some(frame) = track.recv().await else { break; };
+    loop {
+        let read = match tokio::time::timeout_at(deadline, consumer.read()).await {
+            Err(_) => break,
+            Ok(read) => read?,
+        };
+        let frame = match read {
+            Some(moq_video::decode::Read::Frame(frame)) => frame,
+            Some(_) => continue,
+            None => break,
+        };
         if encoder.is_none() {
             let size = frame.size();
-            encoder = Some(Encoder::new(&EncodeConfig::new(size.width, size.height, moq_video::Rate::new(30, 1)?))?);
+            let rate = moq_video::FrameRate::new(30, 1).map_err(|err| anyhow::anyhow!("{err}"))?;
+            encoder = Some(Encoder::new(&EncodeConfig::new(size.width, size.height, rate))?);
         }
-        for unit in encoder.as_mut().unwrap().encode(&frame)? { bytes.extend_from_slice(&unit.payload); }
+        let encoder = encoder.as_mut().expect("set above");
+        encoder.encode(&frame)?;
+        while let Some(unit) = encoder.receive()? {
+            bytes.extend_from_slice(&unit.payload);
+        }
         frames += 1;
     }
     std::fs::write(out, &bytes)?;
