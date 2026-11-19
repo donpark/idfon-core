@@ -64,6 +64,8 @@ struct Args {
     expect_absent: Vec<f32>,
     leave_after: Option<u64>,
     codec: String,
+    /// The roster size the member must end with (members it plays).
+    expect_members: Option<usize>,
 }
 
 fn args() -> Args {
@@ -78,6 +80,7 @@ fn args() -> Args {
         expect_absent: Vec::new(),
         leave_after: None,
         codec: "opus".into(),
+        expect_members: None,
     };
     let list = |v: String| v.split(',').filter(|s| !s.is_empty()).map(|s| s.parse().unwrap()).collect();
     while let Some(flag) = it.next() {
@@ -92,6 +95,7 @@ fn args() -> Args {
             "--expect-absent" => args.expect_absent = list(value),
             "--leave-after" => args.leave_after = Some(value.parse().unwrap()),
             "--codec" => args.codec = value,
+            "--expect-members" => args.expect_members = Some(value.parse().unwrap()),
             other => panic!("unknown flag {other}"),
         }
     }
@@ -221,11 +225,14 @@ fn main() {
     for hz in args.expect.iter().chain(&args.expect_absent) {
         report.insert(format!("{hz}"), serde_json::json!(heard(*hz)));
     }
-    let ok = args.expect.iter().all(|hz| heard(*hz)) && args.expect_absent.iter().all(|hz| !heard(*hz));
+    let members_final = playing.len();
+    let ok = args.expect.iter().all(|hz| heard(*hz))
+        && args.expect_absent.iter().all(|hz| !heard(*hz))
+        && args.expect_members.is_none_or(|n| n == members_final);
     println!(
         "{}",
         serde_json::json!({
-            "hz": args.hz, "heard": report, "members_max": members_max,
+            "hz": args.hz, "heard": report, "members_max": members_max, "members_final": members_final,
             "mix_samples": mix.len(), "left": left, "ok": ok,
         })
     );

@@ -4635,4 +4635,117 @@ mod tests {
         assert!(resumed > 5, "audio after the silence played: {resumed} frames");
     }
 
+
+    fn start_group_collect() {
+        unsafe extern "C" fn collect(
+            _: *const std::ffi::c_void,
+            pcm: *const u8,
+            len: usize,
+            _rate: u32,
+            _channels: u32,
+            _: u64,
+        ) {
+            let bytes = unsafe { std::slice::from_raw_parts(pcm, len) };
+            GROUP_MIX.lock().unwrap().extend(
+                bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+            );
+        }
+        assert_eq!(super::media_audio_set_playback_cb(std::ptr::null(), collect), 0);
+        super::media_live_set_audio_preference(c"".into());
+        GROUP_MIX.lock().unwrap().clear();
+    }
+
+    fn add(member: &TonePublisher) -> u8 {
+        let ticket = std::ffi::CString::new(member.ticket.clone()).unwrap();
+        let addr = std::ffi::CString::new(member.addr.clone()).unwrap();
+        super::media_live_add_member(ticket.as_c_str().into(), addr.as_c_str().into())
+    }
+
+    fn remove(member: &TonePublisher) -> u8 {
+        let ticket = std::ffi::CString::new(member.ticket.clone()).unwrap();
+        super::media_live_remove_member(ticket.as_c_str().into())
+    }
+
+    /// Wait until every tone in `hz` is in the last 0.5 s of the mix (and none of `absent`).
+    fn wait_for_mix(hz: &[f32], absent: &[f32], within: std::time::Duration) -> bool {
+        let waited = std::time::Instant::now();
+        while waited.elapsed() < within {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let mix = GROUP_MIX.lock().unwrap();
+            if mix.len() < 24_000 {
+                continue;
+            }
+            let tail = &mix[mix.len() - 24_000..];
+            if hz.iter().all(|&f| tone_power(tail, f) > 1e-4) && absent.iter().all(|&f| tone_power(tail, f) < 1e-5) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn shutdown_publishers(members: Vec<TonePublisher>) {
+        for member in members {
+            super::tokio_executor(async move {
+                let _ = member.router.shutdown().await;
+                member.node.shutdown().await;
+                member.endpoint.close().await;
+            });
+        }
+    }
+
+    /// Corner cases on the media side of a group call: churn, a dead member, the
+    /// cap, and the mix handing over between one member and several.
+    #[test]
+    fn group_media_corner_cases() {
+        let _guard = crate::util::MEDIA_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        start_group_collect();
+        let tones = [440.0f32, 660.0, 990.0];
+        let mut members: Vec<TonePublisher> = tones.iter().map(|&hz| tone_publisher(hz)).collect();
+        for member in &members {
+            assert_eq!(add(member), 0);
+        }
+        assert!(wait_for_mix(&tones, &[], std::time::Duration::from_secs(15)), "all three heard");
+
+        // 1. Churn: drop and re-add one member five times.
+        for round in 0..5 {
+            assert_eq!(remove(&members[1]), 0, "remove round {round}");
+            assert_eq!(remove(&members[1]), 1, "a second remove finds nobody");
+            assert!(wait_for_mix(&[440.0, 990.0], &[660.0], std::time::Duration::from_secs(5)), "gone, round {round}");
+            assert_eq!(add(&members[1]), 0, "re-add round {round}");
+        }
+        assert!(wait_for_mix(&tones, &[], std::time::Duration::from_secs(15)), "all three after churn");
+        assert_eq!(super::media_live_member_count(), 3);
+
+        // 2. A member whose publisher dies: the others keep playing; removing it works.
+        let dead = members.remove(2);
+        shutdown_publishers(vec![dead]);
+        assert!(wait_for_mix(&[440.0, 660.0], &[990.0], std::time::Duration::from_secs(10)), "the others play on");
+        assert_eq!(super::media_live_member_count(), 3, "its leg still retries until removed");
+
+        // 3. Hand-over: down to one member (straight through), then two again (mixed).
+        assert_eq!(remove(&members[1]), 0);
+        assert!(wait_for_mix(&[440.0], &[660.0], std::time::Duration::from_secs(5)), "one member, passed through");
+        assert_eq!(add(&members[1]), 0);
+        assert!(wait_for_mix(&[440.0, 660.0], &[], std::time::Duration::from_secs(10)), "two again, mixed");
+
+        // 4. The cap: 11 remote members at most (12 people with this one).
+        // Two live members and the dead leg are 3; 8 more make 11.
+        let fillers: Vec<TonePublisher> = (0..8).map(|i| tone_publisher(1_200.0 + 100.0 * i as f32)).collect();
+        for filler in &fillers {
+            assert_eq!(add(filler), 0);
+        }
+        assert_eq!(super::media_live_member_count(), super::MAX_REMOTE_MEMBERS as u32);
+        let extra = tone_publisher(3_000.0);
+        assert_eq!(add(&extra), 3, "the 12th remote member is refused");
+
+        super::media_live_unsubscribe();
+        assert_eq!(super::media_live_member_count(), 0);
+        super::media_audio_clear_playback_cb();
+        shutdown_publishers(members);
+        shutdown_publishers(fillers);
+        shutdown_publishers(vec![extra]);
+    }
+
 }
