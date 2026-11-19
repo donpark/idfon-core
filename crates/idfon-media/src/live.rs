@@ -406,9 +406,9 @@ async fn record_remote(
     decode_config.output.format = Format::F32;
     decode_config.output.sample_rate = Some(48_000);
     decode_config.output.layout = Some(moq_audio::Layout::Mono);
-    // TODO(iroh-live-next): fork. The fork's decode-side `conceal` (FEC from
-    // the next packet) is gone; upstream conceals lost Opus packets itself
-    // (PLC), and `missing_packets` still counts pts holes.
+    // The harness measures live playout, so it fills holes the way calls do
+    // (moq-audio's recovering decode); `missing_packets` still counts pts holes.
+    decode_config.recover = Some(true);
     let mut decoder = AudioConsumer::new(consumer, config, audio.clone(), decode_config).await?;
 
     let start = Instant::now();

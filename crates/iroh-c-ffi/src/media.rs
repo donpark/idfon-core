@@ -91,10 +91,6 @@ static BITRATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 /// burst this long recovers instead of concealing.
 const DRED_COVER: std::time::Duration = std::time::Duration::from_millis(120);
 
-/// The parity sidecar window for `transport` redundancy, in packets: one XOR
-/// block per four packets is ~25% wire (docs/media-adaptation.md §D7.1).
-const PARITY_WINDOW: usize = 4;
-
 /// Redundancy modes for [`redundancy_for`] and `media_audio_set_redundancy`:
 /// docs/media-adaptation.md §D7.1's `off | inband | dred | transport`, plus
 /// `auto` as the default the ladder does not override.
@@ -107,7 +103,8 @@ mod redundancy {
     pub const INBAND: u8 = 2;
     /// Opus deep redundancy (DRED).
     pub const DRED: u8 = 3;
-    /// Codec-independent parity sidecar over the encoded packets.
+    /// Was the codec-independent parity sidecar; now an alias for [`DRED`], which
+    /// the recovering decoder covers bursts with.
     pub const TRANSPORT: u8 = 4;
 }
 static REDUNDANCY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(redundancy::AUTO);
@@ -167,13 +164,17 @@ fn call_options(
             moq_audio::encode::Kind::Voice
         });
     }
-    // TODO(iroh-live-next): fork. In-band FEC (LBRR), DRED and the transport
-    // parity sidecar were fork-only encoder settings; upstream has none, so
-    // every redundancy mode encodes as `off` here. Step 3 restores them.
-    if mode != redundancy::OFF && codec == AudioCodec::Opus {
-        tracing::debug!(target: "idfon.media", mode, "redundancy mode not available upstream; sending without");
+    // §D7.1's split: `inband` is Opus LBRR (mono voice), `dred` the stereo-safe deep
+    // redundancy (needs the 48 kbps per channel floor above). The receiver rebuilds lost
+    // packets from either through moq-audio's recovering decode (`recover: Some(true)`).
+    // `transport` (the codec-independent parity sidecar) is gone with the old fork: the
+    // recovering decoder covers single holes from LBRR and bursts from DRED, so it maps
+    // to DRED.
+    if codec == AudioCodec::Opus {
+        options.fec = mode == redundancy::INBAND;
+        options.dred =
+            matches!(mode, redundancy::DRED | redundancy::TRANSPORT).then_some(DRED_COVER);
     }
-    let _ = (DRED_COVER, PARITY_WINDOW);
     if codec == AudioCodec::Liquid {
         // Fixed 80 ms frames; the codec carries its own redundancy, not the encoder knobs.
         options.frame_duration = std::time::Duration::from_millis(80);
@@ -388,6 +389,23 @@ struct CallSession {
 struct Publication {
     broadcast: LocalBroadcast,
     ticket: String,
+}
+
+/// The live call's node and published broadcast, cloned out of the lock, for
+/// crate::abr. `None` without a call or before it publishes.
+pub(crate) fn call_publication() -> Option<(Node, LocalBroadcast)> {
+    let session = SESSION.lock().unwrap_or_else(|poison| poison.into_inner());
+    let session = session.as_ref()?;
+    let publication = session.publication.as_ref()?;
+    Some((session.node.clone(), publication.broadcast.clone()))
+}
+
+/// Whether a call session exists, published or not.
+pub(crate) fn call_live() -> bool {
+    SESSION
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .is_some()
 }
 
 /// What a listen leg needs from the session, cloned out of the lock.
@@ -822,12 +840,18 @@ fn start_live(
         tracing::info!(target: "idfon.media", "live broadcast created");
         if audio {
             let renditions = call_renditions(codec, sample_rate, channels, video)?;
-            // Audio ABR (docs/media-adaptation.md §C5) needs an encoder bitrate
-            // control upstream does not expose; see crate::abr.
-            if let Some(opus) = renditions.iter().find(|o| o.codec == AudioCodec::Opus) {
-                let total = opus.bitrate.as_ref().map_or(0, |rate| rate.as_bps());
-                crate::abr::start(total, opus.layout.channels());
-            }
+            // Audio ABR (docs/media-adaptation.md §C5): the Opus rendition follows the
+            // sessions' send estimates (crate::abr). Started after the audio is set.
+            let abr = renditions
+                .iter()
+                .find(|o| o.codec == AudioCodec::Opus)
+                .map(|opus| {
+                    (
+                        iroh_live::media::AudioRendition::from_config(opus.clone()).name,
+                        opus.bitrate.as_ref().map_or(0, |rate| rate.as_bps()),
+                        opus.layout.channels(),
+                    )
+                });
             // Capture device is the default live source; shell-pushed PCM
             // remains available through `media_audio_push_samples`.
             let capture: Box<dyn AudioCapture> = if push_audio {
@@ -843,6 +867,9 @@ fn start_live(
                 ))
             };
             broadcast.set_audio_renditions(capture.into_source(), audio_renditions_of(renditions))?;
+            if let Some((rendition, total, channels)) = abr {
+                crate::abr::start(rendition, total, channels);
+            }
         }
         if video {
             VIDEO_ENABLED.store(true, Ordering::Relaxed);
@@ -1650,9 +1677,11 @@ async fn subscribe_decode_once(
         // or a 100–250 ms burst is dropped on arrival and becomes a hole the
         // jitter buffer can never smooth over. (The old `max_age`.)
         decode.delay.max = Some(std::time::Duration::from_millis(250));
-        // TODO(iroh-live-next): fork. The fork's `conceal` (fill a hole from the
-        // next packet's in-band FEC copy or DRED, `IDFON_CONCEAL_MS`) is gone;
-        // upstream conceals lost Opus packets with PLC on its own.
+        // Live playout rebuilds lost packets from the next packet's in-band FEC copy or
+        // DRED, concealing what neither covers (moq-audio's recovering decode; LiquidCodec
+        // recovers from its redundant copy by default). Holes past the codec's burst bound
+        // still read as gaps.
+        decode.recover = Some(true);
         let mut consumer =
             moq_audio::decode::Consumer::new(&broadcast, &config, name, decode.clone()).await?;
         let input = AudioInput {
@@ -1739,6 +1768,8 @@ async fn subscribe_decode_once(
             >,
         >;
         let mut pending_switch: Option<PendingSwitch> = None;
+        // The current consumer's loss counters already folded into the health record.
+        let mut losses_seen = moq_audio::decode::Losses::default();
         loop {
             if stop.load(Ordering::Relaxed) {
                 if !started && !startup.is_empty() {
@@ -1843,6 +1874,7 @@ async fn subscribe_decode_once(
                                     *INCOMING_AUDIO_CODEC.lock().unwrap_or_else(|poison| poison.into_inner()) =
                                         Some(want.codec.clone());
                                     consumer = next;
+                                    losses_seen = moq_audio::decode::Losses::default();
                                     current = want;
                                     if first.data.is_empty() { continue; }
                                     Some(first)
@@ -1897,6 +1929,12 @@ async fn subscribe_decode_once(
             last_arrival = Some(arrived);
             // Per-call quality record: one fold tick per decoded frame (§C1).
             crate::health::note_frame(pts_us as u64, pts_gap_us as u64);
+            let losses = consumer.losses();
+            crate::health::note_losses(
+                losses.recovered.saturating_sub(losses_seen.recovered),
+                losses.concealed.saturating_sub(losses_seen.concealed),
+            );
+            losses_seen = losses;
             if decoded <= 3 || decoded % 100 == 0 || arrival_gap_us > 30_000 || media_gap_us > 1_000 {
                 eprintln!("[media] audio frame decoded #{} arrival_gap={}us media_gap={}us samples={}", decoded, arrival_gap_us, media_gap_us, frame_samples);
             }
@@ -2308,8 +2346,8 @@ pub fn media_audio_set_fec(fec: u8) -> u8 {
 /// (docs/media-adaptation.md §D7.1). Modes: `0` auto — DRED for stereo and
 /// for the audio of any video call (video is the shed rung, its audio must
 /// survive it), LBRR for mono voice; `1` off (holes as sent); `2` inband
-/// (Opus LBRR); `3` dred (Opus deep redundancy); `4` transport (the
-/// codec-independent parity sidecar over the encoded packets). Returns 0 on
+/// (Opus LBRR); `3` dred (Opus deep redundancy); `4` transport (formerly the
+/// parity sidecar; now the same as dred). Returns 0 on
 /// success, 1 without a live audio track (the mode still applies to the next
 /// call), 2 for an unknown mode.
 #[ffi_export]
@@ -2357,6 +2395,16 @@ fn rebuild_audio_track() -> u8 {
             ))
         };
         let source = capture.into_source();
+        let abr = renditions
+            .iter()
+            .find(|o| o.codec == AudioCodec::Opus)
+            .map(|opus| {
+                (
+                    iroh_live::media::AudioRendition::from_config(opus.clone()).name,
+                    opus.bitrate.as_ref().map_or(0, |rate| rate.as_bps()),
+                    opus.layout.channels(),
+                )
+            });
         let session = SESSION.lock().unwrap_or_else(|poison| poison.into_inner());
         let Some(publication) = session.as_ref().and_then(|session| session.publication.as_ref())
         else {
@@ -2368,6 +2416,14 @@ fn rebuild_audio_track() -> u8 {
             .is_err()
         {
             return 1;
+        }
+        drop(session);
+        // The replaced encoders start at their configured rates: restart ABR from there.
+        match abr {
+            Some((rendition, total, channels)) => {
+                crate::abr::start(rendition, total, channels);
+            }
+            None => crate::abr::stop(),
         }
         0
     })
@@ -2745,10 +2801,29 @@ mod tests {
         })
     }
 
-    /// The in-process publisher's dial address, as the invite's `addr=` carries it.
+    /// The in-process publisher's dial address, as the invite's `addr=` carries it, plus
+    /// loopback on the same ports. A freshly built test binary may lack macOS
+    /// local-network permission, which blocks the LAN addresses and sends every call
+    /// through a public relay (slow and rate-limited); loopback is exempt.
     fn publisher_addr() -> iroh::EndpointAddr {
         let json = super::media_live_endpoint_addr().to_str().to_string();
-        serde_json::from_str(&json).expect("publisher addr")
+        let mut value: serde_json::Value = serde_json::from_str(&json).expect("publisher addr");
+        if let Some(addrs) = value.get_mut("addrs").and_then(|addrs| addrs.as_array_mut()) {
+            let loopback: Vec<serde_json::Value> = addrs
+                .iter()
+                .filter_map(|addr| addr.get("Ip")?.as_str()?.parse::<std::net::SocketAddr>().ok())
+                .map(|socket| {
+                    let ip: std::net::IpAddr = if socket.is_ipv4() {
+                        std::net::Ipv4Addr::LOCALHOST.into()
+                    } else {
+                        std::net::Ipv6Addr::LOCALHOST.into()
+                    };
+                    serde_json::json!({ "Ip": std::net::SocketAddr::new(ip, socket.port()).to_string() })
+                })
+                .collect();
+            addrs.extend(loopback);
+        }
+        serde_json::from_value(value).expect("publisher addr")
     }
 
     #[test]
@@ -3022,7 +3097,18 @@ mod tests {
             "subscribe"
         );
 
-        std::thread::spawn(|| {
+        // Push from the subscriber's first decoded frame on (the pump pads silence until
+        // then): a subscribe through a relay can take seconds, and a push that started at
+        // publish would be over before the record had anything to fold.
+        let decoded_before = super::AUDIO_FRAMES_DECODED.load(std::sync::atomic::Ordering::Relaxed);
+        std::thread::spawn(move || {
+            let waited = std::time::Instant::now();
+            while super::AUDIO_FRAMES_DECODED.load(std::sync::atomic::Ordering::Relaxed)
+                == decoded_before
+                && waited.elapsed() < std::time::Duration::from_secs(20)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
             for _ in 0..150u32 {
                 let frame = vec![0.05f32; 960];
                 super::media_audio_push_frames(frame.as_ptr(), 960, 1);
@@ -3309,7 +3395,17 @@ mod tests {
 
         // 0.25 for the whole push, in 20 ms chunks as the shell does, a little faster than real time so the
         // 20 ms pump never pads a chunk with silence (the capture-side trim bounds the backlog).
+        let decoded_before = super::AUDIO_FRAMES_DECODED.load(Ordering::Relaxed);
         let pusher = std::thread::spawn(move || {
+            // Push only once the subscriber decodes (the pump's silence padding), so the whole
+            // signal reaches it: a live track doesn't replay what was sent before the subscribe,
+            // and a slow first subscribe (cold caches) otherwise misses most of a 2.8 s push.
+            let waited = std::time::Instant::now();
+            while super::AUDIO_FRAMES_DECODED.load(Ordering::Relaxed) == decoded_before
+                && waited.elapsed() < std::time::Duration::from_secs(8)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
             // 80 ms bursts every 70 ms: the capture-side trim then keeps ~160 ms of slack for the pump.
             for _ in 0..40u32 {
                 let frame = vec![0.25f32; 1920];
@@ -3504,8 +3600,22 @@ mod tests {
             "both renditions published"
         );
 
+        // Every timing below runs from the subscriber's first decoded frame, not from the
+        // publish: a subscribe through a relay takes seconds (a fresh test binary may lack
+        // macOS local-network permission), and a fixed schedule would then unregister the
+        // codec before the subscriber ever chose it.
+        let decoded_before = super::AUDIO_FRAMES_DECODED.load(Ordering::Relaxed);
+        let decoding = move || {
+            let waited = std::time::Instant::now();
+            while super::AUDIO_FRAMES_DECODED.load(Ordering::Relaxed) == decoded_before
+                && waited.elapsed() < std::time::Duration::from_secs(10)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
         // A 440 Hz tone at RMS ~0.177, in 80 ms bursts a little faster than real time.
         let pusher = std::thread::spawn(move || {
+            decoding();
             for burst in 0..90u32 {
                 let frame: Vec<f32> = (0..1920)
                     .map(|n| {
@@ -3518,7 +3628,8 @@ mod tests {
             }
         });
         // LiquidCodec goes away 3 s in: the subscriber must move to Opus by itself.
-        let unregister = std::thread::spawn(|| {
+        let unregister = std::thread::spawn(move || {
+            decoding();
             std::thread::sleep(std::time::Duration::from_secs(3));
             crate::liquid::media_liquid_unregister();
         });
@@ -3526,7 +3637,10 @@ mod tests {
         let watchdog = {
             let stop = stop.clone();
             std::thread::spawn(move || {
-                for _ in 0..90 {
+                // 7 s of decoding: past the switch at 3 s, inside the 6.3 s push plus slack,
+                // before a silent (DTX) tail could read as a stall.
+                decoding();
+                for _ in 0..70 {
                     if stop.load(Ordering::Relaxed) {
                         break;
                     }

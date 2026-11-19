@@ -57,6 +57,8 @@ moq-audio = { git = "https://github.com/moq-dev/moq", rev = "4a6f52248", default
 moq-video = { git = "https://github.com/moq-dev/moq", rev = "4a6f52248" }
 moq-net = { git = "https://github.com/moq-dev/moq", rev = "4a6f52248" }
 moq-mux = { git = "https://github.com/moq-dev/moq", rev = "4a6f52248" }
+# moq-net's poll primitives (`kio::wait` bridges a send-estimate consumer to async).
+kio = { git = "https://github.com/moq-dev/moq", rev = "4a6f52248" }
 idfon-protocol = { path = "../idfon-protocol" }
 idfon-core = { path = "../idfon-core" }
 idfon-client = { path = "../idfon-client" }

@@ -364,6 +364,21 @@ pub(crate) fn note_frame(pts_us: u64, pts_gap_us: u64) {
     }
 }
 
+/// Lost packets the decoder rebuilt or concealed since the last call, folded into the
+/// call's record.
+pub(crate) fn note_losses(recovered: u64, concealed: u64) {
+    if recovered == 0 && concealed == 0 {
+        return;
+    }
+    let call = CALL.lock().unwrap_or_else(|poison| poison.into_inner());
+    if let Some(call) = call.as_ref() {
+        call.audio
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .record_losses(recovered, concealed);
+    }
+}
+
 /// Fold the call's accumulators into the record (the same shape whether the
 /// call is still running or just ended).
 fn build_record(call: &CallSampler) -> CallRecord {

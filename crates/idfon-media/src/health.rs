@@ -217,6 +217,13 @@ pub struct AudioStats {
     pub missing_frames: u64,
     /// Capture-side starvation samples: mic samples the encoder had to pad.
     pub underrun_samples: u64,
+    /// Lost packets the decoder rebuilt from redundancy a later packet carried
+    /// (Opus in-band FEC or DRED, LiquidCodec's previous-frame copy).
+    #[serde(default)]
+    pub recovered_packets: u64,
+    /// Lost packets the decoder concealed: nothing later carried them.
+    #[serde(default)]
+    pub concealed_packets: u64,
 }
 
 /// Running fold of the decode path's frame arrivals. Fed per decoded frame
@@ -236,6 +243,8 @@ pub struct AudioArrival {
     last_arrival_us: u64,
     last_pts_us: u64,
     last_pts_gap_us: u64,
+    recovered_packets: u64,
+    concealed_packets: u64,
 }
 
 impl AudioArrival {
@@ -253,7 +262,15 @@ impl AudioArrival {
             last_arrival_us: 0,
             last_pts_us: 0,
             last_pts_gap_us: 0,
+            recovered_packets: 0,
+            concealed_packets: 0,
         }
+    }
+
+    /// Adds lost packets the decoder rebuilt (`recovered`) or concealed.
+    pub fn record_losses(&mut self, recovered: u64, concealed: u64) {
+        self.recovered_packets += recovered;
+        self.concealed_packets += concealed;
     }
 
     /// Counts accrued since a prior snapshot, for a bounded health-check window.
@@ -310,6 +327,8 @@ impl AudioArrival {
             stalls_over_100ms: self.stalls_over_100ms,
             missing_frames: self.missing_frames,
             underrun_samples,
+            recovered_packets: self.recovered_packets,
+            concealed_packets: self.concealed_packets,
         }
     }
 }
@@ -614,8 +633,9 @@ mod tests {
         assert_eq!(
             keys(&json["audio"]),
             [
-                "arrival_jitter_ms", "duration_ms", "frames", "max_gap_ms",
-                "missing_frames", "stalls_over_100ms", "startup_ms", "underrun_samples",
+                "arrival_jitter_ms", "concealed_packets", "duration_ms", "frames", "max_gap_ms",
+                "missing_frames", "recovered_packets", "stalls_over_100ms", "startup_ms",
+                "underrun_samples",
             ]
         );
         assert_eq!(

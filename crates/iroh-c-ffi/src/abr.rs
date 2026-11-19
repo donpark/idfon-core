@@ -1,33 +1,32 @@
 //! Audio ABR: retune the live Opus encoder from the connection's send
 //! estimate (docs/media-adaptation.md §C5).
 //!
-//! The mic audio publishes on the session the peer dialed in on, and that
-//! session's congestion controller knows what the uplink can carry:
+//! The mic audio publishes on the call's sessions, and each session's
+//! congestion controller knows what the uplink can carry:
 //! [`Session::send_bandwidth`](moq_net::Session::send_bandwidth) — the same
 //! estimate moq-net mirrors to subscribers as `delivery_bps`. The house rate
-//! policy ([`moq_video::encode::rate`], "every sender backs off the same way")
-//! turns estimates into targets, and a [`BitrateControl`] hands them to the
-//! encoder the publish task owns (see `Options::bitrate_control` in moq-audio).
+//! policy ([`moq_mux::rate`], "every sender backs off the same way") turns
+//! estimates into targets.
 //!
 //! The encoder starts at its configured rate and the estimate only takes it
 //! down or back up within the voice band: 8–64 kbps per channel, never above
 //! configured. A caller that configured more (music via
 //! `media_audio_set_bitrate`) made that choice explicitly; ABR stands down
 //! rather than fight it.
-
 //!
-//! TODO(iroh-live-next): fork. `moq-ext-publisher` owns the encoder and exposes
-//! no bitrate control, and moq-audio's `BitrateControl` was fork-only, so the
-//! driver is off: [`start`] only reports whether ABR would run. The policy and
-//! its tests stay for when a control returns (upstream or the fork, step 3/4).
+//! The publisher retunes one rendition through
+//! `LocalBroadcast::set_audio_bitrate` (the iroh-live fork,
+//! `audio-renditions-next`). With several peers reading the call, the lowest
+//! target wins: the broadcast is one encoding for all of them.
 
-#[cfg(test)]
-use moq_net::time::Instant;
+use std::collections::HashMap;
+use std::sync::Mutex;
 
-#[cfg(test)]
-use moq_mux::rate::Control;
-use moq_mux::rate::Policy;
+use iroh::EndpointId;
+use iroh::Watcher as _;
+use moq_mux::rate::{Control, Policy, Target};
 use moq_net::bandwidth::Rate;
+use moq_net::time::Instant;
 
 /// The voice band `Producer::set_bitrate` is clamped to, in bits per second
 /// per channel. The floor is where speech stops being worth sending; the
@@ -36,20 +35,111 @@ use moq_net::bandwidth::Rate;
 const BAND_MIN: u64 = 8_000;
 const BAND_MAX: u64 = 64_000;
 
-/// Would drive the publish encoder from the send estimate. Returns whether the
-/// configured rate is inside the voice band (ABR would run); nothing drives the
-/// encoder on this branch.
-pub(crate) fn start(configured_bps: u64, channels: u32) -> bool {
-    let wanted = voice_policy(configured_bps, channels).is_some();
-    if wanted {
-        tracing::info!(target: "idfon.media", configured_bps, channels,
-            "audio ABR unavailable on upstream iroh-live; the encoder keeps its configured rate");
-    }
-    wanted
+/// How often the driver looks for new sessions to follow.
+const SESSION_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The running driver; dropping it (call end, or a new call) stops it.
+static DRIVER: Mutex<Option<tokio::task::JoinHandle<()>>> = Mutex::new(None);
+
+/// Start driving rendition `rendition` of the call's broadcast from the send
+/// estimates of the call's sessions. Returns whether ABR runs: `false` when the
+/// configured rate is outside the voice band (the caller's explicit choice
+/// stands).
+///
+/// The driver holds neither the node nor the broadcast: it looks the call up
+/// at each step (`crate::media::call_publication`), so a hung-up call's path is
+/// free at once, and it ends when no call is live.
+pub(crate) fn start(rendition: String, configured_bps: u64, channels: u32) -> bool {
+    stop();
+    let Some(policy) = voice_policy(configured_bps, channels) else {
+        return false;
+    };
+    let task = crate::util::TOKIO_EXECUTOR.spawn(async move {
+        let targets: std::sync::Arc<Mutex<HashMap<EndpointId, u64>>> = Default::default();
+        let applied = std::sync::Arc::new(Mutex::new(configured_bps));
+        let mut followed: Vec<iroh_live::Session> = Vec::new();
+        loop {
+            let Some(sessions) = crate::media::call_publication()
+                .map(|(node, _)| node.sessions().get())
+            else {
+                // Not published yet (the call is starting), or the call is gone.
+                if !crate::media::call_live() {
+                    break;
+                }
+                tokio::time::sleep(SESSION_POLL).await;
+                continue;
+            };
+            followed.retain(|session| sessions.contains(session));
+            for session in sessions {
+                if followed.contains(&session) {
+                    continue;
+                }
+                followed.push(session.clone());
+                let Some(mut send) = session.moq().send_bandwidth() else {
+                    continue;
+                };
+                let (policy, targets, applied, rendition) = (
+                    policy.clone(),
+                    targets.clone(),
+                    applied.clone(),
+                    rendition.clone(),
+                );
+                tokio::spawn(async move {
+                    let peer = session.peer();
+                    let mut rate = Control::new(policy);
+                    let apply = |target: Option<Target>| {
+                        let Some(target) = target else { return };
+                        let bps = match target {
+                            Target::Enabled(rate) => rate.as_bps(),
+                            Target::Disabled => return,
+                        };
+                        let mut targets = targets.lock().unwrap_or_else(|p| p.into_inner());
+                        targets.insert(peer, bps);
+                        let lowest = targets.values().copied().min().unwrap_or(bps);
+                        drop(targets);
+                        let mut applied = applied.lock().unwrap_or_else(|p| p.into_inner());
+                        if *applied == lowest {
+                            return;
+                        }
+                        let Some((_, broadcast)) = crate::media::call_publication() else {
+                            return;
+                        };
+                        match broadcast.set_audio_bitrate(&rendition, Rate::from_bps(lowest)) {
+                            Ok(()) => {
+                                tracing::debug!(target: "idfon.media", bps = lowest, "audio ABR retune");
+                                *applied = lowest;
+                            }
+                            Err(err) => {
+                                tracing::debug!(target: "idfon.media", error = %err, "audio ABR retune refused");
+                            }
+                        }
+                    };
+                    apply(rate.update(send.peek(), Instant::now()));
+                    loop {
+                        tokio::select! {
+                            _ = session.closed() => break,
+                            changed = kio::wait(|waiter| send.poll_changed(waiter)) => {
+                                let Ok(estimate) = changed else { break };
+                                apply(rate.update(estimate, Instant::now()));
+                            }
+                        }
+                    }
+                    targets.lock().unwrap_or_else(|p| p.into_inner()).remove(&peer);
+                });
+            }
+            tokio::time::sleep(SESSION_POLL).await;
+        }
+    });
+    *DRIVER.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(task);
+    true
 }
 
-/// Call end. Nothing to forget while the driver is off.
-pub(crate) fn stop() {}
+/// Call end: stop the driver. Its per-session followers end as the sessions close.
+pub(crate) fn stop() {
+    if let Some(task) = DRIVER.lock().unwrap_or_else(|poison| poison.into_inner()).take() {
+        task.abort();
+    }
+}
 
 /// The rate policy for a call configured at `configured_bps` total over
 /// `channels` channels: within the voice band per channel, capped at the
