@@ -65,7 +65,14 @@ defaults read com.idfon.mac | grep -i edge                          # nothing
 
 ## C. Droplet deploy (production)
 
-`deploy/digitalocean/README.md` covers provisioning (`pnpm deploy:do`). The
+`deploy/digitalocean/README.md` covers provisioning (`pnpm deploy:do`).
+**Routine image updates:** `pnpm edge deploy` (`scripts/edge-deploy.sh`). It tags
+origin/main as the next `edge-v*` when the edge changed, waits for the image,
+pins it in the droplet `.env` without rewriting the file, recreates only the
+edge container, and runs step 4's key-id check and step 5's `healthz`. The ring
+test in step 5 stays manual. `pnpm edge deploy -n` is a dry run;
+`pnpm edge deploy edge-vX.Y.Z` rolls back. Use `pnpm deploy:do` only to
+provision or change compose and relay config: it rewrites the droplet `.env`. The
 push channel needs more than the stock `compose.yaml` provides:
 
 1. **APNs key on the droplet** — copy `edge.apns.p8` to

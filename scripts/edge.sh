@@ -5,6 +5,7 @@
 #
 #   pnpm edge build
 #   pnpm edge image
+#   pnpm edge deploy [-y] [-n] [edge-vX.Y.Z]   (scripts/edge-deploy.sh)
 set -euo pipefail
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -19,8 +20,12 @@ case "$action" in
     shift
     exec docker build -f "$root/deploy/idfon-edge/Dockerfile" -t idfon-edge "$root" "$@"
     ;;
+  deploy)
+    shift
+    exec bash "$root/scripts/edge-deploy.sh" "$@"
+    ;;
   *)
-    printf 'Usage: pnpm edge {build|image}\n' >&2
+    printf 'Usage: pnpm edge {build|image|deploy}\n' >&2
     exit 2
     ;;
 esac
