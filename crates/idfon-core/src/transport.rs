@@ -156,12 +156,19 @@ pub trait MessageTransport: Send + Sync {
 #[derive(Clone, Default)]
 pub struct FakeTransport {
     sent: Arc<Mutex<Vec<MessageEnvelope>>>,
+    /// Every send with its target endpoint id, for tests that route between stores.
+    sent_to: Arc<Mutex<Vec<(String, MessageEnvelope)>>>,
     endpoint_tickets: Arc<Mutex<std::collections::HashMap<String, Vec<u8>>>>,
 }
 
 impl FakeTransport {
     pub fn messages(&self) -> Vec<MessageEnvelope> {
         self.sent.lock().expect("fake transport poisoned").clone()
+    }
+
+    /// Take every send so far, with its target endpoint id.
+    pub fn take_sent_to(&self) -> Vec<(String, MessageEnvelope)> {
+        std::mem::take(&mut *self.sent_to.lock().expect("fake transport poisoned"))
     }
 
     /// Test double for `endpoint_ticket`: what `endpoint_ticket_for` returns
@@ -185,7 +192,7 @@ impl FakeTransport {
 impl MessageTransport for FakeTransport {
     fn send<'a>(
         &'a self,
-        _target: &'a EndpointAddr,
+        target: &'a EndpointAddr,
         message: &'a MessageEnvelope,
     ) -> SendFuture<'a> {
         Box::pin(async move {
@@ -200,6 +207,10 @@ impl MessageTransport for FakeTransport {
                 .lock()
                 .expect("fake transport poisoned")
                 .push(message.clone());
+            self.sent_to
+                .lock()
+                .expect("fake transport poisoned")
+                .push((target.id.to_string(), message.clone()));
             Ok(MessageAck {
                 message_id: message.message_id.clone(),
                 status: AckStatus::Accepted,

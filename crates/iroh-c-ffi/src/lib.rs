@@ -10,6 +10,7 @@ pub mod endpoint;
 pub mod key;
 pub mod liquid;
 pub mod media;
+mod mixer;
 pub mod stream;
 pub mod util;
 pub mod video;

@@ -3,8 +3,12 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use iroh_live::{media::publish::LocalBroadcast, Live};
+use iroh_live::media::{
+    audio_encoding, AudioMode, LocalBroadcast, Player, PlayerConfig, SubscriptionExt as _,
+};
+use iroh_live::{BroadcastTicket, EndpointConfig, Node, NodeConfig};
 
+use crate::live::MountedNode;
 use crate::seam::{AudioCapture, DeviceAudioCapture};
 use idfon_protocol::{MediaKind, MediaSession};
 use thiserror::Error;
@@ -34,14 +38,15 @@ pub struct MediaSessionHandle {
 }
 
 struct LivePublisher {
-    live: Live,
+    live: MountedNode,
     _broadcast: LocalBroadcast,
 }
 
 struct LiveSubscriber {
-    live: Live,
+    node: Node,
+    endpoint: iroh::Endpoint,
     _subscription: iroh_live::Subscription,
-    _media: Option<iroh_live::media::subscribe::MediaTracks>,
+    _player: Option<Player>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,19 +114,26 @@ impl MediaSessionHandle {
         if self.session.kind != MediaKind::LiveAudio || !self.is_active() {
             return Err(MediaServiceError::AlreadyStopped);
         }
-        let live = Live::from_env()
-            .await
+        let endpoint = EndpointConfig::from_env()
             .map_err(|_| MediaServiceError::MediaUnavailable)?
-            .with_router()
-            .spawn();
+            .bind()
+            .await
+            .map_err(|_| MediaServiceError::MediaUnavailable)?;
+        let live = MountedNode::spawn(endpoint);
         let name = format!("idfon-session-{}", self.session.session_id);
-        let broadcast = live
-            .publish(&name)
+        let broadcast: LocalBroadcast = live
+            .layout
+            .publish(&live.node, &name)
             .map_err(|_| MediaServiceError::MediaUnavailable)?;
         broadcast
-            .audio()
-            .set(Box::new(DeviceAudioCapture::new(None)).into_source());
-        let ticket = iroh_live::ticket::LiveTicket::new(live.endpoint().id(), &name).serialize();
+            .set_audio(
+                Box::new(DeviceAudioCapture::new(None)).into_source(),
+                audio_encoding::voice(),
+            )
+            .map_err(|_| MediaServiceError::MediaUnavailable)?;
+        let ticket = live
+            .ticket(&name)
+            .map_err(|_| MediaServiceError::MediaUnavailable)?;
         *self.publisher.lock().expect("publisher poisoned") = Some(LivePublisher {
             live,
             _broadcast: broadcast,
@@ -141,21 +153,33 @@ impl MediaSessionHandle {
         if self.session.kind != MediaKind::LiveAudio || !self.is_active() {
             return Err(MediaServiceError::AlreadyStopped);
         }
-        let ticket = iroh_live::ticket::LiveTicket::deserialize(ticket)
+        let ticket: BroadcastTicket = ticket
+            .parse()
             .map_err(|_| MediaServiceError::MediaUnavailable)?;
-        let live = Live::from_env()
-            .await
+        let endpoint = EndpointConfig::from_env()
             .map_err(|_| MediaServiceError::MediaUnavailable)?
-            .spawn();
-        let subscription = live
-            .subscribe(ticket.endpoint, &ticket.broadcast_name)
+            .bind()
             .await
             .map_err(|_| MediaServiceError::MediaUnavailable)?;
-        let media = subscription.media().await;
+        let node = Node::new(endpoint.clone(), NodeConfig::default());
+        let subscription = node
+            .subscribe_ticket(&ticket)
+            .await
+            .map_err(|_| MediaServiceError::MediaUnavailable)?;
+        // Plays through the default output device when one opens; headless
+        // daemons keep the subscription without playback.
+        let player = match moq_audio::playback::Engine::open(Default::default()).await {
+            Ok(engine) => subscription
+                .remote_broadcast()
+                .play(PlayerConfig::default().with_audio(AudioMode::Play(engine)))
+                .ok(),
+            Err(_) => None,
+        };
         *self.subscriber.lock().expect("subscriber poisoned") = Some(LiveSubscriber {
-            live,
+            node,
+            endpoint,
             _subscription: subscription,
-            _media: Some(media),
+            _player: player,
         });
         Ok(())
     }
@@ -163,8 +187,10 @@ impl MediaSessionHandle {
     pub async fn stop_subscriber(&self) -> Result<(), MediaServiceError> {
         let subscriber = self.subscriber.lock().expect("subscriber poisoned").take();
         if let Some(subscriber) = subscriber {
+            drop(subscriber._player);
             drop(subscriber._subscription);
-            subscriber.live.shutdown().await;
+            subscriber.node.shutdown().await;
+            subscriber.endpoint.close().await;
         }
         Ok(())
     }

@@ -686,11 +686,14 @@ mod tests {
         client.bootstrap(&signer).await.expect("bootstrap");
         {
             let captured = captured.lock().expect("captured");
-            assert_eq!(captured[0], (
-                "POST".into(),
-                "/owner/challenge".into(),
-                format!(r#"{{"endpoint_id":"{}","identity":"{}"}}"#, signer.endpoint, signer.identity),
-            ));
+            // Compare parsed bodies: key order depends on serde_json's
+            // `preserve_order`, which any crate in the build can turn on.
+            assert_eq!((captured[0].0.as_str(), captured[0].1.as_str()), ("POST", "/owner/challenge"));
+            let challenge: serde_json::Value = serde_json::from_str(&captured[0].2).expect("json");
+            assert_eq!(
+                challenge,
+                serde_json::json!({"endpoint_id": signer.endpoint, "identity": signer.identity})
+            );
             let enroll: serde_json::Value = serde_json::from_str(&captured[1].2).expect("json");
             assert_eq!(enroll["nonce"], "00112233445566778899aabbccddeeff");
             assert_eq!(enroll["identity"], signer.identity);

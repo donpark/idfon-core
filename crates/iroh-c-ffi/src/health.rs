@@ -11,10 +11,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use iroh::endpoint::Connection;
-use iroh::protocol::{AcceptError, ProtocolHandler, Router};
+use iroh::protocol::{AcceptError, ProtocolHandler};
 use iroh::{Endpoint, EndpointAddr};
-use iroh_live::Live;
-use moq_media::net::NetworkSignals;
 use safer_ffi::prelude::*;
 use tokio::sync::watch;
 
@@ -27,41 +25,89 @@ use idfon_media::health::{
 /// endpoint (docs/media-adaptation.md §B2.2).
 pub const HEALTH_ALPN: &[u8] = b"idfon-health/1";
 
+/// One reading of the link a subscription plays over, in the shape the
+/// health record, the status line and the audio rendition policy read.
+///
+/// The old `moq_media::net::NetworkSignals` is gone upstream; this mirrors its
+/// fields from iroh-live's per-link `NetworkSample` (`Subscription::serving_link`).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct NetworkSignals {
+    pub rtt: Duration,
+    pub min_rtt: Duration,
+    pub loss_rate: f64,
+    pub goodput_bps: Option<u64>,
+    pub delivery_bps: Option<u64>,
+}
+
+impl From<iroh_live::NetworkSample> for NetworkSignals {
+    fn from(sample: iroh_live::NetworkSample) -> Self {
+        Self {
+            rtt: sample.rtt.unwrap_or_default(),
+            min_rtt: sample.min_rtt.or(sample.rtt).unwrap_or_default(),
+            loss_rate: sample.loss.unwrap_or(0.0),
+            goodput_bps: sample.throughput,
+            delivery_bps: sample.delivery,
+        }
+    }
+}
+
+/// How often [`signals_of`] reads the serving link.
+const SIGNAL_PERIOD: Duration = Duration::from_millis(250);
+
+/// A watch of `subscription`'s serving link, refreshed every [`SIGNAL_PERIOD`]
+/// until the subscription closes or every receiver is gone.
+pub(crate) fn signals_of(subscription: &iroh_live::Subscription) -> watch::Receiver<NetworkSignals> {
+    let initial = subscription
+        .serving_link()
+        .map(|link| NetworkSignals::from(link.sample))
+        .unwrap_or_default();
+    let (tx, rx) = watch::channel(initial);
+    let subscription = subscription.clone();
+    crate::util::TOKIO_EXECUTOR.spawn(async move {
+        let mut tick = tokio::time::interval(SIGNAL_PERIOD);
+        loop {
+            tokio::select! {
+                _ = subscription.closed() => break,
+                _ = tx.closed() => break,
+                _ = tick.tick() => {
+                    if let Some(link) = subscription.serving_link() {
+                        let next = NetworkSignals::from(link.sample);
+                        tx.send_if_modified(|current| {
+                            let changed = *current != next;
+                            *current = next;
+                            changed
+                        });
+                    }
+                }
+            }
+        }
+    });
+    rx
+}
+
 static SIGNALS: Mutex<Option<watch::Receiver<NetworkSignals>>> = Mutex::new(None);
 /// Prefer the dedicated video subscription when measuring video admission;
 /// the parallel audio subscription can otherwise overwrite its signals.
 static VIDEO_SIGNALS: Mutex<Option<watch::Receiver<NetworkSignals>>> = Mutex::new(None);
 static CHANNELS: AtomicU64 = AtomicU64::new(1);
-/// Routers serving [`HEALTH_ALPN`], one per session endpoint. A call runs
-/// two endpoints in one process (publish and subscribe legs); each keeps its
-/// own accept side alive.
-static ROUTERS: Mutex<Vec<(iroh::EndpointId, Router)>> = Mutex::new(Vec::new());
 /// The endpoint of the attached session: where a merged check dials out.
 static ENDPOINT: Mutex<Option<Endpoint>> = Mutex::new(None);
 /// The attached session's connection: what the per-call record reads path
 /// state (direct/relay, path switches) from.
 static CONN: Mutex<Option<Connection>> = Mutex::new(None);
 
-/// Serve the health ALPN on the session's endpoint, alongside MoQ. Per
-/// endpoint and idempotent; routers live as long as their endpoint.
-pub(crate) fn ensure_served(live: &Live) {
-    let mut routers = ROUTERS.lock().unwrap_or_else(|poison| poison.into_inner());
-    if routers.iter().any(|(id, _)| *id == live.endpoint().id()) {
-        return;
-    }
-    let endpoint = live.endpoint().clone();
-    let builder = live.register_protocols(Router::builder(endpoint.clone()));
-    let router = builder.accept(HEALTH_ALPN, Arc::new(HealthProtocol)).spawn();
-    routers.push((live.endpoint().id(), router));
+/// Serve the health ALPN on a call session's router, alongside MoQ
+/// (`media::CallSession` mounts it once per session endpoint).
+pub(crate) fn serve(router: iroh::protocol::RouterBuilder) -> iroh::protocol::RouterBuilder {
+    router.accept(HEALTH_ALPN, Arc::new(HealthProtocol))
 }
 
 /// Attach the live session's connection and signals so checks and the
 /// per-call record can sample them. Call it when a subscription is
 /// established; the last one wins per call, and a re-attach (the re-subscribe
 /// loop) keeps the record accumulating rather than starting a new one.
-pub(crate) fn attach(live: &Live, conn: &Connection, signals: watch::Receiver<NetworkSignals>) {
-    ensure_served(live);
-    *ENDPOINT.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(live.endpoint().clone());
+pub(crate) fn attach(endpoint: &Endpoint, conn: &Connection, signals: watch::Receiver<NetworkSignals>) {
+    *ENDPOINT.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(endpoint.clone());
     *CONN.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(conn.clone());
     *SIGNALS.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(signals);
     start_call_sampling();
@@ -70,11 +116,11 @@ pub(crate) fn attach(live: &Live, conn: &Connection, signals: watch::Receiver<Ne
 /// Attach the video leg separately so an audio resubscribe cannot replace the
 /// goodput source that gates video admission.
 pub(crate) fn attach_video(
-    live: &Live,
+    endpoint: &Endpoint,
     conn: &Connection,
     signals: watch::Receiver<NetworkSignals>,
 ) {
-    attach(live, conn, signals.clone());
+    attach(endpoint, conn, signals.clone());
     *VIDEO_SIGNALS.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(signals);
 }
 
@@ -318,6 +364,21 @@ pub(crate) fn note_frame(pts_us: u64, pts_gap_us: u64) {
     }
 }
 
+/// Lost packets the decoder rebuilt or concealed since the last call, folded into the
+/// call's record.
+pub(crate) fn note_losses(recovered: u64, concealed: u64) {
+    if recovered == 0 && concealed == 0 {
+        return;
+    }
+    let call = CALL.lock().unwrap_or_else(|poison| poison.into_inner());
+    if let Some(call) = call.as_ref() {
+        call.audio
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .record_losses(recovered, concealed);
+    }
+}
+
 /// Fold the call's accumulators into the record (the same shape whether the
 /// call is still running or just ended).
 fn build_record(call: &CallSampler) -> CallRecord {
@@ -419,7 +480,7 @@ struct Probe {
 }
 
 #[derive(Debug)]
-struct HealthProtocol;
+pub(crate) struct HealthProtocol;
 
 impl ProtocolHandler for HealthProtocol {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
@@ -531,10 +592,12 @@ pub fn media_health_check_ticket(
     let Some(endpoint) = session_endpoint() else {
         return 1;
     };
-    let Ok(ticket) = peer_ticket.to_str().parse::<iroh_live::ticket::LiveTicket>() else {
+    let Ok(ticket) = peer_ticket.to_str().parse::<iroh_live::BroadcastTicket>() else {
         return 2;
     };
-    run_check(ctx, cb, duration_ms, Some((endpoint, ticket.endpoint)))
+    // A ticket names the peer only; the endpoint already holds the call's
+    // connection to it, so the dial finds its addresses there.
+    run_check(ctx, cb, duration_ms, Some((endpoint, EndpointAddr::from(ticket.peer()))))
 }
 
 fn run_check(

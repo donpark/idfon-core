@@ -1,6 +1,7 @@
 //! Current decoded-video FFI bridge.
 
-use iroh_live::{ticket::LiveTicket, Live};
+use iroh_live::media::{PlayerConfig, SubscriptionExt as _, IMMEDIATE_LATENCY};
+use iroh_live::{BroadcastTicket, Reach};
 use safer_ffi::prelude::*;
 use std::{
     ffi::c_void,
@@ -12,7 +13,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use idfon_media::seam::VideoRender;
 use moq_video::Frame as VideoFrame;
 
 use crate::media::media_path;
@@ -180,11 +180,10 @@ pub fn media_video_start(ticket: char_p::Ref<'_>) -> char_p::Box {
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = stop.clone();
     let return_path = frame_path.to_string_lossy().into_owned();
+    // A dedicated thread drives the loop on the shared executor's runtime, so
+    // the call session's node and this subscription share one reactor.
+    let runtime = crate::util::TOKIO_EXECUTOR.handle().clone();
     std::thread::spawn(move || {
-        let Ok(runtime) = tokio::runtime::Runtime::new() else {
-            video_error("video runtime creation failed");
-            return;
-        };
         runtime.block_on(video_loop(&ticket, render, thread_stop));
     });
     *VIDEO.lock().unwrap() = Some(VideoSession { stop });
@@ -211,6 +210,14 @@ pub fn media_video_stop() {
     }
 }
 
+/// Where decoded frames go. Frames arrive shared (`Arc`) from the player, so a
+/// renderer borrows them; `idfon_media::seam::VideoRender` takes them by value.
+trait VideoRender: Send + Sync {
+    fn present(&self, frame: &VideoFrame);
+    /// No live frames are available any more (peer camera off / track ended).
+    fn clear(&self) {}
+}
+
 /// Disk artifact renderer: the fallback when no shell callback is registered.
 struct DiskRender {
     frame_path: PathBuf,
@@ -227,7 +234,7 @@ impl DiskRender {
 }
 
 impl VideoRender for DiskRender {
-    fn present(&self, frame: VideoFrame) {
+    fn present(&self, frame: &VideoFrame) {
         let Ok(rgba) = frame.surface.to_rgba(&moq_video::convert::Config::default()) else {
             return;
         };
@@ -262,12 +269,12 @@ struct CallbackRender {
 }
 
 impl VideoRender for CallbackRender {
-    fn present(&self, frame: VideoFrame) {
+    fn present(&self, frame: &VideoFrame) {
         let Ok(rgba) = frame.surface.to_rgba(&moq_video::convert::Config::default()) else {
             return;
         };
         let data = rgba.data();
-        let pts_ms = frame.timestamp.as_millis() as u64;
+        let pts_ms = frame.timestamp.as_millis().unwrap_or(0) as u64;
         unsafe {
             (self.cb)(
                 self.ctx as *const c_void,
@@ -286,22 +293,25 @@ impl VideoRender for CallbackRender {
 }
 
 async fn video_loop(ticket: &str, render: Box<dyn VideoRender>, stop: Arc<AtomicBool>) {
-    let ticket = match ticket.parse::<LiveTicket>() {
+    let ticket = match ticket.parse::<BroadcastTicket>() {
         Ok(ticket) => ticket,
         Err(error) => {
             video_error(format!("ticket parse failed: {error}"));
             return;
         }
     };
-    let live = match Live::from_env().await {
-        Ok(live) => live.spawn(),
+    // The call session's node: the audio leg's subscription already holds a
+    // session to this peer, so the video subscription rides it.
+    let session = match crate::media::session_handle().await {
+        Ok(session) => session,
         Err(error) => {
-            video_error(format!("live init failed: {error}"));
+            video_error(format!("live init failed: {error:#}"));
             return;
         }
     };
-    let subscription = match live
-        .subscribe(ticket.endpoint, &ticket.broadcast_name)
+    let subscription = match session
+        .node
+        .subscribe(ticket.path().clone(), Reach::Direct(ticket.peer()))
         .await
     {
         Ok(subscription) => subscription,
@@ -310,59 +320,57 @@ async fn video_loop(ticket: &str, render: Box<dyn VideoRender>, stop: Arc<Atomic
             return;
         }
     };
-    let broadcast = subscription.broadcast();
+    let remote = subscription.remote_broadcast();
     // The publisher registers its video rendition only once the first camera
-    // frame reaches the encoder (moq-media `VideoSource::Frames` derives the
-    // catalog geometry from it), and a mic-first call may not switch the camera
+    // frame reaches the encoder, and a mic-first call may not switch the camera
     // on for a while. The first catalog is therefore audio-only or empty; wait
-    // for the rendition instead of failing on that snapshot.
-    while !broadcast.has_video() {
+    // for a rendition instead of failing on that snapshot.
+    let mut catalog = remote.catalog();
+    loop {
         if stop.load(Ordering::Relaxed) {
-            live.shutdown().await;
             return;
         }
-        tokio::time::sleep(STOP_POLL).await;
+        if catalog
+            .borrow()
+            .as_ref()
+            .is_some_and(|catalog| !catalog.video.renditions.is_empty())
+        {
+            break;
+        }
+        let _ = tokio::time::timeout(STOP_POLL, catalog.changed()).await;
     }
-    // Start in the middle of the ladder, not at its top or bottom. Neither end
-    // is a safe assumption: the top strands a constrained path while it walks
-    // down, and the bottom shows a bad picture while it climbs. One step either
-    // way from the middle lands on a useful rung, and the adaptation loop takes
-    // it within a check or two. The rung to start on is a calibration value:
-    // measure what the iPhone reference client (FaceTime) opens at before
-    // tuning it. The Mac FaceTime app is a separate implementation and is not
-    // the reference for an iOS ladder.
-    let ranked = moq_media::adaptive::rank_renditions(broadcast.catalog().video());
-    let first_rendition = ranked
-        .get(ranked.len() / 2)
-        .map(|rendition| rendition.name.clone());
-    let Some(first_rendition) = first_rendition else {
-        video_error("video catalog has no renditions");
-        live.shutdown().await;
-        return;
-    };
-    let track = match broadcast.video_rendition(&first_rendition).await {
-        Ok(track) => track,
+    // The player picks and adapts the rendition from the serving link (upstream
+    // `moq-ext-adaptive`, which replaces the hand-picked middle rung). Audio
+    // stays with the audio leg; video presents on arrival here and against the
+    // audio playout clock below (av.rs).
+    let player = match remote.play(PlayerConfig::default().with_latency(IMMEDIATE_LATENCY)) {
+        Ok(player) => player,
         Err(error) => {
-            video_error(format!("video track failed: {error}"));
-            live.shutdown().await;
+            video_error(format!("video player failed: {error}"));
             return;
         }
     };
-    track.enable_adaptation(subscription.signals().clone());
-    *VIDEO_RENDITION.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(track.rendition());
+    let status = player.status();
     // Admission must measure the video leg's actual delivery, not only audio
     // goodput; attach this subscription after the audio leg so it is sampled.
-    crate::health::attach_video(&live, subscription.session().conn(), subscription.signals().clone());
+    if let Some(peer_session) = subscription.session() {
+        crate::health::attach_video(
+            &session.endpoint,
+            peer_session.connection(),
+            crate::health::signals_of(&subscription),
+        );
+    }
+    let mut frames = player.video_frames();
     let mut stop_poll = tokio::time::interval(STOP_POLL);
     while !stop.load(Ordering::Relaxed) {
-        // `VideoTrack::recv` is a cancel-safe latest-frame slot, so bounding it
+        // `VideoFrames::next` is a cancel-safe latest-frame slot, so bounding it
         // keeps hangup prompt and lets an idle track clear the picture.
         let frame = tokio::select! {
             _ = stop_poll.tick() => {
                 if stop.load(Ordering::Relaxed) { break; }
                 continue;
             }
-            frame = tokio::time::timeout(FRAME_IDLE, track.recv()) => match frame {
+            frame = tokio::time::timeout(FRAME_IDLE, frames.next()) => match frame {
                 Ok(Some(frame)) => frame,
                 Ok(None) => break,
                 Err(_) => {
@@ -371,35 +379,42 @@ async fn video_loop(ticket: &str, render: Box<dyn VideoRender>, stop: Arc<Atomic
                 }
             }
         };
+        let (rendition, decoder) = {
+            let status = status.borrow();
+            (status.rendition.clone(), status.decoder.clone())
+        };
         *VIDEO_RENDITION
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner()) = Some(track.rendition());
+            .unwrap_or_else(|poison| poison.into_inner()) = rendition.clone();
         {
-            let rendition = track.rendition();
             let mut info = VIDEO_INFO
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
-            if info.rendition.as_deref() != Some(rendition.as_str()) {
-                info.bitrate = broadcast
-                    .catalog()
-                    .video()
-                    .get(&rendition)
-                    .and_then(|config| config.bitrate);
-                info.rendition = Some(rendition);
+            if info.rendition != rendition {
+                info.bitrate = rendition.as_ref().and_then(|name| {
+                    remote
+                        .catalog()
+                        .borrow()
+                        .as_ref()
+                        .and_then(|catalog| catalog.video.renditions.get(name))
+                        .and_then(|config| config.bitrate)
+                });
+                info.rendition = rendition;
             }
-            info.decoder = Some(track.decoder());
+            info.decoder = decoder;
         }
         let size = (frame.surface.width(), frame.surface.height());
+        let pts_us = frame.timestamp.as_micros().unwrap_or(0) as u64;
         // Present against the audio playout clock: wait out an early frame,
         // drop one too late to show (av.rs). No audio leg = present on arrival.
-        match crate::av::decide(frame.timestamp.as_micros() as u64) {
+        match crate::av::decide(pts_us) {
             crate::av::Decision::Present => {
-                render.present(frame);
+                render.present(&frame);
                 record_presented_frame(size);
             }
             crate::av::Decision::Wait(due) => {
                 tokio::time::sleep_until(tokio::time::Instant::from_std(due)).await;
-                render.present(frame);
+                render.present(&frame);
                 record_presented_frame(size);
             }
             crate::av::Decision::Drop => {}
@@ -407,5 +422,6 @@ async fn video_loop(ticket: &str, render: Box<dyn VideoRender>, stop: Arc<Atomic
     }
     // Track ended or the session stopped: nothing is live any more.
     render.clear();
-    live.shutdown().await;
+    drop(player);
+    drop(subscription);
 }
