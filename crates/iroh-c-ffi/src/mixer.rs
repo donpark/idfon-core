@@ -222,9 +222,18 @@ impl Drop for MemberInput {
     }
 }
 
+/// The mix's ceiling: a limiter holds peaks under it.
+const CEILING: f32 = 0.9;
+/// How fast the limiter's gain recovers after a loud stretch, per 10 ms tick
+/// (about 0.5 s to recover most of the way).
+const RELEASE: f32 = 0.05;
+
 fn run(inner: Arc<Inner>) {
     let mut next = Instant::now() + TICK;
     let mut mix: Vec<f32> = Vec::new();
+    // Limiter gain: drops at once when several loud members would clip, and
+    // recovers slowly, so the mix stays clean instead of distorting.
+    let mut gain = 1.0f32;
     while !inner.stop.load(Ordering::Relaxed) {
         let now = Instant::now();
         if next > now {
@@ -276,10 +285,14 @@ fn run(inner: Arc<Inner>) {
             }
         }
         if any {
+            let peak = mix.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+            let target = if peak > CEILING { CEILING / peak } else { 1.0 };
+            gain = if target < gain { target } else { gain + (target - gain) * RELEASE };
             for sample in mix.iter_mut() {
-                // Soft clip: several loud members must not wrap.
-                if sample.abs() > 0.9 {
-                    *sample = sample.signum() * (0.9 + (sample.abs() - 0.9).tanh() * 0.1);
+                *sample *= gain;
+                // Backstop: a residual overshoot must not wrap.
+                if sample.abs() > CEILING {
+                    *sample = sample.signum() * (CEILING + (sample.abs() - CEILING).tanh() * (1.0 - CEILING));
                 }
             }
         }
@@ -367,6 +380,23 @@ mod tests {
         }
         let after = mixer.levels()[0].1;
         assert!(after < 0.06, "decays in silence: {after}");
+    }
+
+    #[test]
+    fn loud_members_are_limited_not_clipped() {
+        let (sink, out) = collect();
+        let mixer = Mixer::start(sink);
+        let members: Vec<MemberInput> = (0..6).map(|i| mixer.add(format!("m{i}"), 1)).collect();
+        for _ in 0..5 {
+            for member in &members {
+                member.push(&[0.5; 960], 1);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(60));
+        let out = out.lock().unwrap();
+        let peak = out.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        assert!(peak <= CEILING + 1e-4, "held under the ceiling: {peak}");
+        assert!(peak > 0.8, "limited, not silenced: {peak}");
     }
 
     #[test]

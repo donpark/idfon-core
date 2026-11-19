@@ -4748,4 +4748,31 @@ mod tests {
         shutdown_publishers(vec![extra]);
     }
 
+
+    /// A full call: all 11 remote members come through the one mix.
+    #[test]
+    fn eleven_members_are_all_heard() {
+        let _guard = crate::util::MEDIA_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        start_group_collect();
+        // Spread so no tone sits on another's harmonic.
+        let tones: Vec<f32> = (0..11).map(|i| 410.0 + 137.0 * i as f32).collect();
+        let members: Vec<TonePublisher> = tones.iter().map(|&hz| tone_publisher(hz)).collect();
+        for member in &members {
+            assert_eq!(add(member), 0);
+        }
+        let heard = wait_for_mix(&tones, &[], std::time::Duration::from_secs(25));
+        let mix = GROUP_MIX.lock().unwrap().clone();
+        let tail = &mix[mix.len().saturating_sub(24_000)..];
+        let powers: Vec<String> = tones.iter().map(|&hz| format!("{hz}:{:.1e}", tone_power(tail, hz))).collect();
+        let peak = tail.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        eprintln!("DIAG eleven: peak={peak:.2} {powers:?}");
+        assert!(heard, "every member in the mix: {powers:?}");
+        assert!(peak <= 0.901, "the limiter holds the mix under its ceiling: {peak}");
+        super::media_live_unsubscribe();
+        super::media_audio_clear_playback_cb();
+        shutdown_publishers(members);
+    }
+
 }
