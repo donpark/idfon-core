@@ -6,6 +6,11 @@
 //! stream, so the shell's playback callback keeps seeing one producer at one
 //! channel count, however many members talk.
 //!
+//! With one member there is nothing to mix: its audio passes straight to the
+//! shell on the leg's own pacing thread, so a 1:1 call pays none of the mix's
+//! prebuffer (two 20 ms chunks plus up to a 10 ms tick). The mix takes over
+//! when a second member joins, and hands back when one is left.
+//!
 //! The device fallback needs none of this: moq's playback `Engine` already
 //! mixes every sink opened on it, so legs share one engine instead.
 
@@ -135,11 +140,32 @@ impl MemberInput {
             .members
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
+        let solo = members.len() == 1;
         let Some(member) = members.get_mut(&self.id) else {
             return;
         };
         let channels = channels.max(1) as usize;
         let out = out as usize;
+        if solo {
+            // Pass through: drop anything queued while others were in the mix.
+            member.queue.clear();
+            member.started = false;
+            drop(members);
+            if channels == out {
+                (self.inner.sink)(pcm, out as u32);
+            } else {
+                let mut converted = Vec::with_capacity(pcm.len() / channels * out);
+                for frame in pcm.chunks_exact(channels) {
+                    match (channels, out) {
+                        (1, 2) => converted.extend([frame[0], frame[0]]),
+                        (_, 1) => converted.push(frame.iter().sum::<f32>() / channels as f32),
+                        _ => converted.extend_from_slice(&frame[..2]),
+                    }
+                }
+                (self.inner.sink)(&converted, out as u32);
+            }
+            return;
+        }
         let frames = pcm.len() / channels;
         member.largest_chunk = member.largest_chunk.max(frames);
         for frame in pcm.chunks_exact(channels) {
@@ -204,7 +230,8 @@ fn run(inner: Arc<Inner>) {
                 .members
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
-            if members.is_empty() {
+            // One member passes through on its own thread (see `push`).
+            if members.len() < 2 {
                 continue;
             }
             for member in members.values_mut() {
@@ -270,11 +297,9 @@ mod tests {
         assert!((peak - 0.5).abs() < 1e-3, "summed level {peak}");
         drop(b);
         assert_eq!(mixer.member_count(), 1);
-        for _ in 0..5 {
-            a.push(&[0.25; 960], 1);
-        }
+        // Alone again: its audio passes straight through.
         out.lock().unwrap().clear();
-        std::thread::sleep(Duration::from_millis(40));
+        a.push(&[0.25; 960], 1);
         let after = out.lock().unwrap().iter().cloned().fold(0.0f32, f32::max);
         assert!((after - 0.25).abs() < 1e-3, "one member left, level {after}");
     }
@@ -286,13 +311,23 @@ mod tests {
         let mono = mixer.add(1);
         let stereo = mixer.add(2);
         let frame: Vec<f32> = [0.2f32, 0.4].repeat(960);
-        for _ in 0..5 {
-            stereo.push(&frame, 2);
-        }
+        // The mix's channel count stays the first member's after it leaves.
         drop(mono);
-        std::thread::sleep(Duration::from_millis(60));
+        stereo.push(&frame, 2);
+        assert_eq!(out.lock().unwrap().len(), 960, "folded to mono");
         let peak = out.lock().unwrap().iter().cloned().fold(0.0f32, f32::max);
         assert!((peak - 0.3).abs() < 1e-3, "averaged to {peak}");
+    }
+
+    #[test]
+    fn a_lone_member_passes_straight_through() {
+        let (sink, out) = collect();
+        let mixer = Mixer::start(sink);
+        let a = mixer.add(1);
+        a.push(&[0.25; 960], 1);
+        // Delivered at once, on the pushing thread: no prebuffer, no tick.
+        assert_eq!(out.lock().unwrap().len(), 960);
+        assert!(mixer.inner.members.lock().unwrap()[&a.id].queue.is_empty());
     }
 
     #[test]
@@ -300,6 +335,7 @@ mod tests {
         let (sink, _out) = collect();
         let mixer = Mixer::start(sink);
         let a = mixer.add(1);
+        let _b = mixer.add(1);
         for _ in 0..100 {
             a.push(&[0.1; 960], 1);
         }
