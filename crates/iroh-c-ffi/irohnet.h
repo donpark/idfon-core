@@ -787,6 +787,20 @@ media_audio_set_bitrate (
     uint32_t bitrate);
 
 /** \brief
+ *  Flip in-band FEC on the live audio track (docs/media-adaptation.md §B2.4).
+ *
+ *  The degradation ladder's stereo step calls this: stereo on is quality
+ *  mode (FEC off, the LBRR copy would couple the channels), auto stereo-off
+ *  is resilience mode (FEC on, the measured recovery win is mono speech).
+ *  `fec` on selects the `inband` redundancy mode; off returns to the
+ *  automatic split ([`redundancy_for`]). Returns 0 on success, 1 without a
+ *  live audio track.
+ */
+uint8_t
+media_audio_set_fec (
+    uint8_t fec);
+
+/** \brief
  *  Register a shell audio renderer before `media_live_subscribe`.
  *
  *  The callback runs on the seam's pacing thread and is handed a borrowed
@@ -799,6 +813,20 @@ uint8_t
 media_audio_set_playback_cb (
     void const * ctx,
     void (*cb)(void const *, uint8_t const *, size_t, uint32_t, uint32_t, uint64_t));
+
+/** \brief
+ *  Set the redundancy mode for the live audio track and every call after it
+ *  (docs/media-adaptation.md §D7.1). Modes: `0` auto — DRED for stereo and
+ *  for the audio of any video call (video is the shed rung, its audio must
+ *  survive it), LBRR for mono voice; `1` off (holes as sent); `2` inband
+ *  (Opus LBRR); `3` dred (Opus deep redundancy); `4` transport (formerly the
+ *  parity sidecar; now the same as dred). Returns 0 on
+ *  success, 1 without a live audio track (the mode still applies to the next
+ *  call), 2 for an unknown mode.
+ */
+uint8_t
+media_audio_set_redundancy (
+    uint8_t mode);
 
 /** <No documentation available> */
 uint8_t
@@ -843,9 +871,150 @@ media_call_tone (
 void
 media_emergency_stop (void);
 
+/** \brief
+ *  Run a health check over the live session and report through `cb`.
+ *
+ *  `cb` receives JSON (`idfon_media::health::Progress`): `sampling` events
+ *  while the window runs, then one `done` event carrying the report. The last
+ *  argument tells them apart (1 = done). Returns 0 when the check started,
+ *  1 when no live session is attached.
+ */
+uint8_t
+media_health_check (
+    void const * ctx,
+    void (*cb)(void const *, uint8_t const *, size_t, uint8_t),
+    uint64_t duration_ms);
+
+/** \brief
+ *  The bi-directional check: like [`media_health_check`], and the far end
+ *  (its iroh endpoint address as JSON) samples its own downlink over the
+ *  same window on the health ALPN. The `done` report merges both legs.
+ *  Returns 0 when started, 1 when no live session is attached, 2 when the
+ *  address does not parse.
+ */
+uint8_t
+media_health_check_remote (
+    void const * ctx,
+    void (*cb)(void const *, uint8_t const *, size_t, uint8_t),
+    uint64_t duration_ms,
+    char const * peer_addr);
+
+/** \brief
+ *  The shell-friendly bi-directional check: the far end is named by its
+ *  `LiveTicket` (what call setup already holds) instead of a raw address.
+ *  Returns 0 when started, 1 when no live session is attached, 2 when the
+ *  ticket does not parse.
+ */
+uint8_t
+media_health_check_ticket (
+    void const * ctx,
+    void (*cb)(void const *, uint8_t const *, size_t, uint8_t),
+    uint64_t duration_ms,
+    char const * peer_ticket);
+
+/** \brief
+ *  The last ended call's record JSON (`idfon_media::health::CallRecord`),
+ *  taken (and cleared) so one record ships exactly once. Empty when no call
+ *  has ended since the last read.
+ */
+char *
+media_health_last_report (void);
+
+/** \brief
+ *  The running call's record so far (`idfon_media::health::CallRecord`), read
+ *  without stopping the sampler — what `/health-check` shows mid-call. Empty
+ *  when no call is being sampled. Same shape as [`media_health_last_report`].
+ */
+char *
+media_health_live_report (void);
+
+/** \brief
+ *  1 when a LiquidCodec implementation is registered, else 0.
+ */
+uint8_t
+media_liquid_available (void);
+
+/** \brief
+ *  Register the shell's LiquidCodec implementation (see the module docs for the
+ *  callback contract). `bitrate` is what the catalog advertises, in bits per
+ *  second. Replaces any earlier registration; returns 0.
+ */
+uint8_t
+media_liquid_register (
+    void const * ctx,
+    void const * (*enc_new)(void const *),
+    int32_t (*enc_encode)(void const *, float const *, size_t, uint8_t *, size_t),
+    void (*enc_free)(void const *),
+    void const * (*dec_new)(void const *),
+    int32_t (*dec_decode)(void const *, uint8_t const *, size_t, float *, size_t),
+    int32_t (*dec_recover)(void const *, uint8_t const *, size_t, uint32_t, float *, size_t),
+    void (*dec_free)(void const *),
+    uint32_t bitrate);
+
+/** \brief
+ *  Remove the shell's LiquidCodec implementation. Open streams keep theirs.
+ */
+void
+media_liquid_unregister (void);
+
+/** \brief
+ *  Add one remote member to the call (group call, docs/group-live-chat.md G0):
+ *  subscribe to `ticket`'s publisher without ending the other legs. `addrs` is
+ *  the member's dial address JSON, as for `media_live_subscribe_with_addrs`
+ *  (empty when unknown). Every member's audio plays through one mix.
+ *
+ *  Returns 0 on success, 1 for a bad ticket or no session, 2 when the member is
+ *  already in the call, 3 when the call is full (12 people).
+ */
+uint8_t
+media_live_add_member (
+    char const * ticket,
+    char const * addrs);
+
+/** \brief
+ *  The live session's own dial address as `EndpointAddr` JSON — what the far
+ *  side merges into the ticket (`media_live_subscribe_with_addrs`) via the
+ *  envelope's `addr` line (C20). A live ticket is endpoint-id-only and a fresh
+ *  endpoint's pkarr record is not resolvable yet at call-setup time, so
+ *  id-only dials race discovery and time out; `Endpoint::addr()` carries the
+ *  relay and current direct addresses, which dial without any lookup. Empty
+ *  when no live session is running.
+ */
+char *
+media_live_endpoint_addr (void);
+
 /** <No documentation available> */
 char *
 media_live_last_error (void);
+
+/** \brief
+ *  How many remote members the call holds (listen legs).
+ */
+uint32_t
+media_live_member_count (void);
+
+/** \brief
+ *  The selected path as one short line for the call UI: `direct 192.168.1.42`
+ *  or `relay`. Empty when no connection is attached. The local IP is what
+ *  says which network carries the call (192.168.x vs a cellular address) —
+ *  the record keeps the same value, so one test answers "did it move?".
+ */
+char *
+media_live_path (void);
+
+/** \brief
+ *  The OS reports a network interface change. Shorten the stall watchdog for
+ *  a grace window; if frames keep flowing this costs nothing.
+ */
+void
+media_live_path_changed (void);
+
+/** \brief
+ *  The shell returned to the foreground: answer a stalled subscription now
+ *  instead of at the end of its backoff. No-op when nothing is subscribed.
+ */
+void
+media_live_reconnect (void);
 
 /** <No documentation available> */
 size_t
@@ -855,10 +1024,27 @@ media_live_recording_samples (void);
 char *
 media_live_recording_store (void);
 
+/** \brief
+ *  Remove one remote member (its endpoint id, hex) from the call: stop its
+ *  leg and drop it from the mix. The others keep playing. Returns 0, or 1 when
+ *  no such member is in the call.
+ */
+uint8_t
+media_live_remove_member (
+    char const * peer);
+
 /** <No documentation available> */
 uint8_t
 media_live_set_audio_enabled (
     uint8_t enabled);
+
+/** \brief
+ *  Prefer `codec` (`liquid`, `opus`, ...; empty clears) among a publisher's audio renditions for the
+ *  next and current subscription. Returns 0.
+ */
+uint8_t
+media_live_set_audio_preference (
+    char const * codec);
 
 /** <No documentation available> */
 uint8_t
@@ -888,6 +1074,13 @@ media_live_start_with_source (
     uint8_t video,
     char const * source);
 
+/** \brief
+ *  What the listening leg is doing: 0 idle, 1 connecting, 2 playing,
+ *  3 reconnecting, 4 failed. Cheap; safe to poll from the call UI.
+ */
+uint8_t
+media_live_state (void);
+
 /** <No documentation available> */
 void
 media_live_stop (void);
@@ -896,6 +1089,32 @@ media_live_stop (void);
 uint8_t
 media_live_subscribe (
     char const * ticket);
+
+/** \brief
+ *  Subscribe with the peer's known addresses merged in (#157).
+ *
+ *  A serialized live ticket carries the endpoint id only — `LiveTicket`'s
+ *  wire form is `iroh-live:<base64 id>/<name>` — so every dial resolves the
+ *  publisher through pkarr/DNS. That is what failed with "No addressing
+ *  information available" while interfaces flipped (2026-11-04 drive), and it
+ *  is why first dials can take 10-20 s. The shell already holds the contact's
+ *  `endpoint_addr` from pairing, so it passes it here; when the ids match and
+ *  the ticket has no addresses of its own, they are used directly.
+ */
+uint8_t
+media_live_subscribe_with_addrs (
+    char const * ticket,
+    char const * addrs);
+
+/** \brief
+ *  A human status for the live call, for checking the adaptive heuristics rather than reading IDs: one line
+ *  for the incoming video (rendition, resolution, frame rate, hardware or software decode, the rendition's
+ *  bitrate) and one for the call (audio codecs each way, direct or relay, round trip, loss, the delivery-rate
+ *  estimate adaptation acts on). Empty when nothing is live. E.g.
+ *  `high 720p · 30 fps · HW decode · 1.5 Mbps` / `LiquidCodec · direct · 10 ms · 0% loss · 4.8 Mbps avail`.
+ */
+char *
+media_live_summary (void);
 
 /** <No documentation available> */
 void

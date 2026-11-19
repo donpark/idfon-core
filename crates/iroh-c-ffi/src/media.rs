@@ -5,7 +5,7 @@
 //! stays in moq-audio/moq-video.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     ffi::c_void,
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
@@ -390,12 +390,65 @@ pub fn media_audio_set_playback_cb(
     cb: unsafe extern "C" fn(*const c_void, *const u8, usize, u32, u32, u64),
 ) -> u8 {
     *AUDIO_PLAYBACK_CB.lock().unwrap() = Some((ctx as usize, cb));
+    MIXER.lock().unwrap_or_else(|poison| poison.into_inner()).take();
     0
 }
 
 #[ffi_export]
 pub fn media_audio_clear_playback_cb() {
     *AUDIO_PLAYBACK_CB.lock().unwrap() = None;
+    // The mixer calls the old callback; it must not outlive it.
+    MIXER.lock().unwrap_or_else(|poison| poison.into_inner()).take();
+}
+
+/// Sums the listen legs for the shell callback (crate::mixer). Started by the
+/// first leg, dropped once no leg feeds it.
+static MIXER: Mutex<Option<crate::mixer::Mixer>> = Mutex::new(None);
+
+/// Members added with `media_live_add_member` (group call, G0). Their legs skip
+/// the A/V anchor (group video is later work, and one anchor serves one
+/// picture) and write per-member call captures.
+static GROUP_PEERS: Mutex<Option<HashSet<EndpointId>>> = Mutex::new(None);
+
+/// Remote members a call holds at most: 12 people including this one.
+pub(crate) const MAX_REMOTE_MEMBERS: usize = 11;
+
+fn is_group_peer(peer: &EndpointId) -> bool {
+    GROUP_PEERS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .as_ref()
+        .is_some_and(|peers| peers.contains(peer))
+}
+
+/// A mixer input for one leg, starting the mixer on the shell callback if none runs.
+fn mixer_member(ctx: usize, cb: AudioPlaybackFn, channels: u32) -> crate::mixer::MemberInput {
+    let mut slot = MIXER.lock().unwrap_or_else(|poison| poison.into_inner());
+    let mixer = slot.get_or_insert_with(|| {
+        crate::mixer::Mixer::start(Box::new(move |pcm: &[f32], channels: u32| {
+            // SAFETY: the shell copies before returning (documented contract); the
+            // mixer is dropped before the callback is cleared or replaced.
+            unsafe {
+                (cb)(
+                    ctx as *const c_void,
+                    pcm.as_ptr() as *const u8,
+                    std::mem::size_of_val(pcm),
+                    crate::mixer::RATE,
+                    channels,
+                    0,
+                )
+            }
+        }))
+    });
+    mixer.add(channels)
+}
+
+/// Drop the mixer once no leg feeds it.
+fn release_mixer_if_idle() {
+    let mut slot = MIXER.lock().unwrap_or_else(|poison| poison.into_inner());
+    if slot.as_ref().is_some_and(|mixer| mixer.member_count() == 0) {
+        slot.take();
+    }
 }
 
 /// One call's media plane: one endpoint and node, shared by the published leg
@@ -738,6 +791,11 @@ impl DevicePlayback {
         })
         .await
         .map_err(|err| anyhow::anyhow!("playback engine: {err}"))?;
+        Self::on_engine(engine, input)
+    }
+
+    /// A sink on an engine that is already open: the engine mixes it with its other sinks.
+    fn on_engine(engine: moq_audio::playback::Engine, input: AudioInput) -> anyhow::Result<Self> {
         let mut spec = moq_audio::playback::Input::default();
         spec.format = input.format;
         spec.sample_rate = input.sample_rate;
@@ -1484,13 +1542,20 @@ fn start_listen_leg(session: SessionHandle, ticket: BroadcastTicket, addr: Optio
             }
             // The endpoint is the call session's: it outlives this leg and
             // shuts down with the session (`release_session_if_idle`).
-            let received_wav = media_path("received.wav");
-            let received_timing = media_path("received-timing.csv");
+            // A group member's capture is named for it, so legs don't overwrite each other.
+            let suffix = if is_group_peer(&peer) {
+                format!("-{}", peer.fmt_short())
+            } else {
+                String::new()
+            };
+            let received_wav = media_path(&format!("received{suffix}.wav"));
+            let received_timing = media_path(&format!("received{suffix}-timing.csv"));
             write_wav(&received_wav, &samples, decoded_channels)?;
             std::fs::write(&received_timing, timing)?;
             eprintln!("[media] live audio captures wav={} timing={}", received_wav.display(), received_timing.display());
             archive_call_capture(&received_wav, &received_timing);
             PLAYBACK_CONTROL.lock().unwrap().take();
+            release_mixer_if_idle();
             result
         });
         if let Err(err) = result {
@@ -1802,20 +1867,18 @@ async fn subscribe_decode_once(
         let mut floor_handle: Option<idfon_media::seam::PlayoutFloor> = None;
         let mut playback: Box<dyn AudioPlayback> = match *AUDIO_PLAYBACK_CB.lock().unwrap() {
             Some((ctx, cb)) => {
+                // Every leg feeds the mixer, which hands the shell one stream
+                // (a 1:1 call is a mix of one).
+                let member = mixer_member(ctx, cb, input.channels);
+                let channels = input.channels;
                 let paced = PacedPlayback::new(
                     input,
                     Box::new(move |pcm| {
-                        // SAFETY: the shell copies before returning (documented contract).
-                        unsafe {
-                            (cb)(
-                                ctx as *const c_void,
-                                pcm.as_ptr(),
-                                pcm.len(),
-                                input.sample_rate,
-                                input.channels,
-                                0,
-                            )
-                        }
+                        let samples: Vec<f32> = pcm
+                            .chunks_exact(4)
+                            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                            .collect();
+                        member.push(&samples, channels);
                     }),
                 );
                 if let Some(floor) = playout_floor {
@@ -1825,8 +1888,15 @@ async fn subscribe_decode_once(
                 Box::new(paced)
             }
             None => {
-                let device = OUTPUT_DEVICE.lock().unwrap().clone();
-                let device_playback = DevicePlayback::open(device, input).await?;
+                // Legs share one engine, which mixes their sinks.
+                let shared = PLAYBACK_ENGINE.lock().unwrap().clone();
+                let device_playback = match shared {
+                    Some(engine) => DevicePlayback::on_engine(engine, input)?,
+                    None => {
+                        let device = OUTPUT_DEVICE.lock().unwrap().clone();
+                        DevicePlayback::open(device, input).await?
+                    }
+                };
                 PLAYBACK_ENGINE
                     .lock()
                     .unwrap()
@@ -1838,7 +1908,11 @@ async fn subscribe_decode_once(
             }
         };
         // A/V sync: video presents against the audio playout clock (av.rs).
-        crate::av::reset();
+        // Only the 1:1 leg drives it; group members skip it.
+        let anchors_video = !is_group_peer(&ticket.peer());
+        if anchors_video {
+            crate::av::reset();
+        }
         // Match PacedPlayback's target so startup buffering is one hold, not
         // a second delay before the jitter buffer can start draining.
         let startup_prebuffer_frames: usize = (playout_floor
@@ -2068,10 +2142,12 @@ async fn subscribe_decode_once(
                     / input.sample_rate.max(1) as u128;
                 playback.write(&apply_playback_gain(&startup), pts_us as u64)?;
                 // The batch plays as one block starting at pts_us - batch_us.
-                crate::av::anchor_audio(
-                    pts_us.saturating_sub(batch_us) as u64,
-                    playback.buffered(),
-                );
+                if anchors_video {
+                    crate::av::anchor_audio(
+                        pts_us.saturating_sub(batch_us) as u64,
+                        playback.buffered(),
+                    );
+                }
                 startup.clear();
                 started = true;
             } else {
@@ -2102,7 +2178,9 @@ async fn subscribe_decode_once(
                     + (trim_samples as u128 / input.channels.max(1) as u128) * 1_000_000
                         / input.sample_rate.max(1) as u128;
                 playback.write(&apply_playback_gain(data), pts_us as u64)?;
-                crate::av::anchor_audio(written_pts_us as u64, playback.buffered());
+                if anchors_video {
+                    crate::av::anchor_audio(written_pts_us as u64, playback.buffered());
+                }
             }
             // Audio has reached the sink: the call is audible again.
             set_sub_state(SUB_PLAYING);
@@ -2307,9 +2385,98 @@ pub fn media_live_unsubscribe() {
     for subscriber in subscribers {
         stop_subscriber(subscriber);
     }
+    GROUP_PEERS.lock().unwrap_or_else(|poison| poison.into_inner()).take();
+    release_mixer_if_idle();
     release_session_if_idle();
     SUB_KICK.store(false, Ordering::Relaxed);
     set_sub_state(SUB_IDLE);
+}
+
+/// Add one remote member to the call (group call, docs/group-live-chat.md G0):
+/// subscribe to `ticket`'s publisher without ending the other legs. `addrs` is
+/// the member's dial address JSON, as for `media_live_subscribe_with_addrs`
+/// (empty when unknown). Every member's audio plays through one mix.
+///
+/// Returns 0 on success, 1 for a bad ticket or no session, 2 when the member is
+/// already in the call, 3 when the call is full (12 people).
+#[ffi_export]
+pub fn media_live_add_member(ticket: char_p::Ref<'_>, addrs: char_p::Ref<'_>) -> u8 {
+    let Ok(ticket) = ticket.to_str().parse::<BroadcastTicket>() else {
+        return 1;
+    };
+    let peer = ticket.peer();
+    {
+        let slot = SESSION.lock().unwrap_or_else(|poison| poison.into_inner());
+        if let Some(session) = slot.as_ref() {
+            if session.subscribers.contains_key(&peer) {
+                return 2;
+            }
+            if session.subscribers.len() >= MAX_REMOTE_MEMBERS {
+                return 3;
+            }
+        }
+    }
+    let addrs = addrs.to_str();
+    let addr = (!addrs.is_empty())
+        .then(|| known_addr(&ticket, addrs))
+        .flatten();
+    let session = match tokio_executor(session_handle()) {
+        Ok(session) => session,
+        Err(err) => {
+            *LAST_ERROR.lock().expect("error poisoned") = Some(format!("{err:#}"));
+            return 1;
+        }
+    };
+    GROUP_PEERS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .get_or_insert_with(HashSet::new)
+        .insert(peer);
+    tracing::info!(target: "idfon.media", peer = %peer.fmt_short(), "group member added");
+    if SUB_STATE.load(Ordering::Relaxed) == SUB_IDLE {
+        set_sub_state(SUB_CONNECTING);
+    }
+    start_listen_leg(session, ticket, addr)
+}
+
+/// Remove one remote member (its endpoint id, hex) from the call: stop its
+/// leg and drop it from the mix. The others keep playing. Returns 0, or 1 when
+/// no such member is in the call.
+#[ffi_export]
+pub fn media_live_remove_member(peer: char_p::Ref<'_>) -> u8 {
+    let Ok(peer) = peer.to_str().parse::<EndpointId>() else {
+        return 1;
+    };
+    let subscriber = SESSION
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .as_mut()
+        .and_then(|session| session.subscribers.remove(&peer));
+    let Some(subscriber) = subscriber else {
+        return 1;
+    };
+    stop_subscriber(subscriber);
+    if let Some(peers) = GROUP_PEERS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .as_mut()
+    {
+        peers.remove(&peer);
+    }
+    tracing::info!(target: "idfon.media", peer = %peer.fmt_short(), "group member removed");
+    release_mixer_if_idle();
+    release_session_if_idle();
+    0
+}
+
+/// How many remote members the call holds (listen legs).
+#[ffi_export]
+pub fn media_live_member_count() -> u32 {
+    SESSION
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .as_ref()
+        .map_or(0, |session| session.subscribers.len() as u32)
 }
 /// CoreVideo capture is BGRA; `Surface::rgba` reads red first. Feeding BGRA
 /// straight in swaps red and blue, which encodes as blue skin on the wire.
@@ -4125,6 +4292,147 @@ mod tests {
         assert!(attempts >= 2, "the close should end the first attempt");
         let recovered = recovered.expect("audio came back after the session closed");
         assert!(recovered < 6_000, "recovery took {recovered} ms");
+    }
+
+
+    /// Mixed shell output for the group test.
+    static GROUP_MIX: std::sync::Mutex<Vec<f32>> = std::sync::Mutex::new(Vec::new());
+
+    /// Power of `hz` in mono 48 kHz `samples` (Goertzel), normalized by length.
+    fn tone_power(samples: &[f32], hz: f32) -> f32 {
+        let coeff = 2.0 * (2.0 * std::f32::consts::PI * hz / 48_000.0).cos();
+        let (mut s1, mut s2) = (0.0f32, 0.0f32);
+        for &x in samples {
+            let s0 = x + coeff * s1 - s2;
+            s2 = s1;
+            s1 = s0;
+        }
+        (s1 * s1 + s2 * s2 - coeff * s1 * s2) / (samples.len() as f32).powi(2)
+    }
+
+    /// A remote member publishing a continuous tone, as a far phone would.
+    struct TonePublisher {
+        endpoint: iroh::Endpoint,
+        node: super::Node,
+        router: iroh::protocol::Router,
+        _broadcast: super::LocalBroadcast,
+        ticket: String,
+        addr: String,
+    }
+
+    fn tone_publisher(hz: f32) -> TonePublisher {
+        super::tokio_executor(async move {
+            let endpoint = super::bind_call_endpoint().await.expect("publisher endpoint");
+            let layout = super::LiveLayout::default();
+            let node = super::Node::new(endpoint.clone(), layout.config());
+            let router = node.mount(iroh::protocol::Router::builder(endpoint.clone())).spawn();
+            let broadcast: super::LocalBroadcast = layout.publish(&node, "tone").expect("publish");
+            let renditions = super::call_renditions(AudioCodec::Opus, 48_000, 1, false).expect("renditions");
+            broadcast
+                .set_audio_renditions(
+                    super::AudioSource::tone(hz, moq_audio::Layout::from_channels(1).unwrap()).expect("tone"),
+                    super::audio_renditions_of(renditions),
+                )
+                .expect("audio");
+            let ticket = layout.ticket(node.id(), "tone").expect("ticket").to_string();
+            // Loopback on the bound ports: a fresh test binary may lack local-network permission.
+            let mut addr = endpoint.addr();
+            for socket in endpoint.bound_sockets() {
+                let ip: std::net::IpAddr = if socket.is_ipv4() {
+                    std::net::Ipv4Addr::LOCALHOST.into()
+                } else {
+                    std::net::Ipv6Addr::LOCALHOST.into()
+                };
+                addr.addrs.insert(iroh::TransportAddr::Ip(std::net::SocketAddr::new(ip, socket.port())));
+            }
+            let addr = serde_json::to_string(&addr).expect("addr json");
+            TonePublisher { endpoint, node, router, _broadcast: broadcast, ticket, addr }
+        })
+    }
+
+    /// G0: three remote members in one call. Every member is heard in the one mixed
+    /// stream the shell gets, and a member removed mid-call leaves the mix while the
+    /// others keep playing.
+    #[test]
+    fn group_call_mixes_every_member_and_drops_a_removed_one() {
+        let _guard = crate::util::MEDIA_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        unsafe extern "C" fn collect(
+            _: *const std::ffi::c_void,
+            pcm: *const u8,
+            len: usize,
+            rate: u32,
+            channels: u32,
+            _: u64,
+        ) {
+            assert_eq!((rate, channels), (48_000, 1), "one mono 48 kHz stream");
+            let bytes = unsafe { std::slice::from_raw_parts(pcm, len) };
+            GROUP_MIX.lock().unwrap().extend(
+                bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+            );
+        }
+        assert_eq!(super::media_audio_set_playback_cb(std::ptr::null(), collect), 0);
+        super::media_live_set_audio_preference(c"".into());
+        GROUP_MIX.lock().unwrap().clear();
+
+        let tones = [440.0f32, 660.0, 990.0];
+        let members: Vec<TonePublisher> = tones.iter().map(|&hz| tone_publisher(hz)).collect();
+        for member in &members {
+            let ticket = std::ffi::CString::new(member.ticket.clone()).unwrap();
+            let addr = std::ffi::CString::new(member.addr.clone()).unwrap();
+            assert_eq!(super::media_live_add_member(ticket.as_c_str().into(), addr.as_c_str().into()), 0);
+        }
+        // Adding a member twice is refused.
+        let again = std::ffi::CString::new(members[0].ticket.clone()).unwrap();
+        assert_eq!(super::media_live_add_member(again.as_c_str().into(), c"".into()), 2);
+        assert_eq!(super::media_live_member_count(), 3);
+
+        // Wait for every member's tone, then judge a fresh 1.5 s window.
+        let heard = |window: &[f32], hz: f32| tone_power(window, hz) > 1e-4;
+        let waited = std::time::Instant::now();
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            let mix = GROUP_MIX.lock().unwrap();
+            let tail = &mix[mix.len().saturating_sub(24_000)..];
+            if tail.len() == 24_000 && tones.iter().all(|&hz| heard(tail, hz)) {
+                break;
+            }
+            assert!(waited.elapsed() < std::time::Duration::from_secs(15), "not every member was heard");
+        }
+        GROUP_MIX.lock().unwrap().clear();
+        std::thread::sleep(std::time::Duration::from_millis(1_500));
+        let all = GROUP_MIX.lock().unwrap().clone();
+        let powers: Vec<f32> = tones.iter().map(|&hz| tone_power(&all, hz)).collect();
+        eprintln!("DIAG all members: samples={} powers={powers:?}", all.len());
+        assert!(all.len() >= 48_000, "the mix kept flowing: {} samples", all.len());
+        assert!(tones.iter().all(|&hz| heard(&all, hz)), "every member in the mix: {powers:?}");
+
+        // The 660 Hz member leaves.
+        let leaving = members[1].node.id().to_string();
+        let leaving = std::ffi::CString::new(leaving).unwrap();
+        assert_eq!(super::media_live_remove_member(leaving.as_c_str().into()), 0);
+        assert_eq!(super::media_live_member_count(), 2);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        GROUP_MIX.lock().unwrap().clear();
+        std::thread::sleep(std::time::Duration::from_millis(1_500));
+        let rest = GROUP_MIX.lock().unwrap().clone();
+        let powers: Vec<f32> = tones.iter().map(|&hz| tone_power(&rest, hz)).collect();
+        eprintln!("DIAG after one left: samples={} powers={powers:?}", rest.len());
+        assert!(heard(&rest, 440.0) && heard(&rest, 990.0), "the others keep playing: {powers:?}");
+        assert!(!heard(&rest, 660.0), "the removed member left the mix: {powers:?}");
+
+        super::media_live_unsubscribe();
+        assert_eq!(super::media_live_member_count(), 0);
+        assert!(super::MIXER.lock().unwrap().is_none(), "the mixer stops with the last leg");
+        super::media_audio_clear_playback_cb();
+        for member in members {
+            super::tokio_executor(async move {
+                let _ = member.router.shutdown().await;
+                member.node.shutdown().await;
+                member.endpoint.close().await;
+            });
+        }
     }
 
 }
