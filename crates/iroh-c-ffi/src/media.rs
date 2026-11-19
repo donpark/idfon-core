@@ -1931,6 +1931,10 @@ async fn subscribe_decode_once(
         // died without SUBSCRIBE_END, and consumer.read() then never returns
         // — neither frames nor a track end). Treat it like an early end.
         let mut last_frame = std::time::Instant::now();
+        // The publisher declared a pause (a voice encode's discontinuous
+        // transmission: a silent talker sends nothing): the quiet that follows
+        // is not a stall. Cleared by the next frame.
+        let mut paused = false;
         let mut first_frame_seen = false;
         let mut last_choice = std::time::Instant::now();
         type PendingSwitch = std::pin::Pin<
@@ -1959,7 +1963,13 @@ async fn subscribe_decode_once(
             // A fresh attempt gets the full window before its first frame: the 500 ms window after a
             // path change is for noticing a stream that went quiet, and a resubscribe needs longer
             // than that to deliver anything, so it used to end every retry before audio could arrive.
-            let window = if first_frame_seen {
+            let window = if paused {
+                // A long silence is ordinary. Only a dead link ends the attempt
+                // (no selected path, or the connection closed), or this backstop.
+                let link_dead = path_down.load(Ordering::Relaxed)
+                    || peer_conn.as_ref().is_some_and(|conn| conn.close_reason().is_some());
+                if link_dead { std::time::Duration::ZERO } else { PAUSE_BACKSTOP }
+            } else if first_frame_seen {
                 stall_window(relay)
             } else {
                 stall_window(relay).max(normal_stall_window(relay))
@@ -2074,8 +2084,21 @@ async fn subscribe_decode_once(
                         }
                     }
                 }
-                read = tokio::time::timeout(std::time::Duration::from_millis(200), next_frame(&mut consumer)) => match read {
-                    Ok(frame) => frame?,
+                read = tokio::time::timeout(std::time::Duration::from_millis(200), next_read(&mut consumer)) => match read {
+                    Ok(Ok(Some(Next::Paused))) => {
+                        if !paused {
+                            tracing::debug!(target: "idfon.media", attempt, "publisher paused (silent talker)");
+                        }
+                        paused = true;
+                        last_frame = std::time::Instant::now();
+                        continue;
+                    }
+                    Ok(Ok(Some(Next::Frame(frame)))) => {
+                        paused = false;
+                        Some(frame)
+                    }
+                    Ok(Ok(None)) => None,
+                    Ok(Err(err)) => return Err(err.into()),
                     Err(_) => continue,
                 },
             };
@@ -2213,6 +2236,31 @@ async fn subscribe_decode_once(
         );
     }
     result
+}
+
+/// How long a declared pause may last before the attempt is rebuilt anyway:
+/// a backstop for a link that died without closing.
+const PAUSE_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What the live read loop gets next.
+enum Next {
+    Frame(AudioFrame),
+    /// The publisher stopped its encoder (`Read::End`): a voice encode's
+    /// declared silence, or a pause. Nothing arrives until it resumes.
+    Paused,
+}
+
+/// The next decoded frame or declared pause; `Read::Gap` is skipped. `None`
+/// when the track ends.
+async fn next_read(consumer: &mut moq_audio::decode::Consumer) -> Result<Option<Next>, moq_audio::Error> {
+    loop {
+        match consumer.read().await? {
+            Some(moq_audio::decode::Read::Frame(frame)) => return Ok(Some(Next::Frame(frame))),
+            Some(moq_audio::decode::Read::End { .. }) => return Ok(Some(Next::Paused)),
+            Some(_) => continue,
+            None => return Ok(None),
+        }
+    }
 }
 
 /// The next decoded frame, skipping the track-boundary events (`Read::Gap`,
@@ -4472,6 +4520,90 @@ mod tests {
                 member.endpoint.close().await;
             });
         }
+    }
+
+
+    /// A silent talker sends nothing (Opus voice DTX declares the pause). The listener must
+    /// hold its one attempt through a silence longer than any stall window, and play what
+    /// follows, instead of tearing the leg down and resubscribing.
+    #[test]
+    fn a_declared_silence_is_not_a_stall() {
+        use std::sync::atomic::Ordering;
+        let _guard = crate::util::MEDIA_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        unsafe extern "C" fn discard(_: *const std::ffi::c_void, _: *const u8, _: usize, _: u32, _: u32, _: u64) {}
+        assert_eq!(super::media_audio_set_playback_cb(std::ptr::null(), discard), 0);
+        super::media_live_set_audio_preference(c"".into());
+        let ticket_text = super::start_live(true, false, true, None, AudioCodec::Opus, 24_000, 1)
+            .expect("publish");
+        let ticket: super::BroadcastTicket = ticket_text.parse().expect("ticket");
+        let addr = publisher_addr();
+        let listener = remote_listener();
+
+        let decoded = || super::AUDIO_FRAMES_DECODED.load(Ordering::Relaxed);
+        let start = decoded();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let after_silence = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // Tone, then 6 s of digital silence pushed in real time, then tone again.
+        let pusher = {
+            let stop = stop.clone();
+            let after_silence = after_silence.clone();
+            std::thread::spawn(move || {
+                let waited = std::time::Instant::now();
+                while decoded() == start && waited.elapsed() < std::time::Duration::from_secs(10) {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                let clock = std::time::Instant::now();
+                let mut n = 0usize;
+                let total = 24_000 * 9;
+                while n < total {
+                    let t = n as f32 / 24_000.0;
+                    let amplitude = if (1.5..7.5).contains(&t) { 0.0 } else { 0.25 };
+                    if (7.5..7.52).contains(&t) {
+                        after_silence.store(decoded(), Ordering::Relaxed);
+                    }
+                    let frame: Vec<f32> = (0..480)
+                        .map(|i| (2.0 * std::f32::consts::PI * 440.0 * (n + i) as f32 / 24_000.0).sin() * amplitude)
+                        .collect();
+                    super::media_audio_push_frames(frame.as_ptr(), 480, 1);
+                    n += 480;
+                    let due = clock + std::time::Duration::from_micros(n as u64 * 1_000_000 / 24_000);
+                    if let Some(wait) = due.checked_duration_since(std::time::Instant::now()) {
+                        std::thread::sleep(wait);
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                stop.store(true, Ordering::Relaxed);
+            })
+        };
+        let (mut samples, mut timing, mut decoded_total, mut channels, mut stalls) =
+            (Vec::new(), String::new(), 0, 0u32, 0u32);
+        let ended = super::tokio_executor(super::subscribe_decode_once(
+            listener.clone(),
+            ticket,
+            Some(addr),
+            &stop,
+            &mut samples,
+            &mut timing,
+            &mut decoded_total,
+            std::time::Instant::now(),
+            1,
+            &mut channels,
+            &mut stalls,
+        ));
+        pusher.join().unwrap();
+        let resumed = decoded() - after_silence.load(Ordering::Relaxed);
+        super::media_live_stop();
+        super::media_audio_clear_playback_cb();
+        super::tokio_executor(async move {
+            listener.node.shutdown().await;
+            listener.endpoint.close().await;
+        });
+        eprintln!("DIAG ended={ended:?} stalls={stalls} resumed_frames={resumed} decoded_total={decoded_total}");
+        assert!(matches!(ended, Ok(true)), "one attempt, ended by stop: {ended:?}");
+        assert_eq!(stalls, 0, "the silence was not a stall");
+        assert!(resumed > 20, "audio after the silence played: {resumed} frames");
     }
 
 }
