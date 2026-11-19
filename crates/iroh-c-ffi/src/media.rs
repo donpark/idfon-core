@@ -2439,12 +2439,19 @@ pub fn media_live_add_member(ticket: char_p::Ref<'_>, addrs: char_p::Ref<'_>) ->
     start_listen_leg(session, ticket, addr)
 }
 
-/// Remove one remote member (its endpoint id, hex) from the call: stop its
-/// leg and drop it from the mix. The others keep playing. Returns 0, or 1 when
+/// Remove one remote member from the call: stop its leg and drop it from the
+/// mix. The others keep playing. `peer` is the member's broadcast ticket (as
+/// the room roster carries it) or its endpoint id (hex). Returns 0, or 1 when
 /// no such member is in the call.
 #[ffi_export]
 pub fn media_live_remove_member(peer: char_p::Ref<'_>) -> u8 {
-    let Ok(peer) = peer.to_str().parse::<EndpointId>() else {
+    let text = peer.to_str();
+    let Some(peer) = text
+        .parse::<BroadcastTicket>()
+        .map(|ticket| ticket.peer())
+        .ok()
+        .or_else(|| text.parse::<EndpointId>().ok())
+    else {
         return 1;
     };
     let subscriber = SESSION
@@ -4408,8 +4415,8 @@ mod tests {
         assert!(all.len() >= 48_000, "the mix kept flowing: {} samples", all.len());
         assert!(tones.iter().all(|&hz| heard(&all, hz)), "every member in the mix: {powers:?}");
 
-        // The 660 Hz member leaves.
-        let leaving = members[1].node.id().to_string();
+        // The 660 Hz member leaves, named by its ticket as the room roster carries it.
+        let leaving = members[1].ticket.clone();
         let leaving = std::ffi::CString::new(leaving).unwrap();
         assert_eq!(super::media_live_remove_member(leaving.as_c_str().into()), 0);
         assert_eq!(super::media_live_member_count(), 2);

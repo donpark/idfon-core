@@ -1025,8 +1025,9 @@ char *
 media_live_recording_store (void);
 
 /** \brief
- *  Remove one remote member (its endpoint id, hex) from the call: stop its
- *  leg and drop it from the mix. The others keep playing. Returns 0, or 1 when
+ *  Remove one remote member from the call: stop its leg and drop it from the
+ *  mix. The others keep playing. `peer` is the member's broadcast ticket (as
+ *  the room roster carries it) or its endpoint id (hex). Returns 0, or 1 when
  *  no such member is in the call.
  */
 uint8_t
