@@ -188,7 +188,7 @@ Two upload tokens, two policies:
 ## Origin and deployment
 
 - The droplet runs the native `idfon-edge`; point it at a directory:
-  `--files-dir /srv/idfon-edge/files --files-token <secret>`. Without a token
+  `--files-dir /srv/idfon-edge/state/files --files-token <secret>`. Without a token
   the store is read-only, so an operator can rsync content instead of using
   the HTTP publish path.
 - **BunnyCDN** (pull zone) is the default: `idfon-edge/deploy/bunny/setup.sh`
@@ -238,10 +238,10 @@ Deploy:
 
 ```sh
 rsync -a --chmod=D755,F644 dist/speech-packs/phonon-31m/sha256/ \
-  <droplet>:/srv/idfon-edge/files/sha256/
+  <droplet>:/srv/idfon-edge/state/files/sha256/
 rsync -a --chmod=D755,F644 dist/speech-packs/phonon-31m/bundle.json \
-  <droplet>:/srv/idfon-edge/files/phonon-31m/bundle.json
-ssh <droplet> 'chown -R 10001:10001 /srv/idfon-edge/files'
+  <droplet>:/srv/idfon-edge/state/files/phonon-31m/bundle.json
+ssh <droplet> 'chown -R 10001:10001 /srv/idfon-edge/state/files'
 ```
 
 Permissions matter: the edge runs as uid 10001. Pack voice files are created
