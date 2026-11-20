@@ -2,8 +2,7 @@ import CryptoKit
 import Foundation
 
 /// Where the models live, whether they are complete, and how they get there: the content-addressed pack on the
-/// idfon edge (`<base>/pack.json` plus `<base>/sha256/<hash>`, the PhononPack format; published by
-/// idfon-home/demos/liquidcodec/py/publish_pack.sh). One place for the file list, so install and load agree.
+/// idfon edge (`<base>/pack.json` plus `<base>/sha256/<hash>`, the PhononPack format). One place for the file list, so install and load agree.
 public enum LiquidModelStore {
     /// The models `LiquidModels` loads; everything else in the pack (license, notice) is installed alongside.
     public static let files = ["LiquidEncoder-W8.mlmodelc", "LiquidDecoder-C24.mlmodelc", "synth_head.f32.bin"]

@@ -2,7 +2,7 @@ import Foundation
 
 /// The codec's lifecycle in an app, shared by iOS and macOS: absent → downloading → loading → ready (or failed).
 ///
-/// Policy (idfon-home/docs/liquidcodec.md): the codec is made ready as soon as it is *needed* (a contact uses it,
+/// Policy: the codec is made ready as soon as it is *needed* (a contact uses it,
 /// an incoming call carries it, or it is the default), not when a call starts; a call that finds it still on the
 /// way waits for it (`ready()`, no timeout). Only a failure (download, verification, Core ML load) falls back.
 /// Once loaded, `onReady` hands the codec to the app, which registers its callbacks with the media stack.

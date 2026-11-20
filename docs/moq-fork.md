@@ -46,7 +46,7 @@ Our branches on `donpark/moq`:
 | Branch | Base | Used by |
 | --- | --- | --- |
 | `loss-recovery-release` | `origin/release` + our 2 patch commits | idfon `main` |
-| `liquid-codec` | `loss-recovery-release` + LiquidCodec (`AudioCodec::Liquid`, `moq_audio::external`) + iOS VideoToolbox decode | **idfon branch `liquid-codec`** (idfon-home `docs/liquidcodec.md`) |
+| `liquid-codec` | `loss-recovery-release` + LiquidCodec (`AudioCodec::Liquid`, `moq_audio::external`) + iOS VideoToolbox decode | **idfon branch `liquid-codec`** |
 | `loss-recovery-0.1` | `origin/main` + the same 2 patches (ported) | nothing yet — kept for the eventual move to line B |
 | `loss-recovery-0.0.23` | Frando `iroh-live-3` (the original) | nothing — frozen, rollback reference |
 

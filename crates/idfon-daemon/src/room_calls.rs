@@ -1,4 +1,4 @@
-//! Group-call signaling in the daemon (idfon-home docs/group-live-chat.md, G1).
+//! Group-call signaling in the daemon.
 //!
 //! One [`RoomCall`] state machine per (identity, room), fed two ways:
 //! - room controls (`IDFON-LIVE/1` with `room=`) received on the room's

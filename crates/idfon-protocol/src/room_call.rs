@@ -1,4 +1,4 @@
-//! Group-call signaling on a room's channel (idfon-home docs/group-live-chat.md, G1).
+//! Group-call signaling on a room's channel.
 //!
 //! A group call is a live session inside a room, at most one per room, named
 //! by `call_id`. Members announce themselves with `IDFON-LIVE/1` controls that

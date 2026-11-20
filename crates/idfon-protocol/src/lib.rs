@@ -743,7 +743,7 @@ pub struct Room {
     pub repo: Option<String>,
     /// `call.auto_close`: a group call ends when its last member leaves
     /// (`None` means the default, on). Off keeps the empty session open.
-    /// Local until room admins share settings (idfon-home docs/room-admins.md);
+    /// Local until room admins share settings;
     /// a session follows its starter's value (`room_call`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub call_auto_close: Option<bool>,

@@ -127,7 +127,7 @@ the IP.
 
 **No paid GitHub plan is required.** GitHub Packages is free for *public*
 packages (private ones have a plan-dependent quota), and GitHub Actions is free
-for public repos. `donpark/idfon` is public, so GHCR works on a Free account.
+for public repos. `donpark/idfon-core` is public, so GHCR works on a Free account.
 
 `ghcr.io/donpark/idfon-edge` is built from `deploy/idfon-edge/Dockerfile` by
 `.github/workflows/edge.yml`. It does not exist until that workflow pushes it

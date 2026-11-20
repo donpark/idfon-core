@@ -1,4 +1,4 @@
-//! Group-call signaling simulator (idfon-home docs/group-live-chat.md, G1).
+//! Group-call signaling simulator.
 //!
 //! Many members' `RoomCall` state machines run against a modeled network:
 //! random latency (so reordering), loss, duplicates, partitions, crashes that

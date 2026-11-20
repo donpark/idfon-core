@@ -1,6 +1,6 @@
 [Unit]
 Description=idfon-edge — public ingress for idfon resources
-Documentation=https://github.com/donpark/idfon/blob/main/crates/idfon-edge/README.md
+Documentation=https://github.com/donpark/idfon-core/blob/main/crates/idfon-edge/README.md
 After=network-online.target
 Wants=network-online.target
 
