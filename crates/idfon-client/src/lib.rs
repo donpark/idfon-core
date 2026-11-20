@@ -21,7 +21,8 @@ const CONNECT_POLL: Duration = Duration::from_millis(100);
 /// a JSON `Response` (see the connection loop in `crates/idfond/src/main.rs`).
 /// The historical Zig host accepted them via the `"ok":false` sniff, i.e. as
 /// ok=true with raw bytes.
-const BINARY_RESPONSE_METHODS: [&str; 3] = ["peers.compact", "identities.compact", "events.compact"];
+/// Canonical names; legacy spellings are mapped first (`rpc::canonical_method`).
+const BINARY_RESPONSE_METHODS: [&str; 3] = ["peer.list.compact", "identity.list.compact", "event.list.compact"];
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -143,7 +144,9 @@ fn parse_response(body: Vec<u8>) -> Result<ClientResponse, ClientError> {
 
 fn request_expects_binary_response(request: &[u8]) -> bool {
     serde_json::from_slice::<Request>(request)
-        .map(|request| BINARY_RESPONSE_METHODS.contains(&request.method.as_str()))
+        .map(|request| {
+            BINARY_RESPONSE_METHODS.contains(&idfon_protocol::rpc::canonical_method(&request.method))
+        })
         .unwrap_or(false)
 }
 
@@ -391,6 +394,15 @@ mod tests {
         let result = client.round_trip(&sample_request());
         assert!(matches!(result, Err(ClientError::InvalidResponse(_))));
         server.join().unwrap();
+    }
+
+    #[test]
+    fn compact_methods_are_binary_under_either_name() {
+        for method in ["peers.compact", "peer.list.compact", "identities.compact", "identity.list.compact", "events.compact", "event.list.compact"] {
+            let request = format!(r#"{{"version":2,"id":"x","method":"{method}","params":{{}}}}"#);
+            assert!(request_expects_binary_response(request.as_bytes()), "{method}");
+        }
+        assert!(!request_expects_binary_response(br#"{"version":2,"id":"x","method":"peer.list","params":{}}"#));
     }
 
     #[test]
