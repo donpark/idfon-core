@@ -144,7 +144,7 @@ verified **caller context**, not just `(account, path)`.
 ### P3 — ticket-over-H3 (transparent edge, path-scoped)
 
 - **Landed:** a `path_scope` in the ticket's signed document (absent = no
-  limit); `issue_capability_ticket_scoped`. `Caller`
+  limit); `TicketSpec::path_scope`. `Caller`
   carries the raw `ticket`; `Backend::fetch` takes `&Caller`, and `IrohBackend`
   / `EdgeBackend` forward it as `x-idfon-ticket` over H3. The daemon provider
   accepts the header and authorizes a valid, unexpired `resource.read` ticket

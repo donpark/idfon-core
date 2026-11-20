@@ -43,7 +43,9 @@ url = "https://idfon.net"
 idle_exit_secs = 300
 ```
 
-The full list is `idfon_config::SETTINGS` (relay, edge, files, mcp, daemon).
+The full list is `idfon_config::SETTINGS` (relay, edge, files, mcp, daemon,
+endpoint). Libraries never read settings on their own: e.g. the endpoint port
+applies only where a binary opts in (`IrohTransport::builder().port_from_config()`).
 To add a setting: add a row there, then read it with `idfon_config::get("IDFON_…")`
 (or `flag` for booleans: `1|true|yes|on` / `0|false|no|off`). It appears in
 `config show` automatically.
