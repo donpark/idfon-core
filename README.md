@@ -1,6 +1,6 @@
 # idfon-core
 
-The core of [Idfon](https://github.com/donpark/idfon-home), a peer-to-peer
+The core of Idfon, a peer-to-peer
 communication and data-transfer system built on [iroh](https://www.iroh.computer):
 the wire protocol, identity and capability tickets, transport, media, the
 daemon (`idfond`), the C ABI the iOS and macOS apps link (`iroh-c-ffi`), the
@@ -18,7 +18,7 @@ Clone them side by side (for example in `~/dev`):
 | [idfon-sdk](https://github.com/donpark/idfon-sdk) | the `idfon` CLI, the MCP server, the Eve integration and agents, the voice-agent runner, and the end-to-end tests |
 | [idfon-ios](https://github.com/donpark/idfon-ios) | the iPhone app |
 | [idfon-mac](https://github.com/donpark/idfon-mac) | the macOS app |
-| [idfon-home](https://github.com/donpark/idfon-home) | product docs and planning |
+| idfon-home (private) | product docs and planning |
 | [idfon](https://github.com/donpark/idfon) | the archive: history before the split (2026-11-20), model R&D (Tyger ports, ASR tools, the voice corpus tools) and the Native-SDK shell |
 
 idfon-sdk and both apps build idfon-core from `../idfon-core`; set
