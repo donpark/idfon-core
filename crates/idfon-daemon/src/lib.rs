@@ -2742,6 +2742,9 @@ fn dispatch_with_transport(
                     true,
                 );
             }
+            // wire_identity locks the store itself (room_calls::
+            // set_live_transport); holding it here deadlocked the daemon.
+            drop(state);
             // On lazy (mobile) startup this is the first bind for the
             // identity; wire the receiver/relay/gossip/rooms startup skipped.
             wire_identity(
