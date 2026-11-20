@@ -843,7 +843,10 @@ async fn handle_inner<B: Backend, A: Authorizer>(
             plain(StatusCode::FORBIDDEN, &format!("peer refused: {message}"))
         }
         Err(GatewayError::Backend(message)) => {
-            plain(StatusCode::BAD_GATEWAY, &format!("backend: {message}"))
+            // The detail (transport errors, peer statuses) is for the log,
+            // not for whoever sent the request.
+            eprintln!("[idfon.gateway] backend error (account={account}): {message}");
+            plain(StatusCode::BAD_GATEWAY, "peer unavailable")
         }
     };
     (response, Some(subject), Some(account))

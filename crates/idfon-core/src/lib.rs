@@ -564,6 +564,28 @@ pub fn sign_relay_owner_proof(
     )
 }
 
+/// The v2 owner proof: v1 plus the relay-auth **origin** the daemon talked to
+/// (`https://relay.example.com:9443`, as `URL.origin` serializes it). Binding
+/// the origin means a service the daemon was pointed at cannot pass a real
+/// relay's challenge through and collect a signature that relay accepts.
+pub fn relay_owner_proof_bytes_v2(identity: &str, endpoint: &str, nonce: &str, origin: &str) -> Vec<u8> {
+    format!("idfon-relay-owner/2|{identity}|{endpoint}|{nonce}|{origin}").into_bytes()
+}
+
+/// Signs the v2 owner proof with the identity key.
+pub fn sign_relay_owner_proof_v2(
+    key: &IdentityKey,
+    identity: &str,
+    endpoint: &str,
+    nonce: &str,
+    origin: &str,
+) -> String {
+    encode_hex(
+        &key.sign(&relay_owner_proof_bytes_v2(identity, endpoint, nonce, origin))
+            .to_bytes(),
+    )
+}
+
 /// True when `expires_at` is at or before `now_epoch`. `expires_at` may be
 /// epoch seconds or RFC 3339; an unparseable value counts as expired.
 pub fn expiry_passed(expires_at: &str, now_epoch: u64) -> bool {
@@ -990,6 +1012,22 @@ mod tests {
         let grant = verify_relay_grant(&token).expect("grant verifies");
         assert_eq!(grant.relay.as_deref(), Some("https://relay.example.com:8443"));
         assert_eq!(grant.ticket_id, "ticket-golden-1");
+    }
+
+    #[test]
+    fn relay_owner_proof_v2_golden_vector() {
+        // Same contract as v1 (test.mjs re-verifies it), now naming the origin.
+        let key = IdentityKey::decode(&"07".repeat(32)).expect("fixed key");
+        let identity = key.peer_id();
+        let endpoint = "11".repeat(32);
+        let nonce = "00112233445566778899aabbccddeeff";
+        let origin = "https://relay.example.com:9443";
+        assert_eq!(
+            relay_owner_proof_bytes_v2(&identity, &endpoint, nonce, origin),
+            format!("idfon-relay-owner/2|{identity}|{endpoint}|{nonce}|{origin}").into_bytes()
+        );
+        let signature = sign_relay_owner_proof_v2(&key, &identity, &endpoint, nonce, origin);
+        assert_eq!(signature, "30d079eeaecf63f325e1973ecf2a3d2b04c1a5d9afee607b6e934c34af7a9883f1a352b851ad4159b82cbb0701823adabc192cb097ee9993eba6c1d0357e6003");
     }
 
     #[test]

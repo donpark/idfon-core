@@ -55,6 +55,17 @@ fn enroll_url() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// `https://relay.example.com:9443/x` -> `https://relay.example.com:9443`,
+/// serialized like the WHATWG `URL.origin` relay-auth compares against
+/// (default ports omitted).
+fn auth_origin(base: &str) -> Result<String> {
+    let url = reqwest::Url::parse(base).map_err(|error| anyhow!("bad enroll URL {base}: {error}"))?;
+    let host = url.host_str().ok_or_else(|| anyhow!("enroll URL {base} has no host"))?;
+    // `port()` is `None` for the scheme's default port, as `URL.origin` omits it.
+    let port = url.port().map(|port| format!(":{port}")).unwrap_or_default();
+    Ok(format!("{}://{}{port}", url.scheme(), host.to_ascii_lowercase()))
+}
+
 fn lease_days() -> u64 {
     std::env::var("IDFON_RELAY_ENROLL_LEASE_DAYS")
         .ok()
@@ -201,17 +212,22 @@ impl Client {
             .get("nonce")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| anyhow!("owner challenge returned no nonce: {value}"))?;
-        let signature = idfon_core::sign_relay_owner_proof(
+        // v2: the proof names the origin this daemon is talking to, so a
+        // relay only accepts a signature made for it.
+        let origin = auth_origin(&self.base)?;
+        let signature = idfon_core::sign_relay_owner_proof_v2(
             &signer.key,
             &signer.identity,
             &signer.endpoint,
             nonce,
+            &origin,
         );
         let enroll = serde_json::json!({
             "identity": signer.identity,
             "endpoint_id": signer.endpoint,
             "nonce": nonce,
             "signature": signature,
+            "proof": 2,
         });
         let (status, value) = self
             .call(reqwest::Method::POST, "/owner/enroll", Some(&enroll), None)
@@ -503,6 +519,13 @@ pub fn spawn(store: Arc<Mutex<Store>>) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn auth_origin_matches_url_origin() {
+        assert_eq!(super::auth_origin("https://Relay.Example.com:9443/").unwrap(), "https://relay.example.com:9443");
+        assert_eq!(super::auth_origin("https://relay.example.com:443").unwrap(), "https://relay.example.com");
+        assert_eq!(super::auth_origin("http://127.0.0.1:9090").unwrap(), "http://127.0.0.1:9090");
+    }
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -698,10 +721,12 @@ mod tests {
             assert_eq!(enroll["nonce"], "00112233445566778899aabbccddeeff");
             assert_eq!(enroll["identity"], signer.identity);
             assert_eq!(enroll["endpoint_id"], signer.endpoint);
-            let proof = idfon_core::relay_owner_proof_bytes(
+            assert_eq!(enroll["proof"], 2);
+            let proof = idfon_core::relay_owner_proof_bytes_v2(
                 &signer.identity,
                 &signer.endpoint,
                 "00112233445566778899aabbccddeeff",
+                &auth_origin(&client.base).expect("origin"),
             );
             let raw = hex_bytes(enroll["signature"].as_str().expect("signature"));
             let signature =
