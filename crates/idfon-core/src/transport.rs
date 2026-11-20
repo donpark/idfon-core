@@ -59,8 +59,8 @@ where
     Err(error)
 }
 
-pub const MESSAGE_ALPN: &[u8] = b"idfon/message/1";
-pub const SYNC_ALPN: &[u8] = b"idfon/sync/1";
+pub const MESSAGE_ALPN: &[u8] = crate::alpn::MESSAGE;
+pub const SYNC_ALPN: &[u8] = crate::alpn::SYNC;
 
 /// A gossip service attached to an existing Iroh message endpoint. Gossip is
 /// only a dissemination path; callers still validate the signed envelope and
@@ -461,6 +461,99 @@ impl IrohTransport {
                 }
             });
         }
+    }
+}
+
+impl IrohTransport {
+    /// The front door: `IrohTransport::builder().secret_key(k).spawn().await?`
+    /// binds an endpoint and keeps it accepting, so protocols registered on
+    /// it (`idfon_h1::serve_router`, `idfon_h3`, `idfon_channel`, MCP) get
+    /// their connections without a hand-run accept loop.
+    pub fn builder() -> NodeBuilder {
+        NodeBuilder::default()
+    }
+}
+
+/// Options for binding an endpoint. Nothing here reads the environment.
+#[derive(Debug, Default, Clone)]
+pub struct NodeBuilder {
+    key: Option<[u8; 32]>,
+    port: Option<u16>,
+}
+
+impl NodeBuilder {
+    /// The endpoint's secret key (its identity). Default: a fresh random key.
+    pub fn secret_key(mut self, key: [u8; 32]) -> Self {
+        self.key = Some(key);
+        self
+    }
+
+    /// Pin the UDP port so the address survives restarts (falls back to an
+    /// ephemeral port if taken). Default: ephemeral.
+    pub fn port(mut self, port: u16) -> Self {
+        self.port = Some(port);
+        self
+    }
+
+    /// Bind only. You then run [`IrohTransport::serve`] (or
+    /// [`IrohTransport::serve_with_peer`]) yourself.
+    pub async fn bind(self) -> Result<IrohTransport, TransportError> {
+        IrohTransport::bind_with_key_port(self.key, self.port).await
+    }
+
+    /// Bind and accept in the background. Message frames are refused; use
+    /// [`Self::spawn_with`] to handle them.
+    pub async fn spawn(self) -> Result<Node, TransportError> {
+        self.spawn_with(|_message, _remote| async {
+            Err::<MessageAck, _>(TransportError::Failed("this node accepts no messages".into()))
+        })
+        .await
+    }
+
+    /// Bind and accept in the background, handing message frames to
+    /// `handler` (with the authenticated remote endpoint id).
+    pub async fn spawn_with<F, Fut>(self, handler: F) -> Result<Node, TransportError>
+    where
+        F: Fn(MessageEnvelope, EndpointId) -> Fut + Clone + Send + Sync + 'static,
+        Fut: Future<Output = Result<MessageAck, TransportError>> + Send + 'static,
+    {
+        let transport = Arc::new(self.bind().await?);
+        let serving = Arc::clone(&transport);
+        let task = tokio::spawn(async move {
+            if let Err(error) = serving.serve_with_peer(handler).await {
+                tracing::debug!(target: "idfon.core", error = %error, "node accept loop ended");
+            }
+        });
+        Ok(Node { transport, task })
+    }
+}
+
+/// A bound endpoint with its accept loop running. Derefs to
+/// [`IrohTransport`]; [`Node::transport`] gives the `Arc` that protocol
+/// crates take. Dropping it stops accepting (the endpoint itself closes
+/// when the last `Arc` goes).
+pub struct Node {
+    transport: Arc<IrohTransport>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Node {
+    pub fn transport(&self) -> &Arc<IrohTransport> {
+        &self.transport
+    }
+}
+
+impl std::ops::Deref for Node {
+    type Target = IrohTransport;
+
+    fn deref(&self) -> &IrohTransport {
+        &self.transport
+    }
+}
+
+impl Drop for Node {
+    fn drop(&mut self) {
+        self.task.abort();
     }
 }
 

@@ -33,7 +33,7 @@ use iroh::{
 use tokio::{sync::mpsc, task::JoinHandle};
 
 /// Application protocol for message channels.
-pub const ALPN: &[u8] = b"idfon/channel/1";
+pub const ALPN: &[u8] = idfon_core::alpn::CHANNEL;
 
 /// Largest single message, matching what the media paths already move.
 pub const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
