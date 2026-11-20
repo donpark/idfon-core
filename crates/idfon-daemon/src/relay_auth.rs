@@ -212,10 +212,10 @@ impl Client {
             .get("nonce")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| anyhow!("owner challenge returned no nonce: {value}"))?;
-        // v2: the proof names the origin this daemon is talking to, so a
-        // relay only accepts a signature made for it.
+        // The proof names the origin this daemon is talking to, so a relay
+        // only accepts a signature made for it.
         let origin = auth_origin(&self.base)?;
-        let signature = idfon_core::sign_relay_owner_proof_v2(
+        let signature = idfon_core::sign_relay_owner_proof(
             &signer.key,
             &signer.identity,
             &signer.endpoint,
@@ -722,7 +722,7 @@ mod tests {
             assert_eq!(enroll["identity"], signer.identity);
             assert_eq!(enroll["endpoint_id"], signer.endpoint);
             assert_eq!(enroll["proof"], 2);
-            let proof = idfon_core::relay_owner_proof_bytes_v2(
+            let proof = idfon_core::relay_owner_proof_bytes(
                 &signer.identity,
                 &signer.endpoint,
                 "00112233445566778899aabbccddeeff",

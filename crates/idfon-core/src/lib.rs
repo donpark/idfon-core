@@ -541,39 +541,18 @@ pub fn verify_relay_grant(token: &str) -> Result<RelayGrant, AuthError> {
 }
 
 /// The exact bytes an owner-bootstrap proof signs
-/// (`idfon-edge/deploy/relay-auth/server.mjs` `OWNER_PROOF_PREFIX`). Pinned by the golden
-/// vector below and `idfon-edge/deploy/relay-auth/test.mjs` — the two sides must agree
-/// byte for byte or every enrollment is refused.
-pub fn relay_owner_proof_bytes(identity: &str, endpoint: &str, nonce: &str) -> Vec<u8> {
-    format!("idfon-relay-owner/1|{identity}|{endpoint}|{nonce}").into_bytes()
-}
-
-/// Signs the owner proof with the **identity** key (never the endpoint key:
-/// identities created after the account/endpoint split have separate keys).
-/// `identity` is the lowercase hex public key, as the relay lists it in
-/// `IDFON_RELAY_ISSUERS`.
-pub fn sign_relay_owner_proof(
-    key: &IdentityKey,
-    identity: &str,
-    endpoint: &str,
-    nonce: &str,
-) -> String {
-    encode_hex(
-        &key.sign(&relay_owner_proof_bytes(identity, endpoint, nonce))
-            .to_bytes(),
-    )
-}
-
-/// The v2 owner proof: v1 plus the relay-auth **origin** the daemon talked to
+/// (`idfon-edge/deploy/relay-auth/server.mjs` `OWNER_PROOF_PREFIX`), pinned by the
+/// golden vector below and `test.mjs`: identity, endpoint, nonce and the
+/// relay-auth **origin** the daemon talked to
 /// (`https://relay.example.com:9443`, as `URL.origin` serializes it). Binding
 /// the origin means a service the daemon was pointed at cannot pass a real
 /// relay's challenge through and collect a signature that relay accepts.
-pub fn relay_owner_proof_bytes_v2(identity: &str, endpoint: &str, nonce: &str, origin: &str) -> Vec<u8> {
+pub fn relay_owner_proof_bytes(identity: &str, endpoint: &str, nonce: &str, origin: &str) -> Vec<u8> {
     format!("idfon-relay-owner/2|{identity}|{endpoint}|{nonce}|{origin}").into_bytes()
 }
 
-/// Signs the v2 owner proof with the identity key.
-pub fn sign_relay_owner_proof_v2(
+/// Signs the owner proof with the **identity** key (never the endpoint key).
+pub fn sign_relay_owner_proof(
     key: &IdentityKey,
     identity: &str,
     endpoint: &str,
@@ -581,7 +560,7 @@ pub fn sign_relay_owner_proof_v2(
     origin: &str,
 ) -> String {
     encode_hex(
-        &key.sign(&relay_owner_proof_bytes_v2(identity, endpoint, nonce, origin))
+        &key.sign(&relay_owner_proof_bytes(identity, endpoint, nonce, origin))
             .to_bytes(),
     )
 }
@@ -1015,39 +994,19 @@ mod tests {
     }
 
     #[test]
-    fn relay_owner_proof_v2_golden_vector() {
-        // Same contract as v1 (test.mjs re-verifies it), now naming the origin.
+    fn relay_owner_proof_golden_vector() {
+        // Cross-language contract with relay-auth (test.mjs verifies the same vector).
         let key = IdentityKey::decode(&"07".repeat(32)).expect("fixed key");
         let identity = key.peer_id();
         let endpoint = "11".repeat(32);
         let nonce = "00112233445566778899aabbccddeeff";
         let origin = "https://relay.example.com:9443";
         assert_eq!(
-            relay_owner_proof_bytes_v2(&identity, &endpoint, nonce, origin),
+            relay_owner_proof_bytes(&identity, &endpoint, nonce, origin),
             format!("idfon-relay-owner/2|{identity}|{endpoint}|{nonce}|{origin}").into_bytes()
         );
-        let signature = sign_relay_owner_proof_v2(&key, &identity, &endpoint, nonce, origin);
+        let signature = sign_relay_owner_proof(&key, &identity, &endpoint, nonce, origin);
         assert_eq!(signature, "30d079eeaecf63f325e1973ecf2a3d2b04c1a5d9afee607b6e934c34af7a9883f1a352b851ad4159b82cbb0701823adabc192cb097ee9993eba6c1d0357e6003");
-    }
-
-    #[test]
-    fn relay_owner_proof_golden_vector() {
-        // Cross-language contract with idfon-edge/deploy/relay-auth/server.mjs: the
-        // owner proof bytes and their ed25519 signature. test.mjs verifies the
-        // same vector with node:crypto (verifyEd25519).
-        let key = IdentityKey::decode(&"07".repeat(32)).expect("fixed key");
-        let identity = key.peer_id();
-        assert_eq!(identity, "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c");
-        let endpoint = "11".repeat(32);
-        let nonce = "00112233445566778899aabbccddeeff";
-        assert_eq!(
-            relay_owner_proof_bytes(&identity, &endpoint, nonce),
-            format!("idfon-relay-owner/1|{identity}|{endpoint}|{nonce}").into_bytes()
-        );
-        assert_eq!(
-            sign_relay_owner_proof(&key, &identity, &endpoint, nonce),
-            "6024d46a9d40787d532358cd25c704c29684b021f875941c5ebef1f3b3b26fa3e453cb7b9fa1ba75000d89ceda627bf0c3282f7b2eeb61c6574fe3a850a1cf08"
-        );
     }
 
     #[test]
