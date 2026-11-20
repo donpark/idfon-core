@@ -33,7 +33,6 @@ the voice-agent runner live in idfon-sdk.
 | `idfon-h1` | HTTP/1.1 over iroh: serve an existing `axum::Router` (WebSockets, SSE, chunked bodies work unmodified) + client. |
 | `idfon-h3` | HTTP/3 over iroh on a side-channel ALPN beside the message ALPN + client. |
 | `idfon-gateway` | Reusable loopback HTTP gateway for `idfon://` resources; policy and providers arrive as a `Backend` + `Authorizer`. |
-| `idfon-edge` | Public-ingress peer: terminates HTTP(S) for a browser/WebView and bridges to the resource owner over HTTP/3-over-iroh. |
 
 ## MCP
 

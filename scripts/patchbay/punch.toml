@@ -1,6 +1,6 @@
 # Template — expand with scripts/patchbay/gen.sh.
 # Rationale, measured results and the run command are in
-# docs/relay-test-plan.md § "Network-path simulation (patchbay)".
+# idfon-edge/docs/relay-test-plan.md § "Network-path simulation (patchbay)".
 [sim]
 name = "punch-__PAIR__"
 

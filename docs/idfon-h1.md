@@ -256,7 +256,7 @@ by endpoint id, so shared keys let one test dial another test's server.
 ## Rebuild scope
 
 Library-only: nothing to rebuild. Once a binary starts calling `serve_router`:
-`crates/idfond`/CLI (`pnpm cli build`), the edge image (`deploy/idfon-edge`), or
+`crates/idfond`/CLI (`pnpm cli build`), the edge image (`idfon-edge/deploy/idfon-edge`), or
 the eve agents (`pnpm eve build`) depending on which one wires it up. The apps
 link the feature core through `libiroh_c_ffi`, so they only need rebuilding if
 the h1 path is exposed through the daemon/FFI — today it is not. See

@@ -787,7 +787,7 @@ impl Capability {
     /// May use the peer's `idfon/mcp/1` transport (grants gate each direction).
     pub const McpTransport: Capability = Capability(std::borrow::Cow::Borrowed("mcp.transport"));
     /// Relay reachability: the subject endpoint may use the issuer's relay to
-    /// reach the issuer (see `docs/relay-auth.md`).
+    /// reach the issuer (see `idfon-edge/docs/relay-auth.md`).
     pub const RelayUse: Capability = Capability(std::borrow::Cow::Borrowed("relay.use"));
     /// May make the agent speak aloud through the voice service (N9). Issued by
     /// the listening client to the speaker's target, enforced at the holder.

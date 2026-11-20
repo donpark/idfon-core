@@ -7,12 +7,11 @@ own entrypoint, and cargo/SwiftPM/Xcode cache per target dir — so a change onl
 needs the subprojects that actually link it. **When you change something shared,
 say which subprojects must be rebuilt.**
 
-## The two Rust target dirs
+## The Rust target dir
 
-| Dir | Holds | Built by |
-| --- | --- | --- |
-| `target/` | the whole workspace (`crates/*`, incl. `iroh-c-ffi`) | `cargo build`/`cargo test` at the repo root |
-| `deploy/cloudflare/target/` | the Cloudflare Worker (standalone wasm workspace) | `deploy/cloudflare/build.sh` |
+`target/` holds the whole workspace (`crates/*`, incl. `iroh-c-ffi`), built by
+`cargo build`/`cargo test` at the repo root. idfon-sdk and idfon-edge build into
+it too (their `.cargo/config.toml`).
 
 `crates/iroh-c-ffi` produces `libiroh_c_ffi.{dylib,so}` (macOS/Linux) or
 `.a` (iOS).
@@ -36,12 +35,9 @@ the iOS link args.
 | `crates/*` library logic | `cargo test -p <crate>`; add the consumer build below only if you need its artifact |
 | `crates/idfon-protocol` (wire/persisted types) | `cargo test -p idfon-protocol`; a change to a persisted shape or envelope also needs the c-FFI libs rebuilt (`ios/build-deps.sh`, the `iroh-c-ffi` dylib, then `idfond`) — the state decoder runs inside `libiroh_c_ffi` |
 | `crates/idfon-config` | the workspace (core, client, daemon, CLI, `idfond`) and the c-FFI artifact, so the Apple apps too |
-| `crates/idfon-core` | the workspace, plus `deploy/cloudflare/build.sh` (the Worker uses only the wasm-gated security helpers). A change to `transport`/`relay` (relay selection, `docs/relay-config.md`) also needs the c-FFI libs rebuilt — `ios/build-deps.sh` (device staticlib) and the `iroh-c-ffi` dylib, then `idfond` — or the apps won't pick it up. |
+| `crates/idfon-core` | the workspace, plus idfon-edge's Cloudflare Worker (`idfon-edge/deploy/cloudflare/build.sh`; it uses only the wasm-gated security helpers). A change to `transport`/`relay` (relay selection, `docs/relay-config.md`) also needs the c-FFI libs rebuilt — `ios/build-deps.sh` (device staticlib) and the `iroh-c-ffi` dylib, then `idfond` — or the apps won't pick it up. |
 | `crates/idfon-daemon` (feature functions) | `cargo test -p idfon-daemon`, then the c-FFI libs rebuilt (`ios/build-deps.sh`, the `iroh-c-ffi` dylib, then `idfond`) — every app links the feature core through `libiroh_c_ffi`, whether it reaches it over the RPC socket or in-process (`idfon_request`). |
 | `crates/idfon-director` (voice-agent harness) | `cargo test -p idfon-director`; the Apple staticlib is `cargo build -p idfon-director --features afm --target aarch64-apple-ios --release` (produces `libidfon_director.a`). `ios/build-deps.sh` builds and stages it into `ios/Vendor/device/`, and the Xcode project links it, so `pnpm ios build` covers it. `--features afm` links Apple Foundation Models via `fm-rs` and is Apple-only; the crate builds without it everywhere. It wraps `yoagent` (decision #31); the portable contract is `docs/voice-agent-loop-contract.md`. The mac app does **not** link it yet. |
-| `deploy/cloudflare/*` | `deploy/cloudflare/build.sh`, then `wrangler dev`/`deploy` |
-| `deploy/idfon-edge/Dockerfile` | rebuild/push the `idfon-edge` image (`edge-v*` tag or local build) |
-| `deploy/digitalocean/*` | nothing to build; follows the image (runbook in its README) |
 | `crates/iroh-c-ffi/src/*` | the c-ffi artifact, then every consumer that links it: cli, mac, native, ios (staticlib) |
 | `crates/idfond` (daemon) | `pnpm cli build`, `pnpm mac build`, `pnpm native build` (all bundle `idfond`) |
 | `crates/idfon-cli` (CLI binary) | `pnpm cli build` |

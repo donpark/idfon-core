@@ -495,7 +495,7 @@ impl RcanCapability for RelayGrant {
 
 /// Mints a relay reachability grant as an `rcan` token: the issuer's identity
 /// key binds the **subject** endpoint id (the token's audience) to the issuer's
-/// **relay** URL with an expiry. The relay's auth service (`deploy/relay-auth`)
+/// **relay** URL with an expiry. The relay's auth service (`idfon-edge/deploy/relay-auth`)
 /// admits the subject on the strength of the signature; `Delegation::delegate`
 /// lets an admitted caller re-delegate a narrower grant downstream.
 pub fn issue_relay_grant(
@@ -521,7 +521,7 @@ pub fn issue_relay_grant(
 }
 
 /// Decodes a relay grant token and verifies its signature. Expiry, issuer trust
-/// and revocation are the relay's call (see `docs/relay-auth.md`).
+/// and revocation are the relay's call (see `idfon-edge/docs/relay-auth.md`).
 pub fn verify_relay_grant(token: &str) -> Result<RelayGrant, AuthError> {
     let delegation: Delegation<RelayGrant> =
         Delegation::decode_string(token).map_err(|_| AuthError::VerificationFailed)?;
@@ -529,8 +529,8 @@ pub fn verify_relay_grant(token: &str) -> Result<RelayGrant, AuthError> {
 }
 
 /// The exact bytes an owner-bootstrap proof signs
-/// (`deploy/relay-auth/server.mjs` `OWNER_PROOF_PREFIX`). Pinned by the golden
-/// vector below and `deploy/relay-auth/test.mjs` — the two sides must agree
+/// (`idfon-edge/deploy/relay-auth/server.mjs` `OWNER_PROOF_PREFIX`). Pinned by the golden
+/// vector below and `idfon-edge/deploy/relay-auth/test.mjs` — the two sides must agree
 /// byte for byte or every enrollment is refused.
 pub fn relay_owner_proof_bytes(identity: &str, endpoint: &str, nonce: &str) -> Vec<u8> {
     format!("idfon-relay-owner/1|{identity}|{endpoint}|{nonce}").into_bytes()
@@ -962,7 +962,7 @@ mod tests {
 
     #[test]
     fn relay_grant_golden_vector() {
-        // Cross-language contract: deploy/relay-auth/test.mjs verifies the same
+        // Cross-language contract: idfon-edge/deploy/relay-auth/test.mjs verifies the same
         // token with node:crypto. ed25519 is deterministic, so any drift in the
         // rcan payload encoding breaks one side.
         let key = IdentityKey::decode(&"07".repeat(32)).expect("fixed key");
@@ -982,7 +982,7 @@ mod tests {
 
     #[test]
     fn relay_owner_proof_golden_vector() {
-        // Cross-language contract with deploy/relay-auth/server.mjs: the
+        // Cross-language contract with idfon-edge/deploy/relay-auth/server.mjs: the
         // owner proof bytes and their ed25519 signature. test.mjs verifies the
         // same vector with node:crypto (verifyEd25519).
         let key = IdentityKey::decode(&"07".repeat(32)).expect("fixed key");

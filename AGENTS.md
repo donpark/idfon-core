@@ -13,7 +13,6 @@ update the index.
 - `crates/iroh-c-ffi`: the C ABI behind `libiroh_c_ffi.dylib` / `.a`, which
   both apps link. Its artifact must be built before `idfond`.
 - `swift/`: Swift packages the apps reference from `../idfon-core/swift/`.
-- `deploy/`: edge and relay deployments.
 
 ## Other repos
 
@@ -51,7 +50,7 @@ here can break idfon-sdk, idfon-ios and idfon-mac, which build this checkout:
   before touching app code. `403 InvalidProviderToken` = wrong
   `--push-apns-key-id` for `edge.apns.p8` (C26, regressed as C28). Compose
   refuses to start without the id; never reintroduce a default, and run
-  `docs/edge-deploy-checklist.md` §C step 4 after any edge change.
+  `idfon-edge/docs/edge-deploy-checklist.md` §C step 4 after any edge change.
 - **No identifiers in public artifacts.** These repos are public. Keep APNs key
   ids, push tokens, peer/endpoint ids, call UUIDs, droplet IPs and SSH key
   names out of commits, PR titles/bodies, issues and docs. Use placeholders

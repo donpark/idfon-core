@@ -3,7 +3,7 @@
 # Kills only daemons on scratch profiles (--data-dir under /tmp/idfon*), never
 # the app daemon (its profile lives in Application Support). The test edge and
 # the apps' edge config stay — they are the live rig for the pending CallKit
-# legs; the manual steps for those are docs/edge-deploy-checklist.md §B.
+# legs; the manual steps for those are idfon-edge/docs/edge-deploy-checklist.md §B.
 set -euo pipefail
 
 # Stray daemons: scratch profiles only (includes /tmp/idfon-e2e.* from

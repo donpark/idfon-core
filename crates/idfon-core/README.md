@@ -8,7 +8,7 @@ the same code compiles to wasm for the Cloudflare Worker.
 - **Kind:** library (native + wasm)
 - **Modules:** `lib` (identity/capabilities), `path`, `relay`, `transport`
 - **Read more:** `docs/communication-model.md`, `docs/relay-config.md`,
-  `docs/relay-auth.md`
+  `idfon-edge/docs/relay-auth.md`
 
 ```sh
 cargo test -p idfon-core

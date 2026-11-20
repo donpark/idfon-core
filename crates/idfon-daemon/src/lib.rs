@@ -321,7 +321,7 @@ struct Store {
     revoked_tickets: Vec<String>,
     /// Endpoint ids this daemon admitted at the relay's auth service
     /// (`relay_auth`); revocation is the set difference against live
-    /// peers/identities (docs/relay-auth.md §6).
+    /// peers/identities (idfon-edge/docs/relay-auth.md §6).
     #[serde(default)]
     relay_admitted: Vec<String>,
     #[serde(default)]
@@ -815,7 +815,7 @@ pub async fn run(config: DaemonConfig) -> io::Result<()> {
         wire_sync_identity(Arc::clone(&transport), Arc::clone(&store), identity.clone()).await;
     }
     resume_pending_operations(Arc::clone(&store), Arc::clone(&transport));
-    // Relay auto-enrollment (docs/relay-auth.md §6): keeps every identity and
+    // Relay auto-enrollment (idfon-edge/docs/relay-auth.md §6): keeps every identity and
     // peer device endpoint admitted at the relay's auth service. No-op unless
     // IDFON_RELAY_ENROLL_URL is set.
     relay_auth::spawn(Arc::clone(&store));
@@ -1179,7 +1179,7 @@ fn merge_state_events(
     state.save(&data_dir)?;
     if added > 0 {
         // Synced peer/identity changes can add or drop endpoints to admit
-        // (docs/relay-auth.md §6).
+        // (idfon-edge/docs/relay-auth.md §6).
         relay_auth::poke();
     }
     Ok(added)
@@ -2460,7 +2460,7 @@ fn provider_stop(request: &Request, identity: &str) -> Response {
 }
 
 /// Mutations that change which endpoints the relay should admit
-/// (`relay_auth`, docs/relay-auth.md §6); they poke the enrollment loop.
+/// (`relay_auth`, idfon-edge/docs/relay-auth.md §6); they poke the enrollment loop.
 const RELAY_ENROLL_MUTATIONS: &[&str] = &[
     "peer.add",
     "peer.update",

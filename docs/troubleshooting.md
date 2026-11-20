@@ -1087,7 +1087,7 @@ arrives perfectly formed and gets a 200, proving the client. Then read the
 edge's stderr: the panic is right there. Divide the request path at the
 server, not the network.
 
-**Fix.** `crates/idfon-edge/Cargo.toml`: `jsonwebtoken = { version = "11",
+**Fix.** `idfon-edge/crates/idfon-edge/Cargo.toml`: `jsonwebtoken = { version = "11",
 features = ["rust_crypto"] }` + regression test
 `jwt_signing_has_a_crypto_provider`. General lesson: a panicking route handler
 kills the connection silently — check server stderr before blaming the client,

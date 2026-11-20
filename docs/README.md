@@ -20,9 +20,7 @@ kept because it records decisions; **design** = not all implemented.
 
 | Doc | Covers |
 | --- | --- |
-| `idfon-edge.md` | public `idfon.net` gateway + on-device adapter + P2P backbone + VoIP push channel (as-built; P0–P7 landed; public edge on a DigitalOcean droplet + co-located relay; residual issues #27–#29) |
 | `durable-files.md` | Durable file publication independent of sessions/agent lifecycle: the edge's content-addressed store (`/files`, `/models`), `idfon publish`, 24 h user pins / permanent operational pins, the agent tool, BunnyCDN, ops-only takedown with a sticky blocklist and write rate limits; as-built (no paid tier) |
-| `edge-deploy-checklist.md` | the CallKit test rig (local edge + app config), session teardown (`scripts/e2e-teardown.sh`), droplet deploy incl. the APNs push wiring (#54) |
 | `mcp-control.md` | MCP control-surface access model: three approval tiers over iroh/capability tickets, the request-time approval block (lock-screen actionable variant), verb-class scoping, audit-over-Diag; initial read-only tool slice |
 | `contact-exchange.md` | vCard contact cards: the NameDrop substitute, `idfon://add/` deep links, QR, import/export surfaces, the approval modal (rename/deny, admission-code auth), the test-contacts page (`scripts/test-contacts-page.mjs`) |
 
@@ -34,8 +32,6 @@ kept because it records decisions; **design** = not all implemented.
 | `multi-device.md` | one account across devices (design) |
 | `relay-config.md` | relay selection at runtime — parameter (flags / app launch args / FFI / `IDFON_RELAY_*`) > configuration (app Relay settings, `~/.idfon/relay.conf`) > default (N0); who honors it and why the vendored libs must be re-staged (as-built) | configuring a relay, changing relay without a binary rebuild, precedence questions |
 | `config.md` | where idfon keeps things (home, daemon data, socket, `config.toml`), profiles, every setting and its env var, the `/tmp` data migration, `idfon config path`/`show` (as-built) | finding a file, adding a setting, running a second daemon, or debugging "wrong identity" |
-| `relay-auth.md` | relay access: identity→relay claiming, caller-bound grants, relay-issued owner/non-owner tokens, revocation (as-built for the auth service + grant contract + daemon owner-side auto-enrollment) |
-| `relay-test-plan.md` | hand-off test plan for relay auth: L0–L3 cases, pass criteria, known gaps, rollback; plus the adopted patchbay NAT lab (how to run it on macOS, the measured punch/relay matrix, the blob-amplification root cause and direct-path fix, the QAD-needs-TLS trap, and how to get netem/impairment working on macOS) |
 | `chatrooms.md` | rooms, direct fan-out, gossip |
 | `mcp-transport.md` | idfon as an MCP transport binding (implemented) |
 | `idfon-h1.md` | HTTP/1.1 over iroh: serve an existing `axum::Router` with WebSockets, SSE and chunked bodies, `RemoteId` peer identity, client + upgrade handle (slices 1–2 of #142 tested; voxl demo pending) |
@@ -66,3 +62,5 @@ kept because it records decisions; **design** = not all implemented.
 | `diag.md` | `IDFON-DIAG/1` app diagnostics over iroh: protocol, app reporter, the `monitor` filing agent, query examples (issue #63) |
 | `disk-hygiene.md` | the ANE/CoreAI compile leftovers (scratch workdirs, coreai-cache registrations, daemon caches): the mechanism, `pnpm ane list`/`pnpm ane clean` usage, the output contract for scripts and agents, the flush experiment |
 | `dylib-refactoring-plan.md` | shared-dylib build as-built + follow-up log |
+The edge and relay-auth docs (`idfon-edge.md`, `edge-deploy-checklist.md`,
+`relay-auth.md`, `relay-test-plan.md`) moved to the idfon-edge repo.

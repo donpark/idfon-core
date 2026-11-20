@@ -175,6 +175,6 @@ WS over h1, RFC 6455 straight onto an iroh bi-stream, and the channel.
 ## Rebuild scope
 
 Library-only: nothing to rebuild. Once a binary calls `serve_channels`:
-`crates/idfond`/CLI (`pnpm cli build`), the edge image (`deploy/idfon-edge`), or
+`crates/idfond`/CLI (`pnpm cli build`), the edge image (`idfon-edge/deploy/idfon-edge`), or
 the eve agents depending on the consumer. Apps only if it is exposed through
 the daemon/FFI. See [`build.md`](build.md).

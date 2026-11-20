@@ -3,8 +3,7 @@
 The core of Idfon, a peer-to-peer
 communication and data-transfer system built on [iroh](https://www.iroh.computer):
 the wire protocol, identity and capability tickets, transport, media, the
-daemon (`idfond`), the C ABI the iOS and macOS apps link (`iroh-c-ffi`), the
-public edge (`idfon-edge`), and the Swift packages both apps use (`swift/`).
+daemon (`idfond`), the C ABI the iOS and macOS apps link (`iroh-c-ffi`), and the Swift packages both apps use (`swift/`).
 
 > **Status:** experimental and pre-release.
 
@@ -14,9 +13,10 @@ Clone them side by side (for example in `~/dev`):
 
 | Repo | What it holds |
 | --- | --- |
-| [idfon-core](https://github.com/donpark/idfon-core) | protocol, identity, transport, media, the daemon (`idfond`), the C ABI the apps link, the edge, and the Swift packages both apps use |
+| [idfon-core](https://github.com/donpark/idfon-core) | protocol, identity, transport, media, the daemon (`idfond`), the C ABI the apps link, and the Swift packages both apps use |
 | [idfon-sdk](https://github.com/donpark/idfon-sdk) | the `idfon` CLI, the MCP server, the Eve integration and agents, the voice-agent runner, and the end-to-end tests |
 | idfon-ios, idfon-mac (private) | the iPhone and macOS apps |
+| idfon-edge (private) | the `idfon.net` edge server, its deployments, and the relay auth service |
 | idfon-home, idfon (private) | product docs and planning; the pre-split archive and model R&D |
 
 idfon-sdk and both apps build idfon-core from `../idfon-core`; set
@@ -50,8 +50,7 @@ what the app reported before and after it.
 | --- | --- |
 | `crates/` | the Rust workspace; `crates/README.md` says what each crate is for |
 | `swift/` | `tyger-swift` (on-device turn-taking) and `liquid-swift`, used by both apps |
-| `deploy/` | the edge and relay deployments (DigitalOcean, Cloudflare Worker, Bunny) |
-| `scripts/` | daemon, edge, relay-lab and telemetry helpers |
+| `scripts/` | daemon, relay-lab and telemetry helpers |
 | `docs/` | design and as-built docs; start at [docs/README.md](docs/README.md) |
 
 ## Development

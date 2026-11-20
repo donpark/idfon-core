@@ -1,7 +1,7 @@
 # Durable files: CDN-backed publication, independent of sessions and agents
 
 > **Status:** as-built (2026-11-01) for the origin store and the publish path:
-> `FilesRoutes` in `crates/idfon-edge` (`/files/*`, `/models/*`), the daemon's
+> `FilesRoutes` in `idfon-edge/crates/idfon-edge` (`/files/*`, `/models/*`), the daemon's
 > `files.publish` RPC and `idfon publish`, plus expiring rental pins, the
 > Phonon pack delivery (content-addressed objects + app downloader), the
 > BunnyCDN pull zone (`files.idfon.net`), an ops-only takedown with a sticky
@@ -191,12 +191,12 @@ Two upload tokens, two policies:
   `--files-dir /srv/idfon-edge/files --files-token <secret>`. Without a token
   the store is read-only, so an operator can rsync content instead of using
   the HTTP publish path.
-- **BunnyCDN** (pull zone) is the default: `deploy/bunny/setup.sh`
+- **BunnyCDN** (pull zone) is the default: `idfon-edge/deploy/bunny/setup.sh`
   (`docs`-free, idempotent) creates the zone, the `files.idfon.net` custom
   hostname, the free certificate, and — when `DIGITALOCEAN_API_KEY` is set —
   the CNAME. The CDN pulls `https://idfon.net/sha256/<hash>` (the edge matches
   the trailing `/sha256/<hash>` at any prefix) and serves
-  `https://files.idfon.net/sha256/<hash>`. See `deploy/bunny/README.md`; two
+  `https://files.idfon.net/sha256/<hash>`. See `idfon-edge/deploy/bunny/README.md`; two
   settings matter:
   - **Smart Cache must stay OFF** — it restricts caching to a known extension
     list, and content URLs are extensionless.

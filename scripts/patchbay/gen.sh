@@ -1,5 +1,5 @@
 #!/bin/sh
-# Patchbay NAT lab — see docs/relay-test-plan.md § "Network-path simulation".
+# Patchbay NAT lab — see idfon-edge/docs/relay-test-plan.md § "Network-path simulation".
 #
 # Writes the sim files for a cell into "$out" and prints the run command.
 # Prerequisites (macOS): `container system start`, the patchbay CLI built for

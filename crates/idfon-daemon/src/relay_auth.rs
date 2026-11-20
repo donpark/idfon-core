@@ -1,4 +1,4 @@
-//! Owner-side relay auto-enrollment (docs/relay-auth.md §6).
+//! Owner-side relay auto-enrollment (idfon-edge/docs/relay-auth.md §6).
 //!
 //! When `IDFON_RELAY_ENROLL_URL` points at a relay-auth deployment, the daemon
 //! keeps every local identity endpoint and every known peer device endpoint

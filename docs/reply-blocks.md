@@ -85,7 +85,7 @@ read must never lose the reply, and a shell must never try to draw garbage.
 **Data, not code.** A render spec names components from the *app's* catalog
 (`JSONRenderSpec.catalog`) and actions from the *app's* tool registry
 (`RenderTools`), which confirms sensitive ones and audits every dispatch
-(`docs/idfon-edge.md` §P5). Unknown components are dropped with their subtrees;
+(`idfon-edge/docs/idfon-edge.md` §P5). Unknown components are dropped with their subtrees;
 the agent supplies neither code nor markup. Limits: 64 KiB and 200 elements
 per spec.
 
