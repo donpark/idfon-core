@@ -32,10 +32,13 @@ struct Case {
 }
 
 fn norm(v: &Value) -> String {
-    // canonical string form: object key order-insensitive via serde_json's Map ordering
+    // Canonical string form, insensitive to object key order. Sort the keys
+    // explicitly: with serde_json's `preserve_order` feature (on whenever any
+    // crate in the build enables it), Map keeps insertion order.
     let mut v = v.clone();
     if let Value::Object(m) = &mut v {
-        let keys: Vec<String> = m.keys().cloned().collect();
+        let mut keys: Vec<String> = m.keys().cloned().collect();
+        keys.sort();
         let mut sorted = serde_json::Map::new();
         for k in keys {
             sorted.insert(k.clone(), m.remove(&k).unwrap());

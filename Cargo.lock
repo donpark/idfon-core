@@ -2084,35 +2084,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "eve-idfon"
-version = "0.11.0"
-dependencies = [
- "anyhow",
- "axum",
- "base64 0.23.1",
- "blake3",
- "chrono",
- "clap",
- "ed25519-dalek 3.0.0",
- "futures-util",
- "getrandom 0.4.3",
- "idfon-config",
- "idfon-core",
- "idfon-h3",
- "idfon-media",
- "idfon-protocol",
- "idfon-telemetry",
- "idfon-voice",
- "iroh",
- "iroh-blobs",
- "rustls",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "event-listener"
 version = "5.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3335,18 +3306,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "idfon-cli"
-version = "0.11.0"
-dependencies = [
- "clap",
- "idfon-client",
- "idfon-config",
- "idfon-protocol",
- "idfon-telemetry",
- "serde_json",
-]
-
-[[package]]
 name = "idfon-client"
 version = "0.11.0"
 dependencies = [
@@ -3526,26 +3485,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "idfon-live-media"
-version = "0.11.0"
-dependencies = [
- "anyhow",
- "base64 0.23.1",
- "bytes",
- "ed25519-dalek 3.0.0",
- "futures-util",
- "idfon-core",
- "idfon-protocol",
- "iroh",
- "iroh-live",
- "moq-audio",
- "moq-net",
- "n0-future",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "idfon-mcp"
 version = "0.11.0"
 dependencies = [
@@ -3562,18 +3501,6 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "idfon-mcp-server"
-version = "0.11.0"
-dependencies = [
- "anyhow",
- "clap",
- "idfon-client",
- "idfon-protocol",
- "idfon-telemetry",
- "serde_json",
 ]
 
 [[package]]
@@ -3611,16 +3538,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "idfon-radio"
-version = "0.11.0"
-dependencies = [
- "anyhow",
- "chrono",
- "quick-xml",
- "serde_json",
-]
-
-[[package]]
 name = "idfon-telemetry"
 version = "0.11.0"
 dependencies = [
@@ -3641,31 +3558,6 @@ dependencies = [
  "futures-util",
  "idfon-protocol",
  "reqwest",
- "serde",
- "serde_json",
- "tokio",
- "tokio-websockets",
- "tracing",
-]
-
-[[package]]
-name = "idfon-voice-agent"
-version = "0.11.0"
-dependencies = [
- "anyhow",
- "base64 0.23.1",
- "chrono",
- "ed25519-dalek 3.0.0",
- "eve-idfon",
- "futures-util",
- "idfon-core",
- "idfon-director",
- "idfon-live-media",
- "idfon-protocol",
- "idfon-radio",
- "idfon-voice",
- "iroh",
- "rustls",
  "serde",
  "serde_json",
  "tokio",

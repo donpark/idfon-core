@@ -1,202 +1,28 @@
-# Idfon
+# idfon-core
 
-Idfon is a peer-to-peer communication and data-transfer system built on
-[iroh](https://www.iroh.computer). It provides a local daemon, a CLI, and
-native clients. Idfon stores identities and peer state on the local machine.
-Connections may use direct paths, discovery, or relays supplied by iroh.
+The core of [Idfon](https://github.com/donpark/idfon-home), a peer-to-peer
+communication and data-transfer system built on [iroh](https://www.iroh.computer):
+the wire protocol, identity and capability tickets, transport, media, the
+daemon (`idfond`), the C ABI the iOS and macOS apps link (`iroh-c-ffi`), the
+public edge (`idfon-edge`), and the Swift packages both apps use (`swift/`).
 
-> **Status:** experimental and pre-release. The CLI is available as an npm
-> package. Native clients are usable for development. The iOS ↔ Eve text-agent
-> demo passes end-to-end tests on a physical iPhone. Voice/STT/TTS remains a
-> separate follow-up.
+> **Status:** experimental and pre-release.
 
-## CLI installation
+## The idfon repositories
 
-The npm package includes prebuilt binaries for macOS (arm64, x64) and Linux
-(x64, arm64). The launcher requires Node.js 18 or later.
+Clone them side by side (for example in `~/dev`):
 
-```sh
-npx idfon status
-npm install --global idfon
-```
+| Repo | What it holds |
+| --- | --- |
+| [idfon-core](https://github.com/donpark/idfon-core) | protocol, identity, transport, media, the daemon (`idfond`), the C ABI the apps link, the edge, and the Swift packages both apps use |
+| [idfon-sdk](https://github.com/donpark/idfon-sdk) | the `idfon` CLI, the MCP server, the Eve integration and agents, the voice-agent runner, and the end-to-end tests |
+| [idfon-ios](https://github.com/donpark/idfon-ios) | the iPhone app |
+| [idfon-mac](https://github.com/donpark/idfon-mac) | the macOS app |
+| [idfon-home](https://github.com/donpark/idfon-home) | product docs and planning |
+| [idfon](https://github.com/donpark/idfon) | the archive: history before the split (2026-11-20), model R&D (Tyger ports, ASR tools, the voice corpus tools) and the Native-SDK shell |
 
-Windows is not supported yet. To build from source, install Rust and run:
-
-```sh
-cargo build --release -p idfon-cli -p idfond
-```
-
-The resulting binaries are `target/release/idfon` and
-`target/release/idfond`.
-
-## Daemon
-
-`idfon` is a client for `idfond`, which owns the iroh endpoint and persistent
-local state. The CLI starts `idfond` when needed and connects to it through a
-Unix socket. By default the socket is `/tmp/idfon/idfond.sock`.
-
-An automatically started daemon exits after its idle timeout. Use
-`--keep-alive` to disable that behavior, or run `idfon shutdown` to stop it.
-The daemon is also used by the native clients, so the CLI and an app can share
-an identity and peer state.
-
-## CLI
-
-Run `idfon --help` for the complete command list. Common commands:
-
-```sh
-# Inspect and manage local state
-idfon status
-idfon identity list
-idfon identity create work
-idfon peer list
-idfon peer add <endpoint-id-or-address> --name bob
-
-# Store data and retrieve it by ticket
-idfon put --file recording.wav > ticket.txt
-idfon get "$(cat ticket.txt)" --out copy.wav
-
-# Send text or a signaled file to a peer
-idfon send bob --text "hello"
-idfon send bob --file notes.pdf
-idfon recv --out notes.pdf
-
-# Publish or receive live audio
-idfon send --stream --file audio.wav --loop > live-ticket.txt
-idfon get "$(cat live-ticket.txt)" --out capture.wav
-
-# A session-scoped 1:1 stream
-idfon send bob --stream --file audio.wav
-idfon recv --stream --out reply.wav
-```
-
-`put` stores data and prints a `BlobTicket`. `get` fetches a blob ticket to
-stdout or a file. The CLI chunks transfers and the daemon stores them. The
-data does not go through the chat message path.
-
-`send PEER --file` stores a blob and sends its ticket as a peer message.
-`recv` waits for that message, then fetches the blob. Text and file delivery
-require the relevant local capability grants. See
-[CLI data transfer](docs/cli-data.md) for pairing and transfer details.
-
-`send --stream` without a peer publishes live audio and prints an
-`iroh-live:` ticket. With a peer it opens a session-scoped 1:1 stream instead.
-`recv --stream` accepts that stream. The CLI supports file sources. The native
-clients provide microphone capture, not this command. Use
-`send --stream --video` for video broadcasts. See
-[video media](docs/video-media.md).
-
-Useful operational commands:
-
-```sh
-idfon events --follow
-idfon wait --type message.received --timeout-ms 60000
-idfon operation get <operation-id>
-idfon access check --subject <peer-id> --capability message.receive
-idfon mcp listen --to <peer>
-idfon shutdown
-```
-
-Use `--json` for response envelopes intended for scripts. `--socket`,
-`--identity`, and `--keep-alive` are global options.
-
-## MCP transport
-
-Idfon includes an MCP transport bridge. It carries MCP stdio traffic over the
-`idfon/mcp/1` iroh protocol. It does not implement MCP semantics.
-
-```sh
-# On the MCP-server side
-idfon-mcp serve --command '<local-mcp-server>'
-
-# On the client side
-idfon-mcp connect --peer '<peer-ticket>'
-```
-
-`idfon-mcp --help` shows the exact bridge options. The daemon also has
-`idfon mcp listen` and `idfon mcp configure` commands for daemon-backed
-connections. `idfon-mcp-server` exposes selected idfon operations as MCP
-tools. This area is experimental. See
-[MCP transport](docs/mcp-transport.md).
-
-## Native clients
-
-The repository contains native clients for macOS and iOS. They use the same
-daemon protocol and share the Rust networking/media components, but are not
-release products yet.
-
-Install the JavaScript workspace dependencies first:
-
-```sh
-pnpm install
-```
-
-Build and start the iOS app on a connected, unlocked iPhone:
-
-```sh
-pnpm ios build
-DEVICE=<iphone-udid-or-name> pnpm ios device
-```
-
-`pnpm ios build` produces a device Release build. `pnpm ios device` installs
-and starts it through `devicectl`. Omit `DEVICE` to use the first available
-physical iPhone. The iOS app is device-only. The simulator is not supported.
-
-Build and start the macOS app:
-
-```sh
-pnpm mac build
-pnpm mac start
-```
-
-The macOS and iOS apps use the local daemon and share the Rust networking/media
-components. See the platform-specific docs for details:
-
-- [macOS client](mac/README.md)
-- [Native SDK client](native/README.md)
-- iOS client (`ios/`)
-
-Human-to-human calls use Opus by default. LiquidCodec (24 kHz mono, 80 ms
-frames, a neural speech codec run on Core ML) can be chosen per contact on
-both apps. Its models download from the idfon edge when first needed, and a call
-falls back to Opus only if the download or load fails. The codec lives in the
-shared Swift package `ports/liquid-swift`. The design notes and measurements
-are in `idfon-home/docs/liquidcodec.md`.
-
-## Eve extension and agents
-
-Build the `eve-idfon` extension and the agents under `agents/` separately from
-the native clients. `pnpm eve` builds the extension first, then every
-installed agent:
-
-```sh
-pnpm eve build      # eve-idfon + all agents
-pnpm eve clean      # remove dist/.output everywhere
-```
-
-Use `pnpm agent` to manage individual agents:
-
-```sh
-pnpm agent build <name|all>     # eve build in agents/<name>
-pnpm agent clean <name|all>
-pnpm agent start <name>         # needs scripts/<name>-serve.sh
-pnpm agent restart <name>       # stop then start
-pnpm agent stop <name>
-```
-
-The agents under `agents/` are:
-
-| Agent | Served | What it is |
-| --- | --- | --- |
-| `live-voice` | yes | GPT-Live full-duplex voice agent (audio/video calls, artifacts) |
-| `llm` | yes | text-only agent reached by voice. The model is per-instance, so one agent can back several contacts |
-| `agency` | yes | go-between. It introduces registered agents (A2A card relay) and signs nothing |
-| `chat-echo` | no | deterministic echo mock used by the e2e scripts and `eve-spike` |
-
-See [live-voice agent](docs/live-voice.md),
-[voice side channel](docs/voice-side-channel.md) (the `llm` agent and
-multi-contact model selection), [agent agency](docs/agent-agency.md),
-and [Eve ingress channel](docs/idfon-eve.md).
+idfon-sdk and both apps build idfon-core from `../idfon-core`; set
+`IDFON_CORE` to use another checkout.
 
 ## Privacy
 
@@ -220,23 +46,26 @@ like passwords. And while the iPhone app is suspended and the screen is
 locked, nothing runs to be observed — the frozen window is visible only in
 what the app reported before and after it.
 
-## Documentation
+## Layout
 
-Start at [docs/README.md](docs/README.md). It is the index of current docs by
-topic.
+| Path | What |
+| --- | --- |
+| `crates/` | the Rust workspace; `crates/README.md` says what each crate is for |
+| `swift/` | `tyger-swift` (on-device turn-taking) and `liquid-swift`, used by both apps |
+| `deploy/` | the edge and relay deployments (DigitalOcean, Cloudflare Worker, Bunny) |
+| `scripts/` | daemon, edge, relay-lab and telemetry helpers |
+| `docs/` | design and as-built docs; start at [docs/README.md](docs/README.md) |
 
 ## Development
 
 ```sh
+cargo check --workspace --all-targets
 cargo test -p idfon-protocol -p idfon-core -p idfon-daemon
-scripts/test-cli.sh
-scripts/test-e2e.sh
-scripts/stream-e2e.sh
 ```
 
-The workspace has the protocol, core networking, daemon, client, CLI, media,
-and MCP crates. See the architecture documentation for the current boundaries
-and known limitations.
+The end-to-end tests drive the daemon through the `idfon` CLI, so they live in
+idfon-sdk (`scripts/test-cli.sh`, `scripts/test-e2e.sh`, …) and build this
+repo from `../idfon-core`.
 
 ## License
 

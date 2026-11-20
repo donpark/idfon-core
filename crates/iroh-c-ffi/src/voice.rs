@@ -272,7 +272,7 @@ mod turn_tests {
     #[test]
     fn student_traits_decider_is_a_threshold_override() {
         let traits: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../ports/tyger-student/student.traits.json"
+            "../tests/fixtures/student.traits.json"
         ))
         .unwrap();
         let th: idfon_voice::turns::Thresholds =

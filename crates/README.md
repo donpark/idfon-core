@@ -5,7 +5,8 @@ detail; `docs/README.md` indexes the design docs.
 
 Read the list **bottom-up for the layers**: `idfon-protocol` and `idfon-core` are
 the shared floor, the transports and services sit on them, and the apps reach all
-of it through `iroh-c-ffi`.
+of it through `iroh-c-ffi`. The CLI, the MCP server, the Eve integration and
+the voice-agent runner live in idfon-sdk.
 
 ## Foundation
 
@@ -23,7 +24,6 @@ of it through `iroh-c-ffi`.
 | `idfon-daemon` | The feature functions and request dispatch (blobs, live sessions, MCP bridge, relay auth) — the real daemon. |
 | `idfond` | Launcher binary only: parse args, call `idfon_daemon_run` in the c-FFI dylib. |
 | `idfon-client` | Daemon IPC client: framing, socket path, retry, response validation. The single source of truth for all of it. |
-| `idfon-cli` | The `idfon` CLI: noun-verb subcommands mapped one-to-one onto daemon methods. |
 
 ## Transports and HTTP seams
 
@@ -40,24 +40,19 @@ of it through `iroh-c-ffi`.
 | Crate | What it is |
 | --- | --- |
 | `idfon-mcp` | `idfon-mcp` bridge binary over `idfon/mcp/1`, plus the read-only folder provider for stdio or H3. |
-| `idfon-mcp-server` | MCP *server* adapter (stdio), a separate process over `idfon-client`; consent decisions stay in the daemon. |
 
 ## Media
 
 | Crate | What it is |
 | --- | --- |
 | `idfon-media` | The media plane: live-call sessions, MoQ video, the capture/render adapter seam, headless pub/sub, connection health. |
-| `idfon-live-media` | MoQ plumbing shared by live-call handlers (parse an invite, subscribe PCM, publish and sign the return leg). Provider-neutral. |
-| `idfon-radio` | A talk-radio programme: the schedule, its clips, and the frames a transport pumps. Call-relative, not a timer. |
 
 ## Voice
 
 | Crate | What it is |
 | --- | --- |
 | `idfon-voice` | The STT/TTS/endpointing provider seam plus the voice-service pieces around it (barge-in, echo, arbitration, turns). Boundary is text. |
-| `idfon-voice-agent` | The voice-agent kit and `eve-idfon-voice`: one config-driven runner, pluggable backends (cascade, GPT-Live, local). |
 | `idfon-director` | The loop boundary — turns, tools, trace — over `yoagent`; on-device tier is Apple Foundation Models. |
-| `eve-idfon` | A generic Eve ingress endpoint holder (`eve-idfon`); live calls are a handler seam this binary leaves unregistered. |
 
 ## App binding
 

@@ -17,7 +17,7 @@ import XCTest
 ///   # and the same with --batch 1, plus the 24-layer 320 export in asr-tap-320
 final class TurnPrefixTests: XCTestCase {
     private var repoRoot: URL {
-        // .../ports/tyger-swift/Tests/TygerVoiceTests/<this file>
+        // .../swift/tyger-swift/Tests/TygerVoiceTests/<this file>
         URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent()
             .deletingLastPathComponent().deletingLastPathComponent()
@@ -62,7 +62,7 @@ final class TurnPrefixTests: XCTestCase {
     /// two channels carry the *same* audio for the first seconds, and two equal ears
     /// would hide a slot mix-up (the thing these tests exist to catch).
     private func fixture() -> Fixture {
-        let dir = repoRoot.appendingPathComponent("ports/tyger-swift/Tests/TygerVoiceTests/runtime")
+        let dir = repoRoot.appendingPathComponent("swift/tyger-swift/Tests/TygerVoiceTests/runtime")
         let mic = (try? readWav(dir.appendingPathComponent("ch0.wav"))).flatMap { $0.isEmpty ? nil : $0 }
             ?? Self.pseudoSpeech(seed: 1)
         return Fixture(mic: mic, playback: Self.pseudoSpeech(seed: 2))

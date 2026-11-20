@@ -7,7 +7,7 @@
 set -euo pipefail
 
 # Stray daemons: scratch profiles only (includes /tmp/idfon-e2e.* from
-# scripts/test-e2e.sh and the /tmp/idfon-dbg.* debug sessions).
+# idfon-sdk scripts/test-e2e.sh and the /tmp/idfon-dbg.* debug sessions).
 ps -axo pid=,command= | grep '[i]dfond ' | grep -- '--data-dir /tmp/idfon' |
   while read -r pid _; do
     echo "e2e-teardown: killing stray idfond pid=$pid"

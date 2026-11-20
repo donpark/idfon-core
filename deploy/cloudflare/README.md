@@ -139,7 +139,7 @@ curl -H 'x-idfon-ticket: <ticket>' http://localhost:8787/<ref>/
 ```
 
 Routes in `wrangler.toml` are ignored by local `wrangler dev`; use the
-`/<ref>/<path>` form. Test against a real peer (`scripts/edge-e2e.sh` starts a
+`/<ref>/<path>` form. Test against a real peer (`scripts/edge-e2e.sh` in idfon-sdk starts a
 native provider) or a trivial `iroh-h3-axum` echo server.
 
 ## Auth and limits

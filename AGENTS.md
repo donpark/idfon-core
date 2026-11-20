@@ -1,72 +1,35 @@
-# Agent notes
+# Agent notes: idfon-core
 
 ## Documentation
 
 Start at **`docs/README.md`** (the index) and read only the entries relevant to
-the task. Do not bulk-read `docs/` — it is indexed so you don't have to. If you
-add or materially change a doc, update the index.
+the task. Do not bulk-read `docs/`. If you add or materially change a doc,
+update the index.
 
 ## Layout
 
-- `crates/` — Rust workspace (protocol, core, daemon, cli, gateway, h3, mcp, media, …).
-- `crates/iroh-c-ffi` — the FFI crate behind `libiroh_c_ffi.dylib` (workspace member; its artifact must be built before `idfond`).
-- `ios/Idfon`, `mac/Sources/Idfon` — the two native apps (duplicated UI code).
-- `agents/`, `integrations/` — Eve agents and the eve-idfon bridge.
-- `bench-results/`, `dist/` — symlinks to the shared generated-artifact store at
-  `~/.idfon/{bench-results,dist}` (multi-GB model-testing/training outputs, one
-  copy for all worktrees). Fresh worktree: run `scripts/link-artifacts.sh`.
+- `crates/`: the Rust workspace (protocol, config, core, daemon, idfond, client,
+  media, voice, h1, h3, channel, gateway, mcp, edge, director, iroh-c-ffi).
+- `crates/iroh-c-ffi`: the C ABI behind `libiroh_c_ffi.dylib` / `.a`, which
+  both apps link. Its artifact must be built before `idfond`.
+- `swift/`: Swift packages the apps reference from `../idfon-core/swift/`.
+- `deploy/`: edge and relay deployments.
 
-## iOS shipping (TestFlight)
+## Other repos
 
-- Read `docs/testflight-plan.md` before shipping. Use **`pnpm ios ship`**
-  (`ios/upload.sh`): compute build number → build dependencies → Release archive →
-  App Store Connect export → gate the exported IPA → upload. Bundle ID:
-  `com.idfon.ios`; team: `RV27HPQNMF`. Xcode must have signing access for this team.
-- **Ship only `ios/build/export/Idfon.ipa` after its gates pass.**
-  `pnpm ios archive` runs the same export + gates without uploading; despite
-  its name, its shipping output is an IPA, not the raw `.xcarchive`.
-  Do not bypass this pipeline with an Organizer upload or an unchecked IPA.
-- Automatic signing can development-sign the raw archive; export re-signs it
-  for distribution. That is not a failure. Do not change the source
-  `aps-environment` value or pin an Xcode-managed profile in manual mode to
-  try to make the archive production-signed. Check the **final IPA**, not
-  the source `.entitlements` file or archive, for shipping correctness.
-- Before upload, require `aps-environment=production` in **both** the app's
-  code-signature entitlements (`codesign -d --entitlements - --xml`) and its
-  embedded profile (`security cms -D -i …/embedded.mobileprovision`), and
-  `get-task-allow` absent or false. Verify bundle/team identity. Never bypass
-  the script's gates for these entitlements, test-rig residue, or bundled
-  APNs `.p8` keys. Apple documents checking both signature and profile in
-  [QA1798](https://developer.apple.com/library/archive/qa/qa1798/_index.html).
-- Upload uses `altool` when `APPLE_ID` + `APPLE_APP_SPECIFIC_PASSWORD` are set;
-  otherwise the script stops with the gated IPA for Transporter. Obtain missing
-  credentials through secure secret input; never commit or print them.
-  **A successful export is not a successful upload.**
-- The build number (`CFBundleVersion`) is computed per run from the UTC clock
-  (`yymmdd.HHMM`) and passed to `xcodebuild`; it is never stored, so shipping
-  changes no tracked file. Do not reintroduce a stored counter in
-  `project.pbxproj` (its `CURRENT_PROJECT_VERSION` is a local-build
-  placeholder). `MARKETING_VERSION` stays in the project and changes only on
-  purpose. Do not run shipping jobs concurrently in the same checkout.
-  If upload status is uncertain, inspect that build in App Store Connect
-  before retrying; do not blindly create another build.
-- Report version/build, IPA path, gate results, and upload/processing status
-  separately. Confirm processing and TestFlight availability in App Store
-  Connect; surface compliance/review blockers rather than guessing answers.
-  After installing from TestFlight, smoke-test a production VoIP push with the
-  phone locked. PushKit uses the signed `aps-environment`: sandbox tokens sent
-  to production APNs fail with `400 BadDeviceToken`, with no rejection callback
-  to the app. Do not claim ringing works until that test passes.
+This repo is one of several cloned side by side (see `README.md`). Changes
+here can break idfon-sdk, idfon-ios and idfon-mac, which build this checkout:
+
+- After a change to a crate the SDK uses, run the SDK's tests from
+  `../idfon-sdk` (its `cargo check` and `scripts/test-cli.sh` build this repo).
+- After a change to `iroh-c-ffi`, `idfon-director` or `swift/`, rebuild the
+  apps (`../idfon-mac/build.sh`, `../idfon-ios/build.sh`).
+- `docs/build.md` maps a change to what must be rebuilt.
 
 ## Checks
 
 - **Verify before retrying.** For network, device, or model checks, keep the returned operation ID and inspect that operation and its events before sending again. Reusing an idempotency key returns the existing operation; it does not re-run it. A new key creates a new request and may create another model turn.
 - **MAST repeat/contradiction warning.** Stop and reconcile the latest tool result with the current process/config state before taking another action. Do not repeat the last command; state what evidence changed or switch to a read-only check.
-- **One iPhone, several threads.** Install and launch through `ios/device.sh`,
-  or wrap any `devicectl` command with `scripts/device-lock.sh <cmd>`. Both take
-  one machine-wide lock (`/tmp/idfon-iphone.lock`), so two threads cannot
-  interleave installs — which otherwise either fails with an SBMainWorkspace
-  denial or silently puts the other thread's build under test.
 
 - Rebuild scope: `docs/build.md` maps a change to the subprojects that must be
   rebuilt. When you change something shared, say which subprojects to rebuild.
@@ -89,7 +52,7 @@ add or materially change a doc, update the index.
   `--push-apns-key-id` for `edge.apns.p8` (C26, regressed as C28). Compose
   refuses to start without the id; never reintroduce a default, and run
   `docs/edge-deploy-checklist.md` §C step 4 after any edge change.
-- **No identifiers in public artifacts.** This repo is public. Keep APNs key
+- **No identifiers in public artifacts.** These repos are public. Keep APNs key
   ids, push tokens, peer/endpoint ids, call UUIDs, droplet IPs and SSH key
   names out of commits, PR titles/bodies, issues and docs. Use placeholders
   (`<key-id>`, `<peer>`) and local files (`~/.idfon/edge.apns.keyid`).
@@ -100,12 +63,3 @@ add or materially change a doc, update the index.
   are tier-approved over iroh. If a change would add a new party to the table,
   update that table first.
 - Rust: `cargo test -p <crate>` and `cargo check --workspace --all-targets`.
-- macOS app: `swift build` in `mac/`.
-- iOS: source files can be syntax-checked with `swiftc -parse <file>`; a full
-  build needs the Xcode project and a physical iPhone (device-only, no simulator).
-- Native shells use the `native-sdk` skill (vendored, installer-managed — do not
-  edit it) plus the project-local `native-sdk-idfon` addendum holding our
-  hard-won rules; iroh work uses the `iroh-protocols` skill (see
-  `.agents/skills/` — shared by all harnesses; no per-harness skill folders).
-  The vendored `native-sdk` is per-machine, not committed: install it with
-  `npx skills add vercel-labs/native`.
