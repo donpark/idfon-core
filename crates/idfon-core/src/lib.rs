@@ -238,10 +238,22 @@ impl TicketDoc {
             && (self.relay.is_none() || self.relay == other.relay)
             && match (&self.path_scope, &other.path_scope) {
                 (None, _) => true,
-                (Some(mine), Some(theirs)) => theirs.starts_with(mine.as_str()),
+                (Some(mine), Some(theirs)) => path_in_scope(theirs, mine),
                 (Some(_), None) => false,
             }
     }
+}
+
+/// `path` is `scope` itself or below it, on a segment boundary: `/fs/public`
+/// covers `/fs/public/a` but not `/fs/publicx`. The one rule for a ticket's
+/// `path_scope`, both when serving and when delegating.
+pub fn path_in_scope(path: &str, scope: &str) -> bool {
+    let scope = scope.trim_end_matches('/');
+    scope.is_empty()
+        || path == scope
+        || path
+            .strip_prefix(scope)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// The capability bytes rcan signs and carries: the ticket document as JSON

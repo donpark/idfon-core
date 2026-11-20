@@ -552,7 +552,10 @@ where
             Ok::<_, std::convert::Infallible>(response)
         }
     });
+    // A client must finish its request head promptly (slowloris).
     hyper::server::conn::http1::Builder::new()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(HEADER_READ_TIMEOUT)
         .serve_connection(io, service)
         .await
 }
@@ -1049,6 +1052,10 @@ pub struct IrohBackend {
 
 /// How long a resolver answer is reused before the peer store is read again.
 const RESOLVE_TTL: Duration = Duration::from_secs(30);
+/// How long a client may take to send its request head.
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a peer may take to answer a proxied request, body included.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl IrohBackend {
     pub fn new(
@@ -1066,6 +1073,21 @@ impl IrohBackend {
 
 impl Backend for IrohBackend {
     async fn fetch(
+        &self,
+        caller: &Caller,
+        account: &str,
+        path: &str,
+    ) -> Result<Resource, GatewayError> {
+        // A peer that never finishes must not hold the request (and its task)
+        // forever.
+        tokio::time::timeout(FETCH_TIMEOUT, self.fetch_inner(caller, account, path))
+            .await
+            .unwrap_or_else(|_| Err(GatewayError::Backend("peer timed out".to_owned())))
+    }
+}
+
+impl IrohBackend {
+    async fn fetch_inner(
         &self,
         caller: &Caller,
         account: &str,
@@ -1105,13 +1127,16 @@ impl Backend for IrohBackend {
             .and_then(|value| value.to_str().ok())
             .unwrap_or("application/octet-stream")
             .to_owned();
-        let body = response
-            .bytes()
-            .await
-            .map_err(|error| GatewayError::Backend(error.to_string()))?
-            .to_vec();
-        if body.len() > MAX_RESOURCE_BYTES {
-            return Err(GatewayError::Backend("resource too large".to_owned()));
+        // Stream with a running cap: a peer must not make the edge buffer an
+        // unbounded body before the size check.
+        let mut body = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = futures_util::StreamExt::next(&mut stream).await {
+            let chunk = chunk.map_err(|error| GatewayError::Backend(error.to_string()))?;
+            if body.len() + chunk.len() > MAX_RESOURCE_BYTES {
+                return Err(GatewayError::Backend("resource too large".to_owned()));
+            }
+            body.extend_from_slice(&chunk);
         }
         Ok(Resource { content_type, body })
     }

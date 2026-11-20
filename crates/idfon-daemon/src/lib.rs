@@ -2280,12 +2280,13 @@ fn ticket_authorizes(state: &ProviderState, raw: &str, path: &str) -> bool {
         return false;
     }
     if let Some(scope) = ticket.path_scope() {
-        if !path.starts_with(scope) {
+        if !idfon_core::path_in_scope(path, scope) {
             return false;
         }
     }
     true
 }
+
 
 /// `<data_dir>/staging/<identity>/<id>` for a validated relative `id`. This is
 /// the transient accumulator for a chunked `media.resource.put`: the bytes are
@@ -7185,6 +7186,17 @@ impl Drop for SocketCleanup {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn path_scope_matches_whole_segments() {
+        assert!(idfon_core::path_in_scope("/fs/public", "/fs/public"));
+        assert!(idfon_core::path_in_scope("/fs/public/a.txt", "/fs/public"));
+        assert!(idfon_core::path_in_scope("/fs/public/a.txt", "/fs/public/"));
+        assert!(!idfon_core::path_in_scope("/fs/publicx/secret", "/fs/public"));
+        assert!(!idfon_core::path_in_scope("/fs/publi", "/fs/public"));
+        assert!(!idfon_core::path_in_scope("/fs/other", "/fs/public"));
+        assert!(idfon_core::path_in_scope("/fs/anything", "/"));
+    }
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
