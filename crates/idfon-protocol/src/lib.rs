@@ -9,6 +9,7 @@ pub mod calls;
 pub mod diag;
 pub mod room_call;
 pub mod rpc;
+pub mod speech;
 pub mod vcf;
 pub use artifacts::*;
 pub use blocks::*;
