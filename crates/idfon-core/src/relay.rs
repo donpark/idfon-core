@@ -54,10 +54,14 @@ impl RelayConfig {
         (urls.is_some() || token.is_some() || only).then_some(RelayConfig { urls, token, only })
     }
 
+    /// `[relay]` in `~/.idfon/config.toml` (the legacy `relay.conf` fills
+    /// keys it leaves unset; see `idfon_config`).
     fn from_file() -> Option<RelayConfig> {
-        std::fs::read_to_string(config_path())
-            .ok()
-            .and_then(|text| parse_config(&text))
+        let urls = non_empty(idfon_config::file_value("IDFON_RELAY_URLS"));
+        let token = non_empty(idfon_config::file_value("IDFON_RELAY_TOKEN"));
+        let only = idfon_config::file_value("IDFON_RELAY_ONLY")
+            .is_some_and(|value| is_truthy(&value));
+        (urls.is_some() || token.is_some() || only).then_some(RelayConfig { urls, token, only })
     }
 
     /// The effective relay map: `Some(Custom)` when URLs are configured,
@@ -127,7 +131,7 @@ pub fn apply(builder: Builder, config: &RelayConfig) -> Builder {
 /// public keys, not PKI.
 fn ca_override() -> Option<iroh::tls::CaTlsConfig> {
     use rustls_pki_types::{pem::PemObject, CertificateDer};
-    let path = std::env::var_os("IDFON_RELAY_CA_FILE")?;
+    let path = idfon_config::get("IDFON_RELAY_CA_FILE")?;
     let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(path)
         .ok()?
         .filter_map(Result::ok)
@@ -135,45 +139,9 @@ fn ca_override() -> Option<iroh::tls::CaTlsConfig> {
     (!certs.is_empty()).then(|| iroh::tls::CaTlsConfig::custom_roots(certs))
 }
 
-/// The persisted configuration file: `~/.idfon/relay.conf`.
+/// The persisted configuration file: `~/.idfon/config.toml` (`[relay]`).
 pub fn config_path() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default();
-    home.join(".idfon").join("relay.conf")
-}
-
-/// Parses `key=value` lines (`urls`, `token`, `only`; `#` comments). `None`
-/// when the text sets nothing, so an empty file falls through to lower tiers.
-fn parse_config(text: &str) -> Option<RelayConfig> {
-    let mut config = RelayConfig::default();
-    let mut any = false;
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        let value = value.trim();
-        match key.trim() {
-            "urls" if !value.is_empty() => {
-                config.urls = Some(value.to_string());
-                any = true;
-            }
-            "token" if !value.is_empty() => {
-                config.token = Some(value.to_string());
-                any = true;
-            }
-            "only" => {
-                config.only = is_truthy(value);
-                any = true;
-            }
-            _ => {}
-        }
-    }
-    any.then_some(config)
+    idfon_config::paths::config_file()
 }
 
 fn non_empty(value: Option<String>) -> Option<String> {
@@ -263,18 +231,4 @@ mod tests {
         assert!(config.relay_mode().is_none());
     }
 
-    #[test]
-    fn parse_config_reads_the_three_keys() {
-        let config = parse_config(
-            "# comment\n\nurls=https://relay.example:8443, https://b.example\ntoken=a=b c\nonly=1\n",
-        )
-        .expect("configured");
-        assert_eq!(
-            config.urls.as_deref(),
-            Some("https://relay.example:8443, https://b.example")
-        );
-        assert_eq!(config.token.as_deref(), Some("a=b c"));
-        assert!(config.only);
-        assert!(parse_config("# nothing\n").is_none());
-    }
 }

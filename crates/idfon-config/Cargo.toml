@@ -1,0 +1,9 @@
+[package]
+name = "idfon-config"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+description = "Where idfon keeps things (home, data, socket, config file) and its settings: one name per setting, env var over ~/.idfon/config.toml."
+
+[dependencies]
+toml = "1"

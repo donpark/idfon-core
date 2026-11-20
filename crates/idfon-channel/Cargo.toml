@@ -13,6 +13,7 @@ tokio = { version = "1", features = ["rt", "io-util", "sync", "macros"] }
 tracing = "0.1"
 
 [dev-dependencies]
+idfon-config = { path = "../idfon-config" }
 axum = { version = "0.8", features = ["ws"] }
 futures-util = "0.3"
 http = "1"

@@ -835,8 +835,7 @@ mod tests {
 
         // `IDFON_RELAY_ONLY=1` forces the relay path (idfon-core clears the IP
         // transports); the explicit-loopback dial cannot work then.
-        let relay_only = std::env::var("IDFON_RELAY_ONLY")
-            .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
+        let relay_only = idfon_config::flag("IDFON_RELAY_ONLY").unwrap_or(false);
         let target = match (&direct, relay_only) {
             (Some(direct), false) => direct.clone(),
             _ => addr.clone(),
