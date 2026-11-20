@@ -8,7 +8,6 @@
 //! the FFI wrapper in `crates/iroh-c-ffi/src/client.rs` (used by the
 //! Zig app host) and the `idfon` CLI.
 
-use std::env;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
@@ -16,7 +15,6 @@ use std::time::{Duration, Instant};
 use idfon_protocol::{Request, Response, MAX_FRAME_BYTES, PROTOCOL_VERSION};
 
 pub const DEFAULT_SOCKET: &str = "/tmp/idfon/idfond.sock";
-const PROFILE_MAX_CHARS: usize = 64;
 const CONNECT_POLL: Duration = Duration::from_millis(100);
 
 /// Methods whose daemon responses are hand-encoded binary payloads instead of
@@ -156,26 +154,21 @@ fn request_expects_binary_response(request: &[u8]) -> bool {
 ///   truncates at 64 before validating) -> fall back to the default path
 /// - otherwise `/tmp/idfon-{profile}/idfond.sock`
 pub fn socket_path_for(profile: Option<&[u8]>) -> String {
-    let raw: Vec<u8> = match profile {
-        Some(bytes) if !bytes.is_empty() => bytes.to_vec(),
-        _ => match env::var_os("IDFON_PROFILE") {
-            Some(value) if !value.is_empty() => value.as_encoded_bytes().to_vec(),
-            _ => return DEFAULT_SOCKET.into(),
+    // Non-UTF-8 bytes can never form a valid profile: default path.
+    let explicit = match profile {
+        Some(bytes) if !bytes.is_empty() => match std::str::from_utf8(bytes) {
+            Ok(text) => Some(text),
+            Err(_) => return DEFAULT_SOCKET.into(),
         },
+        _ => None,
     };
-    // Mirror Zig: the profile scan stops after PROFILE_MAX_CHARS bytes.
-    let bytes = &raw[..raw.len().min(PROFILE_MAX_CHARS)];
-    if bytes == b"default" {
-        return DEFAULT_SOCKET.into();
-    }
-    let valid = bytes
-        .iter()
-        .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-' || *byte == b'_');
-    if !valid || bytes.is_empty() {
-        return DEFAULT_SOCKET.into();
-    }
-    let profile = String::from_utf8(bytes.to_vec()).expect("validated ASCII");
-    format!("/tmp/idfon-{profile}/idfond.sock")
+    let profile = match explicit {
+        Some(text) => idfon_config::paths::valid_profile(text),
+        None => idfon_config::paths::profile(None),
+    };
+    idfon_config::paths::socket(profile.as_deref())
+        .display()
+        .to_string()
 }
 
 #[cfg(test)]
@@ -244,7 +237,7 @@ mod tests {
     #[test]
     fn socket_path_table() {
         let _guard = ENV_LOCK.lock().unwrap();
-        env::remove_var("IDFON_PROFILE");
+        std::env::remove_var("IDFON_PROFILE");
         assert_eq!(socket_path_for(None), "/tmp/idfon/idfond.sock");
         assert_eq!(socket_path_for(Some(b"default")), "/tmp/idfon/idfond.sock");
         assert_eq!(socket_path_for(Some(b"")), "/tmp/idfon/idfond.sock");
@@ -259,11 +252,11 @@ mod tests {
         assert_eq!(socket_path_for(Some(&long)), format!("/tmp/idfon-{}/idfond.sock", "a".repeat(64)));
         assert_eq!(socket_path_for(Some(&vec![b'a'; 64])), format!("/tmp/idfon-{}/idfond.sock", "a".repeat(64)));
 
-        env::set_var("IDFON_PROFILE", "bob");
+        std::env::set_var("IDFON_PROFILE", "bob");
         assert_eq!(socket_path_for(None), "/tmp/idfon-bob/idfond.sock");
         // Explicit profile beats the env var.
         assert_eq!(socket_path_for(Some(b"carol")), "/tmp/idfon-carol/idfond.sock");
-        env::remove_var("IDFON_PROFILE");
+        std::env::remove_var("IDFON_PROFILE");
     }
 
     #[test]

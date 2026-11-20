@@ -6,8 +6,11 @@ license.workspace = true
 description = "Launcher binary for the idfon daemon; all logic lives in libiroh_c_ffi (idfon_daemon_run)."
 build = "build.rs"
 
-# No runtime [dependencies]: the daemon core is reached through
-# libiroh_c_ffi.dylib (see build.rs and crates/iroh-c-ffi/src/daemon.rs).
+# The daemon core is reached through libiroh_c_ffi.dylib (see build.rs and
+# crates/iroh-c-ffi/src/daemon.rs); these deps only parse flags and paths.
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+idfon-config = { path = "../idfon-config" }
 
 [dev-dependencies]
 serde_json = "1"

@@ -483,8 +483,7 @@ mod tests {
         // Dial the bound port explicitly: advertised addresses on a VPN host
         // resolve to the relay, which measures the relay instead. With
         // `IDFON_RELAY_ONLY=1` that *is* the point: a real network path.
-        let relay_only = std::env::var("IDFON_RELAY_ONLY")
-            .is_ok_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
+        let relay_only = idfon_config::flag("IDFON_RELAY_ONLY").unwrap_or(false);
         let bound = match server.endpoint().bound_sockets().first() {
             Some(_) if !relay_only => server.endpoint().bound_sockets().first().map(|socket| socket.port()),
             _ => None,

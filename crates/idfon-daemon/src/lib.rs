@@ -558,8 +558,7 @@ impl Store {
     /// The inbound MCP relay command: `IDFON_MCP_COMMAND` (per-process, keeps
     /// the C ABI unchanged) overrides the persisted `mcp.configure` value.
     fn configured_mcp_command(&self) -> Option<String> {
-        std::env::var("IDFON_MCP_COMMAND")
-            .ok()
+        idfon_config::get("IDFON_MCP_COMMAND")
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty())
             .or_else(|| {
@@ -698,8 +697,7 @@ pub fn run_blocking(config: DaemonConfig) -> io::Result<()> {
     idfon_telemetry::init("idfond", "info");
     // IDFON_IDLE_EXIT_SECS lets the thin `idfond` binary / CLI-spawned
     // daemons opt into idle shutdown without touching the C ABI. "0" = off.
-    let env_idle_exit = std::env::var("IDFON_IDLE_EXIT_SECS")
-        .ok()
+    let env_idle_exit = idfon_config::get("IDFON_IDLE_EXIT_SECS")
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|&secs| secs > 0)
         .map(Duration::from_secs);
@@ -1696,19 +1694,13 @@ impl Backend for GatewayBackend {
 /// Edge base URL + opaque credentials from the environment. An empty URL means
 /// no edge leg.
 fn edge_config() -> (Option<String>, Vec<(String, String)>) {
-    let base = std::env::var("IDFON_EDGE_URL")
-        .ok()
-        .filter(|value| !value.trim().is_empty());
+    let base = idfon_config::get("IDFON_EDGE_URL");
     let mut headers = Vec::new();
-    if let Ok(token) = std::env::var("IDFON_EDGE_TOKEN") {
-        if !token.trim().is_empty() {
-            headers.push(("Authorization".to_owned(), format!("Bearer {token}")));
-        }
+    if let Some(token) = idfon_config::get("IDFON_EDGE_TOKEN") {
+        headers.push(("Authorization".to_owned(), format!("Bearer {token}")));
     }
-    if let Ok(ticket) = std::env::var("IDFON_EDGE_TICKET") {
-        if !ticket.trim().is_empty() {
-            headers.push(("x-idfon-ticket".to_owned(), ticket));
-        }
+    if let Some(ticket) = idfon_config::get("IDFON_EDGE_TICKET") {
+        headers.push(("x-idfon-ticket".to_owned(), ticket));
     }
     (base, headers)
 }
@@ -2136,10 +2128,9 @@ async fn hash_file(path: &str) -> std::io::Result<(String, u64)> {
     Ok((hex, size))
 }
 
+/// A setting: env var, else `~/.idfon/config.toml` (see `idfon_config`).
 fn env_value(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
+    idfon_config::get(name)
 }
 
 /// The public edge URL for a resource. A real endpoint id on an `https://`

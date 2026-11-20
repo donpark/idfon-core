@@ -19,15 +19,18 @@ it at runtime. Precedence is **parameter > configuration > default**, merged
 
    - the apps' **Relay** settings (iOS: peer-list screen, mac: menu sheet),
      stored in `UserDefaults` and applied at process start;
-   - `~/.idfon/relay.conf` for headless daemons/CLI:
+   - `[relay]` in `~/.idfon/config.toml` for headless daemons/CLI (see
+     `docs/config.md`; the legacy `~/.idfon/relay.conf` is still read for
+     keys `config.toml` leaves unset):
 
-     ```
-     # urls: comma-separated https://… relay URLs (overrides the N0 set)
-     urls=https://relay.example:8443
-     # token: shared bearer token; leave unset for allowlist / HTTP-callout relays
-     token=…
-     # only: 1 = relay-only — drop IP transports (enterprise NAT / tests)
-     only=0
+     ```toml
+     [relay]
+     # comma-separated https://… relay URLs (overrides the N0 set)
+     urls = "https://relay.example:8443"
+     # shared bearer token; leave unset for allowlist / HTTP-callout relays
+     token = "…"
+     # relay-only: drop IP transports (enterprise NAT / tests)
+     only = false
      ```
 
 3. **default** — the N0 public relay set (the iroh preset). Out of the box
@@ -44,9 +47,8 @@ map: it drops IP transports so the endpoint publishes no direct addresses.
 **Trust anchors.** The relay client verifies the relay's TLS certificate
 against Mozilla's roots. A relay with a **private CA** (self-hosted, or the
 patchbay lab) needs `IDFON_RELAY_CA_FILE=<pem>` — a PEM bundle trusted
-*instead of* the public roots (`idfon_core::relay::ca_override`). It is
-environment-only, not a `relay.conf` field: it is a deployment fact, not a
-user choice. Peer connections are unaffected — they authenticate with raw
+*instead of* the public roots (`idfon_core::relay::ca_override`). It can
+also be set as `relay.ca_file` in `config.toml`. Peer connections are unaffected — they authenticate with raw
 public keys, not PKI.
 
 Worked examples (per field):
@@ -62,7 +64,7 @@ Worked examples (per field):
 
 | Process | Configuration | Parameter |
 | --- | --- | --- |
-| `idfond` | `~/.idfon/relay.conf` | `--relay-…` flags, `IDFON_RELAY_*` |
+| `idfond` | `[relay]` in `~/.idfon/config.toml` | `--relay-…` flags, `IDFON_RELAY_*` |
 | `idfon` CLI | (its daemon's) | `--relay-…` flags, forwarded to the daemon it auto-starts |
 | mac app | **Relay** settings (UserDefaults) | launch args; passed to the spawned `idfond` as flags and to the app's in-process media endpoints via the FFI setter |
 | iOS app | **Relay** settings (UserDefaults) | launch args; the in-process daemon + media endpoints via the FFI setter |
@@ -83,4 +85,4 @@ The apps link prebuilt Rust artifacts (`ios/Vendor/…/libiroh_c_ffi.a`,
 `mac/build-deps.sh`). A change in `idfon-core` reaches the apps only after
 those scripts re-stage the libs — see `docs/build.md`. The relay selection
 above is read at runtime, so once the libs are current, changing relay needs
-**no rebuild**: settings, a launch arg, a flag, or `~/.idfon/relay.conf`.
+**no rebuild**: settings, a launch arg, a flag, or `~/.idfon/config.toml`.

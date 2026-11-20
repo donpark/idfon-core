@@ -6,6 +6,7 @@ license.workspace = true
 description = "Daemon IPC client: length-prefixed JSON frames over a Unix socket, plus socket path, retry, and response validation."
 
 [dependencies]
+idfon-config = { path = "../idfon-config" }
 idfon-protocol = { path = "../idfon-protocol" }
 serde = "1"
 serde_json = "1"
