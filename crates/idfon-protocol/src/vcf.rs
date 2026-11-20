@@ -81,6 +81,18 @@ pub fn contact_ticket_link(ticket: &ContactTicket) -> String {
     link_for_json(&serde_json::to_string(ticket).expect("contact ticket serializes"))
 }
 
+/// Parses an `idfon://add/<base64url>` deep link back into its ticket.
+pub fn contact_ticket_from_link(link: &str) -> Result<ContactTicket, String> {
+    let encoded = link
+        .trim()
+        .strip_prefix(TICKET_URL_PREFIX)
+        .ok_or_else(|| format!("expected {TICKET_URL_PREFIX}<base64url>"))?;
+    let bytes = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|error| format!("invalid link encoding: {error}"))?;
+    serde_json::from_slice(&bytes).map_err(|error| format!("invalid contact ticket: {error}"))
+}
+
 /// Wraps a contact ticket in a vCard 3.0 card (CRLF line endings).
 pub fn contact_ticket_vcard(ticket: &ContactTicket) -> String {
     let name = ticket
