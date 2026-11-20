@@ -917,7 +917,7 @@ async fn serve(
             }
         };
         with_session_identity(&mut request, &session_identity);
-        if request.method == "events"
+        if request.method == "event.list"
             && request
                 .params
                 .get("follow")
@@ -965,17 +965,23 @@ async fn serve(
     }
 }
 
-/// Per-request identity defaulting: an explicit `identity` param wins,
+/// Per-request canonicalization (`rpc::normalize_request`: legacy method
+/// names and the `peer` param) and identity defaulting: an explicit
+/// `identity` param wins,
 /// otherwise the session identity fills both (`__identity` carries the
 /// resolved value for handlers). Idempotent.
 fn with_session_identity(request: &mut Request, session_identity: &str) {
+    idfon_protocol::rpc::normalize_request(request);
     if let Some(params) = request.params.as_object_mut() {
-        params
-            .entry("identity")
-            .or_insert_with(|| serde_json::Value::String(session_identity.to_owned()));
-        params
-            .entry("__identity")
-            .or_insert_with(|| serde_json::Value::String(session_identity.to_owned()));
+        for key in ["identity", "__identity"] {
+            // An explicit `null` counts as absent, like a missing key.
+            if params.get(key).is_none_or(serde_json::Value::is_null) {
+                params.insert(
+                    key.into(),
+                    serde_json::Value::String(session_identity.to_owned()),
+                );
+            }
+        }
     }
 }
 
@@ -1009,7 +1015,7 @@ async fn handle_request(
     session_identity: &mut String,
 ) -> io::Result<Vec<u8>> {
     with_session_identity(&mut request, session_identity);
-    if request.method == "wait" {
+    if request.method == "event.wait" {
         let timeout = request
             .params
             .get("timeout_ms")
@@ -1026,16 +1032,16 @@ async fn handle_request(
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
     }
-    if request.method == "peers.compact" {
+    if request.method == "peer.list.compact" {
         return Ok(compact_peers(
             store,
             request_text(&request.params, "identity").as_deref(),
         ));
     }
-    if request.method == "identities.compact" {
+    if request.method == "identity.list.compact" {
         return Ok(compact_identities(store));
     }
-    if request.method == "events.compact" {
+    if request.method == "event.list.compact" {
         let after = request_text(&request.params, "after");
         return Ok(compact_events(
             store,
@@ -1057,7 +1063,7 @@ async fn handle_request(
     if request.method == "web.url" {
         return encode_json(&web_url(&request)).map_err(io::Error::other);
     }
-    if request.method == "files.publish" {
+    if request.method == "file.publish" {
         return encode_json(&files_publish(&request).await).map_err(io::Error::other);
     }
     if request.method == "provider.start" {
@@ -2468,7 +2474,7 @@ const RELAY_ENROLL_MUTATIONS: &[&str] = &[
     "peer.remove",
     "identity.create",
     "identity.delete",
-    "events.merge",
+    "event.merge",
 ];
 
 fn dispatch(request: Request, store: &Arc<Mutex<Store>>) -> Response {
@@ -2491,10 +2497,11 @@ fn transport_not_ready(request: &Request) -> Response {
 }
 
 fn dispatch_with_transport(
-    request: Request,
+    mut request: Request,
     store: &Arc<Mutex<Store>>,
     transport: Option<&Arc<TransportMode>>,
 ) -> Response {
+    idfon_protocol::rpc::normalize_request(&mut request);
     if let Err(error) = validate_request(&request) {
         let (code, message) = match error {
             idfon_protocol::ProtocolError::InvalidVersion(version) => (
@@ -2523,15 +2530,15 @@ fn dispatch_with_transport(
         "operation.get" => operation_get(&request, store),
         "operation.wait" => operation_wait(&request, store),
         "operation.cancel" => operation_cancel(&request, store),
-        "events" => events(&request, store),
-        "events.export" => events_export(&request, store),
-        "events.sync" => events_sync(&request, store, transport),
-        "events.merge" => events_merge(&request, store),
-        "wait" => wait_event(&request, store),
+        "event.list" => events(&request, store),
+        "event.export" => events_export(&request, store),
+        "event.sync" => events_sync(&request, store, transport),
+        "event.merge" => events_merge(&request, store),
+        "event.wait" => wait_event(&request, store),
         "contact.ticket" => contact_ticket(&request, store, transport),
         "contact.export" => contact_export(&request, store, transport),
         "contact.import" => contact_import(&request, store, transport),
-        "status" | "context" => {
+        "daemon.status" => {
             let state = store.lock().expect("store mutex poisoned");
             let identity_ref =
                 request_text(&request.params, "identity").unwrap_or_else(|| "default".into());
@@ -2556,15 +2563,15 @@ fn dispatch_with_transport(
                 }),
             )
         }
-        "identities" => {
+        "identity.list" => {
             let state = store.lock().expect("store mutex poisoned");
             success(
                 &request,
                 serde_json::json!({"identities": state.identities}),
             )
         }
-        "identities.compact" => success(&request, serde_json::json!(compact_identities(store))),
-        "peers" => {
+        "identity.list.compact" => success(&request, serde_json::json!(compact_identities(store))),
+        "peer.list" => {
             let state = store.lock().expect("store mutex poisoned");
             let identity = request_text(&request.params, "identity");
             let peers: Vec<_> = state
@@ -2635,23 +2642,23 @@ fn dispatch_with_transport(
         "mcp.listen" => mcp::listen(&request, store, transport),
         "mcp.configure" => mcp_configure(&request, store),
         "access.grant" => access_grant(&request, store),
-        "capability.ticket" => capability_ticket_issue(&request, store),
-        "capability.ticket.revoke" => capability_ticket_revoke(&request, store),
+        "access.ticket" => capability_ticket_issue(&request, store),
+        "access.ticket.revoke" => capability_ticket_revoke(&request, store),
         "access.revoke" => access_revoke(&request, store),
         "access.check" => access_check(&request, store),
-        "media.session.start" => media_session_start(&request, store),
-        "media.session.stop" => media_session_stop(&request, store),
-        "media.resource.put" => media_resource_put(&request, store),
-        "media.resource.fetch" => media_resource_fetch(&request, store),
-        "media.sessions" => media_sessions(&request, store),
-        "media.live.publish" => live::live_publish(&request),
-        "media.live.dial" => live_dial_dispatch(&request, store),
-        "media.live.answer" => {
+        "session.start" => media_session_start(&request, store),
+        "session.stop" => media_session_stop(&request, store),
+        "blob.put" => media_resource_put(&request, store),
+        "blob.get" => media_resource_fetch(&request, store),
+        "session.list" => media_sessions(&request, store),
+        "live.publish" => live::live_publish(&request),
+        "live.dial" => live_dial_dispatch(&request, store),
+        "live.answer" => {
             live::live_answer(&request, transport, &resolved_identity_id(&request, store))
         }
-        "media.live.stop" => live::live_stop(&request),
-        "media.live.subscribe" => live::live_subscribe(&request),
-        "media.live.publishers" => live::live_publishers(&request),
+        "live.stop" => live::live_stop(&request),
+        "live.subscribe" => live::live_subscribe(&request),
+        "live.list" => live::live_publishers(&request),
         "policy.set" => policy_set(&request, store),
         "policy.dry_run" => policy_dry_run(&request, store),
         "identity.create" => identity_create(&request, store),
@@ -7326,6 +7333,58 @@ mod tests {
             .unwrap();
         let response: Response = serde_json::from_slice(&frame).unwrap();
         assert!(response.ok);
+    }
+
+    /// Canonical names, legacy aliases, the `peer` param and a `null`
+    /// identity all reach the same handlers.
+    #[test]
+    fn canonical_and_legacy_method_names_are_equivalent() {
+        use idfon_protocol::rpc;
+        let dir = temp_dir("canonical-names");
+        let store = Arc::new(Mutex::new(Store::load(&dir).unwrap()));
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let call = |request: Request| -> Response {
+            let frame = runtime
+                .block_on(handle_request(
+                    request,
+                    &store,
+                    None,
+                    &mut String::from("default"),
+                ))
+                .unwrap();
+            serde_json::from_slice(&frame).unwrap()
+        };
+        let add = call(Request::call(
+            "a",
+            &rpc::PeerAdd {
+                peer: Some("bob".into()),
+                id: Some("bob".into()),
+                name: Some("Bob".into()),
+                endpoint_id: Some("ep-bob".into()),
+                ..Default::default()
+            },
+        ));
+        assert!(add.ok, "{add:?}");
+        for method in ["peers", "peer.list"] {
+            let response = call(Request {
+                version: PROTOCOL_VERSION,
+                id: "l".into(),
+                method: method.into(),
+                params: serde_json::json!({"identity": null}),
+            });
+            let ResponseBody::Success { operation, result } = &response.body else {
+                panic!("{method}: {response:?}");
+            };
+            assert_eq!(operation, "peer.list");
+            assert_eq!(result["peers"][0]["name"], "Bob", "{method}");
+        }
+        let show = call(Request {
+            version: PROTOCOL_VERSION,
+            id: "s".into(),
+            method: "peer.show".into(),
+            params: serde_json::json!({"peer": "Bob"}),
+        });
+        assert!(show.ok, "{show:?}");
     }
 
     #[test]
