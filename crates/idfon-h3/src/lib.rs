@@ -27,7 +27,7 @@ use tokio::task::JoinHandle;
 pub use iroh_h3_axum::RemoteId;
 
 /// Application protocol for HTTP/3 request/response inside idfon.
-pub const ALPN: &[u8] = b"idfon/http3/1";
+pub const ALPN: &[u8] = idfon_core::alpn::HTTP3;
 
 /// A running HTTP/3 server. Dropping it stops accepting new connections (the
 /// ALPN stays registered on the endpoint).

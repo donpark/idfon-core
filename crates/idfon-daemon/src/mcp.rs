@@ -25,7 +25,7 @@ use crate::{
     error_response, has_grant, request_text, resolved_identity_id, success, Store, TransportMode,
 };
 
-pub const MCP_ALPN: &[u8] = b"idfon/mcp/1";
+pub const MCP_ALPN: &[u8] = idfon_core::alpn::MCP;
 
 /// Registers the inbound relay on one identity's transport. Called once per
 /// identity at daemon startup; the served command is resolved per connection

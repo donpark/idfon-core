@@ -7,6 +7,7 @@ use rcan::{Capability as RcanCapability, Delegation, Expires};
 use serde::Serialize;
 use thiserror::Error;
 
+pub mod alpn;
 pub mod path;
 // Gossip + tokio I/O are native-only; the wasm build (Cloudflare Worker) uses
 // only the security helpers in this file.
@@ -343,6 +344,86 @@ fn sign_ticket(
     CapabilityTicket::from_delegation(Delegation::issue(key, audience, &DocText(json), expires))
 }
 
+/// What a capability ticket grants, to whom, for how long. One struct in
+/// place of the `issue_capability_ticket*` variants (which remain as thin
+/// wrappers):
+///
+/// ```ignore
+/// let ticket = TicketSpec::new("t-1")
+///     .subject(peer_id)
+///     .grant(Capability::MessageReceive)
+///     .expires_at("2026-12-31T23:59:59Z")
+///     .issue(&key)?;
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct TicketSpec {
+    /// The peer the ticket is bound to; `None` = a public (bearer) ticket.
+    pub subject: Option<String>,
+    /// Limit to one conversation (room).
+    pub conversation: Option<String>,
+    pub capabilities: Vec<Capability>,
+    /// RFC 3339; `None` = never expires.
+    pub expires_at: Option<String>,
+    pub ticket_id: String,
+    /// How the issuer wants voice carried (signed into the ticket).
+    pub voice: Option<VoiceRoute>,
+    /// Resource path prefix (e.g. `/fs/public`); signed, cannot be widened.
+    pub path_scope: Option<String>,
+}
+
+impl TicketSpec {
+    pub fn new(ticket_id: impl Into<String>) -> Self {
+        Self {
+            ticket_id: ticket_id.into(),
+            ..Self::default()
+        }
+    }
+
+    pub fn subject(mut self, subject: impl Into<String>) -> Self {
+        self.subject = Some(subject.into());
+        self
+    }
+
+    pub fn conversation(mut self, conversation: impl Into<String>) -> Self {
+        self.conversation = Some(conversation.into());
+        self
+    }
+
+    pub fn grant(mut self, capability: Capability) -> Self {
+        self.capabilities.push(capability);
+        self
+    }
+
+    pub fn expires_at(mut self, expires_at: impl Into<String>) -> Self {
+        self.expires_at = Some(expires_at.into());
+        self
+    }
+
+    pub fn voice(mut self, voice: VoiceRoute) -> Self {
+        self.voice = Some(voice);
+        self
+    }
+
+    pub fn path_scope(mut self, path_scope: impl Into<String>) -> Self {
+        self.path_scope = Some(path_scope.into());
+        self
+    }
+
+    /// Sign the ticket with the issuer's key.
+    pub fn issue(self, key: &SigningKey) -> Result<CapabilityTicket, AuthError> {
+        issue_capability_ticket_with_voice(
+            key,
+            self.subject,
+            self.conversation,
+            self.capabilities,
+            self.expires_at,
+            self.ticket_id,
+            self.voice,
+            self.path_scope,
+        )
+    }
+}
+
 pub fn issue_capability_ticket(
     key: &SigningKey,
     subject: Option<String>,
@@ -638,6 +719,29 @@ fn hex_digit(value: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ticket_spec_issues_what_it_says() {
+        let issuer = generate_identity();
+        let holder = generate_identity();
+        let ticket = TicketSpec::new("t-spec")
+            .subject(peer_id(&holder))
+            .grant(Capability::MessageReceive)
+            .conversation("room-1")
+            .path_scope("/fs/public")
+            .expires_at("2099-01-01T00:00:00Z")
+            .issue(&issuer)
+            .unwrap();
+        let ticket = CapabilityTicket::decode(&ticket.token()).unwrap();
+        assert_eq!(ticket.issuer(), peer_id(&issuer));
+        assert_eq!(ticket.subject(), Some(peer_id(&holder)));
+        assert_eq!(ticket.capabilities(), &[Capability::MessageReceive]);
+        assert_eq!(ticket.conversation(), Some("room-1"));
+        assert_eq!(ticket.path_scope(), Some("/fs/public"));
+        assert_eq!(ticket.ticket_id(), "t-spec");
+        assert!(ticket.expires_at().is_some());
+        assert!(!ticket.bearer());
+    }
     use idfon_protocol::VoiceMode;
 
     #[test]

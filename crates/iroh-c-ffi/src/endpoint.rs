@@ -1368,7 +1368,7 @@ mod tests {
         let _guard = crate::util::MEDIA_TEST_GUARD
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let alpn: vec::Vec<u8> = b"idfon-chat/1".to_vec().into();
+        let alpn: vec::Vec<u8> = idfon_core::alpn::CHAT.to_vec().into();
         let mut server_config = endpoint_config_default();
         endpoint_config_add_alpn(&mut server_config, alpn.as_ref());
         let mut client_config = endpoint_config_default();

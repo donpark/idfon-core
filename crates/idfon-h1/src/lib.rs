@@ -44,7 +44,7 @@ use tokio::{sync::mpsc, task::JoinHandle};
 pub use http_body_util::BodyExt;
 
 /// Application protocol for HTTP/1.1 over iroh.
-pub const ALPN: &[u8] = b"idfon/http1/1";
+pub const ALPN: &[u8] = idfon_core::alpn::HTTP1;
 
 /// The [`EndpointId`] of the peer that dialed this connection, available to
 /// handlers as a request extension / extractor.
@@ -85,10 +85,11 @@ impl Drop for H1Server {
 
 /// Serves an axum `router` to peers over `transport`'s existing endpoint.
 ///
-/// Run this alongside the transport's message accept loop
-/// ([`IrohTransport::serve`]): that loop dispatches inbound connections by
-/// ALPN, so without it no h1 connection is ever accepted. The h1, h3 and
-/// message ALPNs coexist on one endpoint.
+/// The transport must be accepting: use `IrohTransport::builder().spawn()`
+/// (an [`idfon_core::transport::Node`]; pass `node.transport()`), or run
+/// [`IrohTransport::serve`] yourself. The accept loop dispatches inbound
+/// connections by ALPN, so without it no h1 connection is ever accepted. The
+/// h1, h3 and message ALPNs coexist on one endpoint.
 pub fn serve_router(transport: &Arc<IrohTransport>, router: Router) -> H1Server {
     let (tx, mut rx) = mpsc::channel(16);
     let guard = transport.add_side_channel(ALPN, tx);
@@ -335,6 +336,29 @@ mod tests {
                 })
                 .await;
         })
+    }
+
+    /// The front door: a spawned Node serves h1 with no hand-run accept loop.
+    #[tokio::test]
+    async fn node_builder_serves_h1_without_a_manual_accept_loop() {
+        let node = IrohTransport::builder()
+            .secret_key(test_key())
+            .spawn()
+            .await
+            .expect("node spawns");
+        let client_transport = Arc::new(
+            IrohTransport::builder()
+                .secret_key(test_key())
+                .bind()
+                .await
+                .expect("client binds"),
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(5), node.endpoint().online()).await;
+        let app = Router::new().route("/hi", get(|| async { "hi from node" }));
+        let _server = serve_router(node.transport(), app);
+        let client = H1Client::new(&client_transport);
+        let body = get_body(&client, &node.endpoint().addr(), "/hi").await;
+        assert_eq!(body, Bytes::from_static(b"hi from node"));
     }
 
     async fn get_body(client: &H1Client, peer: &EndpointAddr, path: &str) -> Bytes {

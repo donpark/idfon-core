@@ -18,7 +18,7 @@ use tokio::{
     process::Command,
 };
 
-const MCP_ALPN: &[u8] = b"idfon/mcp/1";
+const MCP_ALPN: &[u8] = idfon_core::alpn::MCP;
 
 #[derive(Parser)]
 #[command(

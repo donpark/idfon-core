@@ -23,7 +23,7 @@ use idfon_media::health::{
 
 /// The health-check ALPN: one request, one `Leg` reply, on the call's own
 /// endpoint (docs/media-adaptation.md §B2.2).
-pub const HEALTH_ALPN: &[u8] = b"idfon-health/1";
+pub const HEALTH_ALPN: &[u8] = idfon_core::alpn::HEALTH;
 
 /// One reading of the link a subscription plays over, in the shape the
 /// health record, the status line and the audio rendition policy read.
