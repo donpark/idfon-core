@@ -29,6 +29,40 @@ format its own blocks invents vocabulary — on the image turn it fabricated a
 tool named `image` from the prompt's own `[image] …` line. Keep the producer
 side as tool calls or structured output, and the wire as blocks.
 
+**Who writes an envelope: tools, never the model.** Every tool that produces
+something for the caller attaches its envelope to the turn's reply through the
+outbox (`integrations/eve-idfon/extension/outbox.ts`), in tool-call order.
+Tools return plain fields (`ticket`, `size_bytes`, `delivered`), never an
+`envelope` string for the model to paste.
+
+| tool | attaches |
+| --- | --- |
+| `speak` | `IDFON-SPEAK/1` |
+| `add_artifact` | `IDFON-ARTIFACT/1` |
+| `point` / `show` / `screenshot` / `render` | `IDFON-POINT/1` / `IDFON-SHOW/1` / `IDFON-SCREENSHOT/1` / `IDFON-RENDER/1` |
+| `put` | `IDFON-DATA/1` (a file the caller can save) |
+| `publish_live` | `IDFON-LIVE/1` |
+| `issue_card` | `IDFON-CARD/1` (with `reply_to` when answering a card request) |
+| `voice_speak`, `voice_relay`, gpt-live-1 `voice-reply` | `IDFON-DATA/1` (reply audio) |
+| agency `request-invite` | `IDFON-INVITE/1` |
+
+Delivery rules:
+
+- An attached envelope goes to **whoever this turn replies to** (the caller,
+  or every member of a room).
+- To give something to a **different** peer, call `send` with structured
+  `attach` items: `{kind: "data", ticket, size_bytes}`,
+  `{kind: "live", ticket, media}` or `{kind: "card", subject, contact, ticket}`.
+  `send` writes the envelopes.
+- A turn whose model writes no text still delivers its attached envelopes, as
+  a reply of their own. They never leak into the next turn.
+- A reply that should carry an envelope is the model's text, then the
+  envelopes. A consumer must find an envelope by its header, never assume it
+  comes first (the agency reads a card this way).
+
+Agent instructions say only "the tool attaches it". No instruction may tell
+the model to write, append or copy `IDFON-*` text.
+
 **Ids make a block revisable.** `Block::id` is stable within a reply: a producer
 that declares one (a render spec's `id`) replaces that block; otherwise the id
 is derived from the block itself. `upsert` is the only merge rule.
