@@ -10,7 +10,7 @@ desktop). Reference implementation: `crates/idfon-protocol` (types) and
 Unix domain socket (path ≤ ~104 bytes: device sandbox paths fit without the
 longer `/tmp` fallback). Framing: 4-byte little-endian length prefix +
 JSON body; one request frame expects one response frame (the daemon may send
-multiple response frames for `events` with `follow: true` and for `wait`
+multiple response frames for `event.list` with `follow: true` and for `event.wait`
 while it holds the request until a match or timeout).
 
 The frames are the contract, not the socket: an embedding target (the iOS
@@ -24,26 +24,60 @@ the socket server.
 Request:
 
 ```json
-{ "version": 2, "id": "cli-1", "method": "peers", "params": {} }
+{ "version": 2, "id": "cli-1", "method": "peer.list", "params": {} }
 ```
 
 - `version`: `PROTOCOL_VERSION` (currently **2**; bump on any breaking shape
   change; daemons reject mismatched versions). Version 2 replaced the closed
   capability enum with open namespaced strings.
 - `id`: client-chosen, echoed in the response.
-- `params`: per-method (below). The daemon injects the session identity for
-  any param that is absent — an explicit `null` defeats the injection (this
-  was a real CLI bug); omit identity params entirely unless overriding.
+- `params`: per-method (below). The daemon fills the `identity` param with
+  the session identity when it is absent or `null`.
 
 Response:
 
 ```json
-{ "version": 2, "id": "cli-1", "ok": true, "operation": "status", "result": { } }
+{ "version": 2, "id": "cli-1", "ok": true, "operation": "daemon.status", "result": { } }
 ```
 
 Failure: `ok: false` with `error: { code, message, retryable }`. Error codes
 include `invalid_request`, `capability_denied`, `cursor_too_old`,
 `daemon_unavailable`.
+
+## Method names
+
+Every method is `noun.verb` with a singular noun (`peer.list`, `event.wait`,
+`blob.put`). The canonical names and their typed params live in
+`crates/idfon-protocol/src/rpc.rs`; clients build requests with
+`Request::call(id, &rpc::PeerAdd { .. })` instead of hand-written JSON.
+Absent optional params are omitted, never sent as `null`.
+
+Older names are accepted as aliases on any version (`rpc::METHOD_ALIASES`).
+The daemon rewrites them before dispatch, and the response's `operation`
+field carries the canonical name:
+
+| legacy | canonical |
+|---|---|
+| `status`, `context` | `daemon.status` |
+| `identities`, `identities.compact` | `identity.list`, `identity.list.compact` |
+| `peers`, `peers.compact` | `peer.list`, `peer.list.compact` |
+| `events`, `events.compact`, `events.export`, `events.sync`, `events.merge` | `event.list`, `event.list.compact`, `event.export`, `event.sync`, `event.merge` |
+| `wait` | `event.wait` |
+| `capability.ticket`, `capability.ticket.revoke` | `access.ticket`, `access.ticket.revoke` |
+| `media.resource.put`, `media.resource.fetch` | `blob.put`, `blob.get` |
+| `media.live.{publish,dial,answer,stop,subscribe}`, `media.live.publishers` | `live.{publish,dial,answer,stop,subscribe}`, `live.list` |
+| `media.session.{start,stop}`, `media.sessions` | `session.{start,stop}`, `session.list` |
+| `files.publish` | `file.publish` |
+
+**Peer argument.** Methods that take one peer accept it as `peer`. The
+daemon copies `peer` into the key the method has always read (`ref` for
+`peer.*` and `web.url`; `to` for `message.send`, `mcp.listen`, `live.dial`;
+`subject` for `access.*`; `from` for `live.answer`) when that key is absent.
+The typed structs still send the legacy key, so a new client works with an
+older daemon. `event.list`/`event.wait` keep `peer` as their own filter.
+
+**Identity.** The daemon fills an absent or `null` `identity` param with the
+session identity.
 
 ## Methods
 
@@ -51,14 +85,14 @@ include `invalid_request`, `capability_denied`, `cursor_too_old`,
 
 | method | params | result |
 |---|---|---|
-| `status` | — | `{ ready, daemon, protocol_version, identity: {id, name, active, public_key, endpoint_id}, ticket: [bytes] }` (ticket = endpoint addr ticket, JSON byte array) |
+| `daemon.status` | — | `{ ready, daemon, protocol_version, identity: {id, name, active, public_key, endpoint_id}, ticket: [bytes] }` (ticket = endpoint addr ticket, JSON byte array) |
 | `daemon.shutdown` | — | `{ shutdown: true }` |
 
 ### Identity
 
 | method | params | result |
 |---|---|---|
-| `identities` | — | `{ identities: [{id, name, active, public_key, endpoint_id}] }` |
+| `identity.list` | — | `{ identities: [{id, name, active, public_key, endpoint_id}] }` |
 | `identity.create` | `{ name }` | `{ identity }` |
 | `identity.use` | `{ name }` | `{ identity, active: true }` |
 | `identity.delete` | `{ name }` | `{}` — rejected for the active or last identity |
@@ -96,7 +130,7 @@ values fold into `ring_score` once (`ring_score_v1`).
 
 | method | params | result |
 |---|---|---|
-| `peers` | — | `{ peers: [Peer] }`; Peer = `{id, identity, name, aliases, endpoint_id, endpoint_addr, ring_score?, ...}` |
+| `peer.list` | — | `{ peers: [Peer] }`; Peer = `{id, identity, name, aliases, endpoint_id, endpoint_addr, ring_score?, ...}` |
 | `peer.add` | `{ ref, id, name, endpoint_id, endpoint_addr, aliases, ring_score?, mcp_ticket? }` | `{ peer }` |
 
 `mcp_ticket` (M3) is an MCP contact ticket; when present it fills any omitted
@@ -130,7 +164,7 @@ keeps standard `URL` fields. `peer.add` also accepts a `contact_ticket`
 | `message.send` | `{ to, text, idempotency_key, capability_ticket?, retries? }` (`capability_ticket` is the holder's rcan token string) | `{ authenticated, message_id, operation_id, status: "queued" }` — returns immediately; delivery proceeds in the daemon (retries per `retries`), confirm via `operation.wait`. Sender needs a `message.send` grant for the peer (own daemon); the receiver needs `message.receive` for the sender. A successful send auto-establishes the local receive side of the reply path. |
 | `message.receive` | — | receive-side helper used by the transport; not called by shells. |
 
-The `wait`/`events` methods below are how received messages surface: a
+The `event.wait`/`event.list` methods below are how received messages surface: a
 `message.received` event with `data: { message_id, peer_id, text }`. Signaled
 blob transfers ride the same path as text with an `IDFON-DATA/1` envelope
 (`ticket=`, `size=` lines). Artifacts and selections use the same mechanism:
@@ -140,14 +174,14 @@ one or more trailing `IDFON-*/1` envelopes; see `docs/idfon-artifacts.md`.
 
 ### Events
 
-`events` are persisted per identity, FIFO, with monotonically increasing
+Events are persisted per identity, FIFO, with monotonically increasing
 `cur_<20 digits>` cursors, retained up to `EVENT_RETENTION`. The only event
 type currently emitted is `message.received`.
 
 | method | params | result |
 |---|---|---|
-| `events` | `{ follow?, after?, type?, peer? }` | `{ events: [Event] }`; Event = `{ event_id, cursor, type, timestamp, identity, data }`. `after` earlier than the oldest retained cursor → `cursor_too_old` error; empty-string `after` is allowed and means "from the start". `follow: true` streams responses as events arrive. |
-| `wait` | same as `events` + `timeout_ms` (default 30000, max 300000) | blocks server-side, returns the first matching event, or `{ events: [] }` on timeout (success — not an error) |
+| `event.list` | `{ follow?, after?, type?, peer? }` | `{ events: [Event] }`; Event = `{ event_id, cursor, type, timestamp, identity, data }`. `after` earlier than the oldest retained cursor → `cursor_too_old` error; empty-string `after` is allowed and means "from the start". `follow: true` streams responses as events arrive. |
+| `event.wait` | same as `event.list` + `timeout_ms` (default 30000, max 300000) | blocks server-side, returns the first matching event, or `{ events: [] }` on timeout (success — not an error) |
 
 ### Operations
 
@@ -172,8 +206,8 @@ this daemon may receive from the subject. Subjects are peer endpoint ids
 | `access.check` | `{ subject, capability }` | `{ allowed, identity, subject, capability }` |
 | `access.grant` | `{ subject, capability }` | `{ grant }` |
 | `access.revoke` | `{ subject, capability }` | `{}` |
-| `capability.ticket` | `{ subject, capabilities: [..], expires_at?, path_scope?, conversation? }` | `{ ticket }` — an `rcan` delegation token (base32), subject-bound; a signature-valid ticket satisfies the receive gate |
-| `capability.ticket.revoke` | `{ ticket_id }` | `{ ticket_id, issuer, revoked }` |
+| `access.ticket` | `{ subject, capabilities: [..], expires_at?, path_scope?, conversation? }` | `{ ticket }` — an `rcan` delegation token (base32), subject-bound; a signature-valid ticket satisfies the receive gate |
+| `access.ticket.revoke` | `{ ticket_id }` | `{ ticket_id, issuer, revoked }` |
 
 Capabilities are **open namespaced strings**, not a closed enum: the built-ins
 are `message.send`, `message.receive`, `voice.message.send`,
@@ -224,24 +258,24 @@ fetch).
 
 | method | params | result |
 |---|---|---|
-| `media.resource.put` | `{ resource_id, bytes: [..], append, finish }` | `{ identity, resource_id, size_bytes, content_hash, blob_ticket }` — chunks stage in `data_dir/staging/`, the ticket is the artifact |
-| `media.resource.fetch` | `{ resource_id, blob_ticket, offset?, length? }` | `{ bytes: [..], total_size }` — chunked fetch; the ticket is required |
-| `media.live.publish` | `{ file, loop?, relay?, name? }` | `{ ticket, id }` — broadcast; ticket is a bearer capability |
-| `media.live.dial` | `{ to, file, relay?, seconds? }` | 1:1 session; blocks until the callee hangs up; no ticket (session-scoped) |
-| `media.live.answer` / `subscribe` | — | callee/subscription side |
-| `media.live.publishers` | — | `{ publishers: [...] }` |
-| `media.live.stop` | `{ id }` | graceful stop |
-| `media.sessions` / `media.session.start` / `media.session.stop` | — | session registry |
+| `blob.put` | `{ resource_id, bytes: [..], append, finish }` | `{ identity, resource_id, size_bytes, content_hash, blob_ticket }` — chunks stage in `data_dir/staging/`, the ticket is the artifact |
+| `blob.get` | `{ resource_id, blob_ticket, offset?, length? }` | `{ bytes: [..], total_size }` — chunked fetch; the ticket is required |
+| `live.publish` | `{ file, loop?, relay?, name? }` | `{ ticket, id }` — broadcast; ticket is a bearer capability |
+| `live.dial` | `{ to, file, relay?, seconds? }` | 1:1 session; blocks until the callee hangs up; no ticket (session-scoped) |
+| `live.answer` / `live.subscribe` | — | callee/subscription side |
+| `live.list` | — | `{ publishers: [...] }` |
+| `live.stop` | `{ id }` | graceful stop |
+| `session.list` / `session.start` / `session.stop` | — | session registry |
 
 ### Durable files
 
 Pins a file on the edge's always-on store (`docs/durable-files.md`). The
-content-addressed URL is the artifact; the free tier is `media.resource.put`
+content-addressed URL is the artifact; the free tier is `blob.put`
 (a connected-only `BlobTicket`) instead.
 
 | method | params | result |
 |---|---|---|
-| `files.publish` | `{ path, name?, url?, token?, expires_in?, permanent? }` | `{ url, sha256, size, existed, expires_in, permanent }` — computes SHA-256, skips the upload when the edge already has the object, streams the file, and optionally writes the same bytes under a mutable `name`. User pins default to and are capped at 24h (`expires_in` can shorten); the edge answers `410` after the term. `permanent` requires `IDFON_FILES_OPS_TOKEN` and never expires |
+| `file.publish` | `{ path, name?, url?, token?, expires_in?, permanent? }` | `{ url, sha256, size, existed, expires_in, permanent }` — computes SHA-256, skips the upload when the edge already has the object, streams the file, and optionally writes the same bytes under a mutable `name`. User pins default to and are capped at 24h (`expires_in` can shorten); the edge answers `410` after the term. `permanent` requires `IDFON_FILES_OPS_TOKEN` and never expires |
 
 `url` defaults to `IDFON_EDGE_URL`; `token` defaults to `IDFON_FILES_TOKEN`,
 then `IDFON_EDGE_TOKEN`. The edge verifies the body against the hash, so the
