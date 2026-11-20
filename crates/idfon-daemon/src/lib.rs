@@ -9050,7 +9050,7 @@ mod tests {
                 version: PROTOCOL_VERSION,
                 id: "create".into(),
                 method: "identity.create".into(),
-                params: serde_json::json!({"name": "work"}),
+                params: serde_json::json!({"name": "travel"}),
             },
             &store,
         );
@@ -9060,7 +9060,7 @@ mod tests {
                 version: PROTOCOL_VERSION,
                 id: "use".into(),
                 method: "identity.use".into(),
-                params: serde_json::json!({"name": "work"}),
+                params: serde_json::json!({"name": "travel"}),
             },
             &store,
         );
@@ -9089,7 +9089,7 @@ mod tests {
             state
                 .identities
                 .iter()
-                .find(|identity| identity.id == "work")
+                .find(|identity| identity.id == "travel")
                 .unwrap()
                 .active
         );
@@ -9975,16 +9975,16 @@ mod tests {
                 version: PROTOCOL_VERSION,
                 id: "create".into(),
                 method: "identity.create".into(),
-                params: serde_json::json!({"name": "work"}),
+                params: serde_json::json!({"name": "travel"}),
             },
             &store,
         );
         assert!(response.ok);
         let state = store.lock().unwrap();
-        let account = state.identity_key("work").unwrap().peer_id();
-        let endpoint = state.endpoint_key("work").unwrap().peer_id();
+        let account = state.identity_key("travel").unwrap().peer_id();
+        let endpoint = state.endpoint_key("travel").unwrap().peer_id();
         assert_ne!(account, endpoint, "account and endpoint keys must differ");
-        assert!(dir.join("endpoint-work.key").is_file());
+        assert!(dir.join("endpoint-travel.key").is_file());
         // Identities predating the split keep one key for both roles.
         assert_eq!(
             state.identity_key("default").unwrap().peer_id(),
