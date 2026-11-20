@@ -46,6 +46,7 @@ pub const SETTINGS: &[Setting] = &[
     secret("IDFON_FILES_OPS_TOKEN", "files.ops_token", "operations token for `publish --permanent`"),
     setting("IDFON_MCP_COMMAND", "mcp.command", "local MCP server inbound idfon/mcp/1 streams splice to"),
     setting("IDFON_IDLE_EXIT_SECS", "daemon.idle_exit_secs", "auto-started daemon idle shutdown, seconds (0 = never)"),
+    setting("IDFON_ENDPOINT_PORT", "endpoint.port", "UDP port to pin the endpoint to, so its address survives restarts"),
 ];
 
 /// Where a setting's value came from.

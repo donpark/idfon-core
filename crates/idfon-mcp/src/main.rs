@@ -123,18 +123,16 @@ fn load_key(key_file: Option<&Path>) -> Result<[u8; 32]> {
     };
     match value.filter(|value| !value.trim().is_empty()) {
         Some(value) => {
-            let key = idfon_core::decode_signing_key(value.trim())
+            let key = idfon_core::IdentityKey::decode(value.trim())
                 .ok_or_else(|| anyhow!("invalid key: expected 64 hex characters"))?;
-            Ok(idfon_core::signing_key_bytes(&key))
+            Ok(key.secret_bytes())
         }
         None => {
             tracing::warn!(
                 target: "idfon.mcp",
                 "no --key-file or IDFON_MCP_KEY; using an ephemeral identity (grants will not survive a restart)"
             );
-            Ok(idfon_core::signing_key_bytes(
-                &idfon_core::generate_identity(),
-            ))
+            Ok(idfon_core::IdentityKey::generate().secret_bytes())
         }
     }
 }
@@ -146,7 +144,7 @@ async fn serve(
     account_id: String,
 ) -> Result<()> {
     let transport = std::sync::Arc::new(
-        IrohTransport::bind_with_key(Some(key))
+        IrohTransport::builder().secret_key(key).port_from_config().bind()
             .await
             .context("bind iroh endpoint")?,
     );
@@ -264,7 +262,7 @@ async fn connect(
     }
     let peer = peer.ok_or_else(|| anyhow!("--peer or --uds is required"))?;
     let target = parse_peer(&peer)?;
-    let transport = IrohTransport::bind_with_key(Some(key))
+    let transport = IrohTransport::builder().secret_key(key).port_from_config().bind()
         .await
         .context("bind iroh endpoint")?;
     let (connection, send, recv) = transport
@@ -290,7 +288,7 @@ async fn connect(
 // account → `access.check`) when exposing daemon-owned resources.
 async fn expose(key: [u8; 32], root: std::path::PathBuf, account: String) -> Result<()> {
     let transport = std::sync::Arc::new(
-        IrohTransport::bind_with_key(Some(key))
+        IrohTransport::builder().secret_key(key).port_from_config().bind()
             .await
             .context("bind iroh endpoint")?,
     );

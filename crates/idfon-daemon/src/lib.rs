@@ -80,10 +80,10 @@ enum TransportMode {
 }
 
 impl TransportMode {
-    async fn new(name: &str, key: Option<[u8; 32]>) -> io::Result<Self> {
+    async fn new(name: &str, key: Option<[u8; 32]>, port: Option<u16>) -> io::Result<Self> {
         match name {
             "fake" => Ok(Self::Fake(FakeTransport::default())),
-            "iroh" => idfon_core::transport::TransportManager::bind_with_key(key)
+            "iroh" => idfon_core::transport::TransportManager::bind(key, port)
                 .await
                 .map(Arc::new)
                 .map(Self::Iroh)
@@ -278,20 +278,20 @@ fn deliver(
 
 /// Identity (account signing) key on disk. Plain files in the profile dir —
 /// no store involved — so endpoint binding can start before the store loads.
-fn identity_key_in(data_dir: &Path, identity_id: &str) -> io::Result<ed25519_dalek::SigningKey> {
+fn identity_key_in(data_dir: &Path, identity_id: &str) -> io::Result<idfon_core::IdentityKey> {
     let path = data_dir.join(format!("identity-{identity_id}.key"));
     let value = std::fs::read_to_string(path)?;
-    idfon_core::decode_signing_key(value.trim())
+    idfon_core::IdentityKey::decode(value.trim())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid identity key"))
 }
 
 /// The transport (endpoint) key for an identity (see `Store::endpoint_key`):
 /// a dedicated `endpoint-<id>.key` when the account/endpoint split created
 /// one, the identity key otherwise.
-fn endpoint_key_in(data_dir: &Path, identity_id: &str) -> io::Result<ed25519_dalek::SigningKey> {
+fn endpoint_key_in(data_dir: &Path, identity_id: &str) -> io::Result<idfon_core::IdentityKey> {
     let path = data_dir.join(format!("endpoint-{identity_id}.key"));
     match std::fs::read_to_string(&path) {
-        Ok(value) => idfon_core::decode_signing_key(value.trim())
+        Ok(value) => idfon_core::IdentityKey::decode(value.trim())
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid endpoint key")),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             identity_key_in(data_dir, identity_id)
@@ -507,12 +507,12 @@ impl Store {
         for identity in &mut self.identities {
             let path = data_dir.join(format!("identity-{}.key", identity.id));
             let key = match std::fs::read_to_string(&path) {
-                Ok(value) => idfon_core::decode_signing_key(value.trim()).ok_or_else(|| {
+                Ok(value) => idfon_core::IdentityKey::decode(value.trim()).ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidData, "invalid identity key")
                 })?,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    let key = idfon_core::generate_identity();
-                    let value = idfon_core::encode_signing_key(&key);
+                    let key = idfon_core::IdentityKey::generate();
+                    let value = key.encode();
                     std::fs::write(&path, value)?;
                     #[cfg(unix)]
                     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
@@ -520,7 +520,7 @@ impl Store {
                 }
                 Err(error) => return Err(error),
             };
-            identity.public_key = Some(idfon_core::peer_id(&key));
+            identity.public_key = Some(key.peer_id());
         }
         // Backfill the derived account handle for peers stored before it existed.
         for peer in &mut self.peers {
@@ -529,7 +529,7 @@ impl Store {
         self.save(data_dir)
     }
 
-    fn identity_key(&self, identity_id: &str) -> io::Result<ed25519_dalek::SigningKey> {
+    fn identity_key(&self, identity_id: &str) -> io::Result<idfon_core::IdentityKey> {
         identity_key_in(&self.data_dir, identity_id)
     }
 
@@ -538,7 +538,7 @@ impl Store {
     /// identity key stays signing-only; identities created before it fall back
     /// to the identity key, because switching their endpoint id would break
     /// every peer record that already points at it.
-    fn endpoint_key(&self, identity_id: &str) -> io::Result<ed25519_dalek::SigningKey> {
+    fn endpoint_key(&self, identity_id: &str) -> io::Result<idfon_core::IdentityKey> {
         endpoint_key_in(&self.data_dir, identity_id)
     }
 
@@ -548,8 +548,8 @@ impl Store {
         if path.exists() {
             return Ok(());
         }
-        let key = idfon_core::generate_identity();
-        std::fs::write(&path, idfon_core::encode_signing_key(&key))?;
+        let key = idfon_core::IdentityKey::generate();
+        std::fs::write(&path, key.encode())?;
         #[cfg(unix)]
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
         Ok(())
@@ -736,15 +736,19 @@ pub async fn run(config: DaemonConfig) -> io::Result<()> {
     // Keep the default identity's endpoint address stable across restarts so
     // paired apps do not need re-pairing. Extra identities stay ephemeral
     // (see TransportManager); a taken port falls back to ephemeral too.
-    if std::env::var_os("IDFON_ENDPOINT_PORT").is_none() {
-        let hash = data_dir
-            .to_string_lossy()
-            .bytes()
-            .fold(2_166_136_261u32, |acc, byte| {
-                (acc ^ byte as u32).wrapping_mul(16_777_619)
-            });
-        std::env::set_var("IDFON_ENDPOINT_PORT", (59_000 + (hash % 900)).to_string());
-    }
+    // The IDFON_ENDPOINT_PORT setting wins; else a port derived from the
+    // data dir (stable per profile, different across profiles).
+    let endpoint_port = idfon_config::get("IDFON_ENDPOINT_PORT")
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .or_else(|| {
+            let hash = data_dir
+                .to_string_lossy()
+                .bytes()
+                .fold(2_166_136_261u32, |acc, byte| {
+                    (acc ^ byte as u32).wrapping_mul(16_777_619)
+                });
+            Some(59_000 + (hash % 900) as u16)
+        });
     let store = Arc::new(Mutex::new(Store::load(&data_dir)?));
     // The feature set serves in-process callers the moment the store is open:
     // local reads (contacts, identities, rooms) never wait on endpoint binds.
@@ -762,7 +766,8 @@ pub async fn run(config: DaemonConfig) -> io::Result<()> {
     let bound = tokio::spawn(async move {
         TransportMode::new(
             &bind_name,
-            Some(idfon_core::signing_key_bytes(&default_endpoint_key)),
+            Some(default_endpoint_key.secret_bytes()),
+            endpoint_port,
         )
         .await
     });
@@ -782,7 +787,7 @@ pub async fn run(config: DaemonConfig) -> io::Result<()> {
                 state
                     .endpoint_key(&identity.id)
                     .ok()
-                    .map(|key| (identity.id.clone(), idfon_core::signing_key_bytes(&key)))
+                    .map(|key| (identity.id.clone(), key.secret_bytes()))
             })
             .collect()
     };
@@ -1781,7 +1786,7 @@ async fn start_gateway(
     )
     .map_err(io::Error::other)?;
     let backend = gateway_backend(direct, prefer).map_err(io::Error::other)?;
-    let token = idfon_core::encode_signing_key(&idfon_core::generate_identity());
+    let token = idfon_core::IdentityKey::generate().encode();
     let handle = idfon_gateway::serve(
         GatewayConfig {
             auth: Some(std::sync::Arc::new(StaticToken::new(token.clone()))),
@@ -2701,7 +2706,7 @@ fn dispatch_with_transport(
                 return transport_not_ready(&request);
             };
             let endpoint_id = match transport
-                .ensure_identity(&identity_id, idfon_core::signing_key_bytes(&key))
+                .ensure_identity(&identity_id, key.secret_bytes())
             {
                 Ok(endpoint_id) => endpoint_id,
                 Err(error) => {
@@ -2825,8 +2830,8 @@ fn request_text(params: &serde_json::Value, name: &str) -> Option<String> {
 /// 128-bit random room id (`r_` + 32 hex). Reuses the identity generator for OS
 /// randomness rather than taking on an RNG dependency.
 fn random_room_id() -> String {
-    let key = idfon_core::generate_identity();
-    format!("r_{}", &idfon_core::peer_id(&key)[..32])
+    let key = idfon_core::IdentityKey::generate();
+    format!("r_{}", &key.peer_id()[..32])
 }
 
 fn identity_id_of(state: &Store, identity_ref: &str) -> String {
@@ -4317,16 +4322,16 @@ fn capability_ticket_issue(request: &Request, store: &Arc<Mutex<Store>>) -> Resp
     };
     let conversation = request_text(&request.params, "conversation");
     let path_scope = request_text(&request.params, "path_scope");
-    let Ok(ticket) = idfon_core::issue_capability_ticket_with_voice(
-        &key,
-        subject,
-        conversation,
-        capabilities,
-        expires_at,
-        ticket_id,
-        None,
-        path_scope,
-    ) else {
+    let Ok(ticket) = idfon_core::TicketSpec {
+        subject: subject,
+        conversation: conversation,
+        capabilities: capabilities,
+        expires_at: expires_at,
+        ticket_id: ticket_id.into(),
+        voice: None,
+        path_scope: path_scope,
+    }
+    .issue(&key) else {
         return error_response(
             request.id.clone(),
             &request.method,
@@ -7602,9 +7607,9 @@ mod tests {
     async fn send_rides_the_relationships_identity() {
         let dir = temp_dir("send-identity");
         let store = Arc::new(Mutex::new(Store::load(&dir).unwrap()));
-        let transport = Arc::new(TransportMode::new("fake", None).await.unwrap());
-        let key = idfon_core::generate_identity();
-        let peer_id = idfon_core::peer_id(&key);
+        let transport = Arc::new(TransportMode::new("fake", None, None).await.unwrap());
+        let key = idfon_core::IdentityKey::generate();
+        let peer_id = key.peer_id();
         {
             let mut state = store.lock().unwrap();
             state.peers.push(idfon_protocol::Peer {
@@ -7683,8 +7688,8 @@ mod tests {
 
     #[test]
     fn edge_url_uses_z32_host_form_for_endpoint_ids() {
-        let key = idfon_core::generate_identity();
-        let id: iroh::EndpointId = idfon_core::peer_id(&key).parse().unwrap();
+        let key = idfon_core::IdentityKey::generate();
+        let id: iroh::EndpointId = key.peer_id().parse().unwrap();
         let z = idfon_core::endpoint_ref(&id);
         assert_eq!(z.len(), 52);
         assert_eq!(
@@ -7707,8 +7712,8 @@ mod tests {
     fn resource_ticket_authorizes_issuer_capability_and_path() {
         let dir = temp_dir("resource-ticket");
         let store = Arc::new(Mutex::new(Store::load(&dir).unwrap()));
-        let owner_key = idfon_core::generate_identity();
-        let owner = idfon_core::peer_id(&owner_key);
+        let owner_key = idfon_core::IdentityKey::generate();
+        let owner = owner_key.peer_id();
         let state = ProviderState {
             store,
             identity: "default".into(),
@@ -7718,28 +7723,30 @@ mod tests {
         let expiry = (now().parse::<u64>().unwrap() + 3600).to_string();
         let read = idfon_protocol::Capability::new(CAPABILITY_RESOURCE_READ);
 
-        let scoped = idfon_core::issue_capability_ticket_scoped(
-            &owner_key,
-            None,
-            vec![read.clone()],
-            Some(expiry.clone()),
-            "t-scoped",
-            Some("/fs/public".into()),
-        ).unwrap();
+        let scoped = idfon_core::TicketSpec {
+            subject: None,
+            capabilities: vec![read.clone()],
+            expires_at: Some(expiry.clone()),
+            ticket_id: "t-scoped".into(),
+            path_scope: Some("/fs/public".into()),
+            ..Default::default()
+        }
+        .issue(&owner_key).unwrap();
         let raw = scoped.token();
         assert!(ticket_authorizes(&state, &raw, "/fs/public/x"));
         assert!(!ticket_authorizes(&state, &raw, "/fs/private/x"));
 
         // A ticket from a peer with no grant is refused...
-        let delegate_key = idfon_core::generate_identity();
-        let delegate_id = idfon_core::peer_id(&delegate_key);
-        let delegated = idfon_core::issue_capability_ticket(
-            &delegate_key,
-            None,
-            vec![read.clone()],
-            Some(expiry.clone()),
-            "t-delegate",
-        ).unwrap();
+        let delegate_key = idfon_core::IdentityKey::generate();
+        let delegate_id = delegate_key.peer_id();
+        let delegated = idfon_core::TicketSpec {
+            subject: None,
+            capabilities: vec![read.clone()],
+            expires_at: Some(expiry.clone()),
+            ticket_id: "t-delegate".into(),
+            ..Default::default()
+        }
+        .issue(&delegate_key).unwrap();
         let delegated_raw = delegated.token();
         assert!(!ticket_authorizes(&state, &delegated_raw, "/fs/x"));
 
@@ -7770,26 +7777,28 @@ mod tests {
         assert!(!ticket_authorizes(&state, &delegated_raw, "/fs/x"));
 
         // Missing capability and expiry both fail.
-        let wrong = idfon_core::issue_capability_ticket(
-            &owner_key,
-            None,
-            vec![idfon_protocol::Capability::new("message.receive")],
-            Some(expiry),
-            "t-wrong",
-        ).unwrap();
+        let wrong = idfon_core::TicketSpec {
+            subject: None,
+            capabilities: vec![idfon_protocol::Capability::new("message.receive")],
+            expires_at: Some(expiry),
+            ticket_id: "t-wrong".into(),
+            ..Default::default()
+        }
+        .issue(&owner_key).unwrap();
         assert!(!ticket_authorizes(
             &state,
             &wrong.token(),
             "/fs/x"
         ));
 
-        let expired = idfon_core::issue_capability_ticket(
-            &owner_key,
-            None,
-            vec![read],
-            Some("1".to_owned()),
-            "t-expired",
-        ).unwrap();
+        let expired = idfon_core::TicketSpec {
+            subject: None,
+            capabilities: vec![read],
+            expires_at: Some("1".to_owned()),
+            ticket_id: "t-expired".into(),
+            ..Default::default()
+        }
+        .issue(&owner_key).unwrap();
         assert!(!ticket_authorizes(
             &state,
             &expired.token(),
@@ -7813,9 +7822,9 @@ mod tests {
     async fn message_send_stamps_context_on_the_envelope() {
         let dir = temp_dir("send-context");
         let store = Arc::new(Mutex::new(Store::load(&dir).unwrap()));
-        let transport = Arc::new(TransportMode::new("fake", None).await.unwrap());
-        let key = idfon_core::generate_identity();
-        let peer_id = idfon_core::peer_id(&key);
+        let transport = Arc::new(TransportMode::new("fake", None, None).await.unwrap());
+        let key = idfon_core::IdentityKey::generate();
+        let peer_id = key.peer_id();
         {
             let mut state = store.lock().unwrap();
             state.identities.push(Identity {
@@ -7933,13 +7942,13 @@ mod tests {
     async fn gateway_resolves_account_handle_and_fetches_over_h3() {
         let dir = temp_dir("gateway-h3");
         let store = Arc::new(Mutex::new(Store::load(&dir).unwrap()));
-        let transport = Arc::new(TransportMode::new("iroh", Some([21; 32])).await.unwrap());
+        let transport = Arc::new(TransportMode::new("iroh", Some([21; 32]), None).await.unwrap());
 
         // The peer: a real folder provider served over H3.
         let root = temp_dir("gateway-h3-root");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("hello.txt"), "hello from peer").unwrap();
-        let server = Arc::new(IrohTransport::bind_with_key(Some([22; 32])).await.unwrap());
+        let server = Arc::new(IrohTransport::builder().secret_key([22; 32]).bind().await.unwrap());
         let _ = tokio::time::timeout(Duration::from_secs(5), server.endpoint().online()).await;
         let router = idfon_mcp::fs::router(&root, "acct-1").unwrap();
         let _h3 = idfon_h3::serve_router(&server, router);
@@ -8084,8 +8093,8 @@ mod tests {
     async fn provider_serves_a_live_shared_root_to_a_granted_peer() {
         let dir = temp_dir("provider-grant");
         let store = Arc::new(Mutex::new(Store::load(&dir).unwrap()));
-        let transport = Arc::new(TransportMode::new("iroh", Some([31; 32])).await.unwrap());
-        let caller = IrohTransport::bind_with_key(Some([32; 32])).await.unwrap();
+        let transport = Arc::new(TransportMode::new("iroh", Some([31; 32]), None).await.unwrap());
+        let caller = IrohTransport::builder().secret_key([32; 32]).bind().await.unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(5), caller.endpoint().online()).await;
 
         // The user's live shared directory, served in place (no copy, no record).
@@ -8223,8 +8232,8 @@ mod tests {
         let producer_dir = temp_dir("artifact-producer");
         let producer_store = Arc::new(Mutex::new(Store::load(&producer_dir).unwrap()));
         let producer_transport =
-            Arc::new(TransportMode::new("iroh", Some([41; 32])).await.unwrap());
-        let consumer_transport = IrohTransport::bind_with_key(Some([42; 32])).await.unwrap();
+            Arc::new(TransportMode::new("iroh", Some([41; 32]), None).await.unwrap());
+        let consumer_transport = IrohTransport::builder().secret_key([42; 32]).bind().await.unwrap();
         let _ = tokio::time::timeout(
             Duration::from_secs(5),
             consumer_transport.endpoint().online(),
@@ -8392,7 +8401,7 @@ mod tests {
     fn capability_ticket_issue_and_revoke_persist() {
         let dir = temp_dir("capability-ticket");
         let store = Arc::new(Mutex::new(Store::load(&dir).unwrap()));
-        let subject = idfon_core::peer_id(&idfon_core::generate_identity());
+        let subject = idfon_core::IdentityKey::generate().peer_id();
         let issue = dispatch(
             Request {
                 version: PROTOCOL_VERSION,
@@ -8432,7 +8441,7 @@ mod tests {
     fn authenticated_message_is_accepted_and_tampering_rejected() {
         let dir = temp_dir("auth");
         let store = Arc::new(Mutex::new(Store::load(&dir).unwrap()));
-        let key = idfon_core::generate_identity();
+        let key = idfon_core::IdentityKey::generate();
         let message = idfon_core::sign_message(
             &key,
             "endpoint-a",
@@ -8444,7 +8453,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let peer_id = idfon_core::peer_id(&key);
+        let peer_id = key.peer_id();
         let mut state = store.lock().unwrap();
         state.peers.push(idfon_protocol::Peer {
             id: peer_id.clone(),
@@ -8511,9 +8520,9 @@ mod tests {
     fn verified_ticket_bootstraps_grants_without_stored_grants() {
         let dir = temp_dir("ticket-bootstrap");
         let store = Arc::new(Mutex::new(Store::load(&dir).unwrap()));
-        let sender_key = idfon_core::generate_identity();
+        let sender_key = idfon_core::IdentityKey::generate();
         let receiver_key = store.lock().unwrap().identity_key("default").unwrap();
-        let sender_id = idfon_core::peer_id(&sender_key);
+        let sender_id = sender_key.peer_id();
         // Cross-daemon pairing: peer exists, but no grants at all.
         store.lock().unwrap().peers.push(idfon_protocol::Peer {
             id: sender_id.clone(),
@@ -8528,16 +8537,17 @@ mod tests {
             pinned: false,
             instant_call: false,
         });
-        let ticket = idfon_core::issue_capability_ticket(
-            &receiver_key,
-            None,
-            vec![
+        let ticket = idfon_core::TicketSpec {
+            subject: None,
+            capabilities: vec![
                 idfon_protocol::Capability::MessageReceive,
                 idfon_protocol::Capability::LiveAudioSubscribe,
             ],
-            None,
-            "tk-bootstrap",
-        ).unwrap();
+            expires_at: None,
+            ticket_id: "tk-bootstrap".into(),
+            ..Default::default()
+        }
+        .issue(&receiver_key).unwrap();
         let message = idfon_core::sign_message_with_ticket(
             &sender_key,
             "endpoint-a",
@@ -8589,9 +8599,9 @@ mod tests {
     fn endpoint_keyed_record_passes_for_the_signed_identity() {
         let dir = temp_dir("split-identity");
         let store = Arc::new(Mutex::new(Store::load(&dir).unwrap()));
-        let sender_key = idfon_core::generate_identity();
+        let sender_key = idfon_core::IdentityKey::generate();
         let receiver_key = store.lock().unwrap().identity_key("default").unwrap();
-        let sender_id = idfon_core::peer_id(&sender_key);
+        let sender_id = sender_key.peer_id();
         // Pairing by endpoint ref keys the record on the endpoint id (#56):
         // it can never match `sender.peer_id`, only the signer's claimed
         // endpoint — the split-identity pairing that died at the gate.
@@ -8608,13 +8618,14 @@ mod tests {
             pinned: false,
             instant_call: false,
         });
-        let ticket = idfon_core::issue_capability_ticket(
-            &receiver_key,
-            None,
-            vec![idfon_protocol::Capability::MessageReceive],
-            None,
-            "tk-split",
-        ).unwrap();
+        let ticket = idfon_core::TicketSpec {
+            subject: None,
+            capabilities: vec![idfon_protocol::Capability::MessageReceive],
+            expires_at: None,
+            ticket_id: "tk-split".into(),
+            ..Default::default()
+        }
+        .issue(&receiver_key).unwrap();
         let message = idfon_core::sign_message_with_ticket(
             &sender_key,
             "endpoint-a",
@@ -8649,7 +8660,7 @@ mod tests {
 
         // A stranger claiming the same endpoint gains nothing without a
         // ticket or grant of their own.
-        let stranger_key = idfon_core::generate_identity();
+        let stranger_key = idfon_core::IdentityKey::generate();
         let stranger = idfon_core::sign_message(
             &stranger_key,
             "endpoint-a",
@@ -8686,9 +8697,9 @@ mod tests {
         // the authentication; the endpoint claim must not veto it.
         let dir = temp_dir("endpoint-drift");
         let store = Arc::new(Mutex::new(Store::load(&dir).unwrap()));
-        let sender_key = idfon_core::generate_identity();
+        let sender_key = idfon_core::IdentityKey::generate();
         let receiver_key = store.lock().unwrap().identity_key("default").unwrap();
-        let sender_id = idfon_core::peer_id(&sender_key);
+        let sender_id = sender_key.peer_id();
         store.lock().unwrap().peers.push(idfon_protocol::Peer {
             id: sender_id.clone(),
             identity: "default".into(),
@@ -8702,13 +8713,14 @@ mod tests {
             pinned: false,
             instant_call: false,
         });
-        let ticket = idfon_core::issue_capability_ticket(
-            &receiver_key,
-            None,
-            vec![idfon_protocol::Capability::MessageReceive],
-            None,
-            "tk-drift",
-        ).unwrap();
+        let ticket = idfon_core::TicketSpec {
+            subject: None,
+            capabilities: vec![idfon_protocol::Capability::MessageReceive],
+            expires_at: None,
+            ticket_id: "tk-drift".into(),
+            ..Default::default()
+        }
+        .issue(&receiver_key).unwrap();
         let message = idfon_core::sign_message_with_ticket(
             &sender_key,
             "endpoint-b", // drifted claim: not the record's endpoint
@@ -8741,9 +8753,9 @@ mod tests {
     fn capability_ticket_scope_expiry_and_issuer_are_enforced() {
         let dir = temp_dir("capability-policy");
         let store = Arc::new(Mutex::new(Store::load(&dir).unwrap()));
-        let sender_key = idfon_core::generate_identity();
+        let sender_key = idfon_core::IdentityKey::generate();
         let receiver_key = store.lock().unwrap().identity_key("default").unwrap();
-        let sender_id = idfon_core::peer_id(&sender_key);
+        let sender_id = sender_key.peer_id();
         let mut state = store.lock().unwrap();
         state.peers.push(idfon_protocol::Peer {
             id: sender_id.clone(),
@@ -8802,35 +8814,38 @@ mod tests {
                 }
             ));
         };
-        let other_id = idfon_core::peer_id(&idfon_core::generate_identity());
+        let other_id = idfon_core::IdentityKey::generate().peer_id();
         rejected(
-            idfon_core::issue_capability_ticket(
-                &receiver_key,
-                Some(other_id),
-                vec![idfon_protocol::Capability::MessageReceive],
-                None,
-                "ticket-subject",
-            ).unwrap(),
+            idfon_core::TicketSpec {
+                subject: Some(other_id),
+                capabilities: vec![idfon_protocol::Capability::MessageReceive],
+                expires_at: None,
+                ticket_id: "ticket-subject".into(),
+                ..Default::default()
+            }
+            .issue(&receiver_key).unwrap(),
             "message-subject",
         );
         rejected(
-            idfon_core::issue_capability_ticket(
-                &receiver_key,
-                Some(sender_id.clone()),
-                vec![idfon_protocol::Capability::MessageReceive],
-                Some("2000-01-01T00:00:00Z".into()),
-                "ticket-expired",
-            ).unwrap(),
+            idfon_core::TicketSpec {
+                subject: Some(sender_id.clone()),
+                capabilities: vec![idfon_protocol::Capability::MessageReceive],
+                expires_at: Some("2000-01-01T00:00:00Z".into()),
+                ticket_id: "ticket-expired".into(),
+                ..Default::default()
+            }
+            .issue(&receiver_key).unwrap(),
             "message-expired",
         );
         rejected(
-            idfon_core::issue_capability_ticket(
-                &sender_key,
-                Some(sender_id),
-                vec![idfon_protocol::Capability::MessageReceive],
-                None,
-                "ticket-issuer",
-            ).unwrap(),
+            idfon_core::TicketSpec {
+                subject: Some(sender_id),
+                capabilities: vec![idfon_protocol::Capability::MessageReceive],
+                expires_at: None,
+                ticket_id: "ticket-issuer".into(),
+                ..Default::default()
+            }
+            .issue(&sender_key).unwrap(),
             "message-issuer",
         );
         std::fs::remove_dir_all(dir).unwrap();
@@ -8840,8 +8855,8 @@ mod tests {
     fn duplicate_message_is_idempotent_and_conflicting_retry_is_rejected() {
         let dir = temp_dir("idempotency");
         let store = Arc::new(Mutex::new(Store::load(&dir).unwrap()));
-        let key = idfon_core::generate_identity();
-        let peer_id = idfon_core::peer_id(&key);
+        let key = idfon_core::IdentityKey::generate();
+        let peer_id = key.peer_id();
         let mut state = store.lock().unwrap();
         state.peers.push(idfon_protocol::Peer {
             id: peer_id.clone(),
@@ -8913,7 +8928,7 @@ mod tests {
     fn queued_outbound_operation_round_trips_for_restart() {
         let dir = temp_dir("outbound-operation");
         let mut state = Store::load(&dir).unwrap();
-        let key = idfon_core::generate_identity();
+        let key = idfon_core::IdentityKey::generate();
         let envelope = idfon_core::sign_message(
             &key,
             "endpoint-a",
@@ -9680,10 +9695,10 @@ mod tests {
             identity: "default".into(),
             data: serde_json::json!({"peer": peer}),
         };
-        let key = idfon_core::generate_identity();
+        let key = idfon_core::IdentityKey::generate();
         let envelope = idfon_core::sign_state_sync(
             &key,
-            idfon_core::peer_id(&key),
+            key.peer_id(),
             "batch-1".into(),
             vec![event],
         );
@@ -9942,14 +9957,14 @@ mod tests {
         );
         assert!(response.ok);
         let state = store.lock().unwrap();
-        let account = idfon_core::peer_id(&state.identity_key("work").unwrap());
-        let endpoint = idfon_core::peer_id(&state.endpoint_key("work").unwrap());
+        let account = state.identity_key("work").unwrap().peer_id();
+        let endpoint = state.endpoint_key("work").unwrap().peer_id();
         assert_ne!(account, endpoint, "account and endpoint keys must differ");
         assert!(dir.join("endpoint-work.key").is_file());
         // Identities predating the split keep one key for both roles.
         assert_eq!(
-            idfon_core::peer_id(&state.identity_key("default").unwrap()),
-            idfon_core::peer_id(&state.endpoint_key("default").unwrap())
+            state.identity_key("default").unwrap().peer_id(),
+            state.endpoint_key("default").unwrap().peer_id()
         );
         drop(state);
         std::fs::remove_dir_all(dir).unwrap();
@@ -10190,7 +10205,7 @@ mod tests {
             let store = Arc::new(Mutex::new(Store::load(&dir).unwrap()));
             let (peer_id, endpoint) = {
                 let state = store.lock().unwrap();
-                let peer_id = idfon_core::peer_id(&state.identity_key("default").unwrap());
+                let peer_id = state.identity_key("default").unwrap().peer_id();
                 let endpoint_key = state.endpoint_key("default").unwrap();
                 let endpoint = iroh::SecretKey::from_bytes(&endpoint_key.to_bytes()).public();
                 (peer_id, endpoint.to_string())

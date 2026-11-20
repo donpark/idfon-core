@@ -43,13 +43,13 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, TransportError>>,
 {
-    let mut error = TransportError::Failed(format!("connect timed out after {per_try:?}"));
+    let mut error = TransportError::Timeout(per_try);
     for attempt in 0..attempts.max(1) {
         match tokio::time::timeout(per_try, try_once()).await {
             Ok(Ok(value)) => return Ok(value),
             Ok(Err(failure)) => error = failure,
             Err(_) => {
-                error = TransportError::Failed(format!("connect timed out after {per_try:?}"));
+                error = TransportError::Timeout(per_try);
             }
         }
         if attempt + 1 < attempts {
@@ -137,10 +137,17 @@ impl Drop for SideChannelGuard {
 
 #[derive(Debug, Error)]
 pub enum TransportError {
-    #[error("transport failed: {0}")]
-    Failed(String),
+    /// The endpoint was closed (shutdown or rebind); an accept loop ends.
+    #[error("endpoint closed")]
+    Closed,
+    /// Every dial attempt timed out.
+    #[error("connect timed out after {0:?}")]
+    Timeout(Duration),
     #[error("encoded message is too large")]
     MessageTooLarge,
+    /// Anything else, with the underlying error's text.
+    #[error("transport failed: {0}")]
+    Failed(String),
 }
 
 pub type SendFuture<'a> =
@@ -232,24 +239,9 @@ pub struct IrohTransport {
 }
 
 impl IrohTransport {
-    pub async fn bind() -> Result<Self, TransportError> {
-        Self::bind_with_key(None).await
-    }
-
-    pub async fn bind_with_key(key: Option<[u8; 32]>) -> Result<Self, TransportError> {
-        // Pin the UDP port so the endpoint address is stable across restarts
-        // (the endpoint id already is). Off by default: only set
-        // `IDFON_ENDPOINT_PORT` when a stable address is wanted.
-        let port = std::env::var("IDFON_ENDPOINT_PORT")
-            .ok()
-            .and_then(|value| value.parse::<u16>().ok());
-        Self::bind_with_key_port(key, port).await
-    }
-
-    /// Like [`bind_with_key`], but with an explicit port (or ephemeral). Used
-    /// for the default identity; additional identities bind ephemeral so a
-    /// pinned port cannot conflict.
-    pub async fn bind_with_key_port(
+    /// Binds with `key` (random when `None`) on `port` (ephemeral when
+    /// `None`). Public callers use [`IrohTransport::builder`].
+    pub(crate) async fn bind_with(
         key: Option<[u8; 32]>,
         port: Option<u16>,
     ) -> Result<Self, TransportError> {
@@ -393,7 +385,7 @@ impl IrohTransport {
                 .endpoint
                 .accept()
                 .await
-                .ok_or_else(|| TransportError::Failed("message endpoint closed".into()))?;
+                .ok_or(TransportError::Closed)?;
             let handler = handler.clone();
             let alpn = self.alpn.clone();
             let side_channels = self.side_channels.clone();
@@ -488,6 +480,11 @@ impl NodeBuilder {
         self
     }
 
+    /// The endpoint's identity (same as `secret_key(identity.secret_bytes())`).
+    pub fn identity(self, identity: &crate::IdentityKey) -> Self {
+        self.secret_key(identity.secret_bytes())
+    }
+
     /// Pin the UDP port so the address survives restarts (falls back to an
     /// ephemeral port if taken). Default: ephemeral.
     pub fn port(mut self, port: u16) -> Self {
@@ -495,10 +492,20 @@ impl NodeBuilder {
         self
     }
 
+    /// Pin the port from the `IDFON_ENDPOINT_PORT` setting (env var, else
+    /// `endpoint.port` in `~/.idfon/config.toml`), if set. Opt-in: the
+    /// builder reads no configuration unless asked.
+    pub fn port_from_config(mut self) -> Self {
+        if let Some(port) = idfon_config::get("IDFON_ENDPOINT_PORT").and_then(|v| v.trim().parse().ok()) {
+            self.port = Some(port);
+        }
+        self
+    }
+
     /// Bind only. You then run [`IrohTransport::serve`] (or
     /// [`IrohTransport::serve_with_peer`]) yourself.
     pub async fn bind(self) -> Result<IrohTransport, TransportError> {
-        IrohTransport::bind_with_key_port(self.key, self.port).await
+        IrohTransport::bind_with(self.key, self.port).await
     }
 
     /// Bind and accept in the background. Message frames are refused; use
@@ -563,11 +570,14 @@ pub struct TransportManager {
 }
 
 impl TransportManager {
-    pub async fn bind_with_key(key: Option<[u8; 32]>) -> Result<Self, TransportError> {
+    /// Binds the default identity's endpoint with `key` on `port` (pinned
+    /// so paired apps keep its address; `None` = ephemeral). Additional
+    /// identities always bind ephemeral, so a pinned port cannot conflict.
+    pub async fn bind(key: Option<[u8; 32]>, port: Option<u16>) -> Result<Self, TransportError> {
         let mut transports = HashMap::new();
         transports.insert(
             "default".into(),
-            Arc::new(IrohTransport::bind_with_key(key).await?),
+            Arc::new(IrohTransport::bind_with(key, port).await?),
         );
         Ok(Self {
             current: RwLock::new(transports),
@@ -606,7 +616,7 @@ impl TransportManager {
     ) -> Result<String, TransportError> {
         // Extra identities stay ephemeral: the pinned port belongs to the
         // default identity only.
-        let transport = Arc::new(IrohTransport::bind_with_key_port(Some(key), None).await?);
+        let transport = Arc::new(IrohTransport::bind_with(Some(key), None).await?);
         let endpoint_id = transport.endpoint().id().to_string();
         self.current
             .write()
@@ -626,9 +636,8 @@ impl TransportManager {
                 .await
                 .ok_or_else(|| TransportError::Failed("identity transport not found".into()))?;
             match current.serve(handler.clone()).await {
-                Err(TransportError::Failed(message)) if message == "message endpoint closed" => {
-                    continue
-                }
+                // A rebind closed the old endpoint: serve the new one.
+                Err(TransportError::Closed) => continue,
                 result => return result,
             }
         }
@@ -639,7 +648,7 @@ impl TransportManager {
         identity: &str,
         key: Option<[u8; 32]>,
     ) -> Result<String, TransportError> {
-        let replacement = Arc::new(IrohTransport::bind_with_key_port(key, None).await?);
+        let replacement = Arc::new(IrohTransport::bind_with(key, None).await?);
         let id = replacement.endpoint().id().to_string();
         let old = self
             .current
@@ -767,7 +776,7 @@ mod tests {
     fn transport_manager_rebinds_to_a_new_endpoint() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let manager = TransportManager::bind_with_key(Some([1; 32]))
+            let manager = TransportManager::bind(Some([1; 32]), None)
                 .await
                 .unwrap();
             let first = manager.endpoint_id("default").unwrap();
@@ -781,8 +790,8 @@ mod tests {
     fn iroh_transport_round_trips_a_message_ack() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let receiver = IrohTransport::bind().await.unwrap();
-            let sender = IrohTransport::bind().await.unwrap();
+            let receiver = IrohTransport::builder().bind().await.unwrap();
+            let sender = IrohTransport::builder().bind().await.unwrap();
             let receiver = std::sync::Arc::new(receiver);
             receiver.endpoint().online().await;
             sender.endpoint().online().await;

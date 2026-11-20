@@ -37,7 +37,7 @@ async fn start_peer(
     String,
 ) {
     let server = Arc::new(
-        IrohTransport::bind_with_key(Some(peer_key))
+        IrohTransport::builder().secret_key(peer_key).bind()
             .await
             .expect("peer binds"),
     );
@@ -172,7 +172,7 @@ async fn edge_accepts_a_capability_ticket() {
     .expect("edge runs");
 
     let path = format!("/{peer_id}/fs/readme");
-    let issuer = idfon_core::generate_identity();
+    let issuer = idfon_core::IdentityKey::generate();
     let expiry = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -185,13 +185,14 @@ async fn edge_accepts_a_capability_ticket() {
 
     // A ticket with the required capability -> 200, and the edge forwards it
     // to the peer (transparent: the peer sees the caller's credential).
-    let ticket = idfon_core::issue_capability_ticket(
-        &issuer,
-        Some(peer_id.clone()),
-        vec![Capability::new("web.fetch")],
-        Some(expiry.to_string()),
-        "edge-test",
-    )
+    let ticket = idfon_core::TicketSpec {
+        subject: Some(peer_id.clone()),
+        capabilities: vec![Capability::new("web.fetch")],
+        expires_at: Some(expiry.to_string()),
+        ticket_id: "edge-test".into(),
+        ..Default::default()
+    }
+    .issue(&issuer)
     .expect("mints");
     let ticket_json = ticket.token();
     let (status, body) = http_get(
@@ -218,26 +219,28 @@ async fn edge_accepts_a_capability_ticket() {
     assert_eq!(status, 401, "URL tickets are not accepted");
 
     // A ticket missing the required capability is rejected.
-    let wrong_cap = idfon_core::issue_capability_ticket(
-        &issuer,
-        Some(peer_id.clone()),
-        vec![Capability::new("message.receive")],
-        Some(expiry.to_string()),
-        "edge-test",
-    )
+    let wrong_cap = idfon_core::TicketSpec {
+        subject: Some(peer_id.clone()),
+        capabilities: vec![Capability::new("message.receive")],
+        expires_at: Some(expiry.to_string()),
+        ticket_id: "edge-test".into(),
+        ..Default::default()
+    }
+    .issue(&issuer)
     .expect("mints");
     let wrong_json = wrong_cap.token();
     let (status, _) = http_get(handle.addr, &path, &[("x-idfon-ticket", wrong_json)]).await;
     assert_eq!(status, 401, "missing capability is rejected");
 
     // An expired ticket is rejected.
-    let expired = idfon_core::issue_capability_ticket(
-        &issuer,
-        Some(peer_id.clone()),
-        vec![Capability::new("web.fetch")],
-        Some("1".to_owned()),
-        "edge-test",
-    )
+    let expired = idfon_core::TicketSpec {
+        subject: Some(peer_id.clone()),
+        capabilities: vec![Capability::new("web.fetch")],
+        expires_at: Some("1".to_owned()),
+        ticket_id: "edge-test".into(),
+        ..Default::default()
+    }
+    .issue(&issuer)
     .expect("mints");
     let expired_json = expired.token();
     let (status, _) = http_get(handle.addr, &path, &[("x-idfon-ticket", expired_json)]).await;

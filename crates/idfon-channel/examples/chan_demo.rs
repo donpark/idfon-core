@@ -57,7 +57,7 @@ async fn main() -> Result<(), Error> {
 }
 
 async fn serve() -> Result<(), Error> {
-    let transport = Arc::new(IrohTransport::bind().await?);
+    let transport = Arc::new(IrohTransport::builder().bind().await?);
     let addr = transport.endpoint().addr();
     println!("TICKET {}", serde_json::to_string(&addr)?);
 
@@ -99,7 +99,7 @@ async fn serve() -> Result<(), Error> {
 }
 
 async fn bench(peer: &EndpointAddr, size: Option<usize>, count: Option<usize>) -> Result<(), Error> {
-    let transport = Arc::new(IrohTransport::bind().await?);
+    let transport = Arc::new(IrohTransport::builder().bind().await?);
     let sizes: Vec<usize> = match size {
         Some(size) => vec![size],
         None => vec![1024, 64 * 1024],

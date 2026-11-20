@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
-use ed25519_dalek::SigningKey;
+use idfon_core::IdentityKey;
 use idfon_protocol::{Identity, Peer};
 use tokio::sync::Notify;
 
@@ -129,7 +129,7 @@ struct Signer {
     identity: String,
     /// The identity's transport endpoint id (what connects to the relay).
     endpoint: String,
-    key: SigningKey,
+    key: IdentityKey,
 }
 
 struct Client {
@@ -367,7 +367,7 @@ fn snapshot(store: &Arc<Mutex<Store>>) -> Snapshot {
             continue;
         };
         signers.push(Signer {
-            identity: idfon_core::peer_id(&key),
+            identity: key.peer_id(),
             endpoint,
             key,
         });
@@ -656,10 +656,10 @@ mod tests {
     }
 
     fn signer() -> Signer {
-        let key = idfon_core::decode_signing_key(&"07".repeat(32)).expect("fixed key");
+        let key = idfon_core::IdentityKey::decode(&"07".repeat(32)).expect("fixed key");
         let endpoint = "11".repeat(32);
         Signer {
-            identity: idfon_core::peer_id(&key),
+            identity: key.peer_id(),
             endpoint: endpoint.clone(),
             key,
         }

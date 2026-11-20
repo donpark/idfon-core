@@ -69,7 +69,7 @@ conflating them is the main design trap.
 **The rule: a daemon is needed iff multiple local processes must share one
 identity.** An agent is a single process, so it embeds the node and owns its
 endpoint directly. This needs no new machinery: `idfon-core` has no dependency
-on the daemon, and `IrohTransport::bind_with_key(Some(key))` creates a
+on the daemon, and `IrohTransport::builder().identity(&key).bind()` creates a
 standalone endpoint. `idfon-client` (the daemon IPC client) is what an agent
 must *not* need.
 
