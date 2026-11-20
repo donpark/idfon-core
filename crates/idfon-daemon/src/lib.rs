@@ -5521,16 +5521,20 @@ fn identity_create(request: &Request, store: &Arc<Mutex<Store>>) -> Response {
             false,
         );
     }
-    if state
-        .identities
-        .iter()
-        .any(|identity| identity.id == name || identity.name == name)
-    {
+    // Case-insensitive: key files are named `identity-<id>.key`, and on a
+    // case-insensitive filesystem (macOS default) "Work" and "work" would
+    // share one key file. Names differing only by case also read as one.
+    if let Some(existing) = state.identities.iter().find(|identity| {
+        identity.id.eq_ignore_ascii_case(name) || identity.name.eq_ignore_ascii_case(name)
+    }) {
         return error_response(
             request.id.clone(),
             &request.method,
             ErrorCode::InvalidRequest,
-            "identity already exists".into(),
+            format!(
+                "identity {:?} already exists (names are compared ignoring case)",
+                existing.name
+            ),
             false,
         );
     }
@@ -7413,6 +7417,26 @@ mod tests {
             .identities
             .iter()
             .any(|identity| identity.name == "Work"));
+    }
+
+    #[test]
+    fn identity_create_rejects_a_case_only_duplicate() {
+        let dir = temp_dir("identity-case");
+        let store = Arc::new(Mutex::new(Store::load(&dir).unwrap()));
+        let create = |name: &str| {
+            dispatch(
+                Request {
+                    version: PROTOCOL_VERSION,
+                    id: "c".into(),
+                    method: "identity.create".into(),
+                    params: serde_json::json!({"name": name}),
+                },
+                &store,
+            )
+        };
+        assert!(create("travel").ok);
+        let duplicate = create("Travel");
+        assert!(!duplicate.ok, "{duplicate:?}");
     }
 
     #[test]

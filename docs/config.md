@@ -30,6 +30,13 @@ wins; the file is the persisted value; per-run flags (`--relay-urls`, …)
 beat both. `idfon config show` prints every setting with its value (secrets
 masked) and source.
 
+`idfon config set KEY VALUE` / `idfon config unset KEY` edit the file in
+place. KEY is the file key (`edge.url`) or the env var (`IDFON_EDGE_URL`).
+Comments and layout are kept, `true`/`false` and integers are stored typed,
+and the file is written atomically with owner-only permissions (it can hold
+tokens). A running daemon reads the file at start, so `idfon shutdown` to
+apply.
+
 ```toml
 # ~/.idfon/config.toml
 [relay]
@@ -57,5 +64,4 @@ unset.
 
 - Env vars outside `SETTINGS` (voice, telemetry, test knobs, deploy inputs) still
   read the environment directly.
-- No `idfon config set`; edit the file.
 - The apps keep their own UserDefaults settings (`docs/relay-config.md`).

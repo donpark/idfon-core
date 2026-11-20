@@ -89,6 +89,88 @@ pub fn file_value(name: &str) -> Option<String> {
     table_value(file(), key)
 }
 
+/// The setting named by its `config.toml` key (`edge.url`) or env var
+/// (`IDFON_EDGE_URL`).
+pub fn find(name: &str) -> Option<&'static Setting> {
+    SETTINGS
+        .iter()
+        .find(|setting| setting.key == name || setting.env.eq_ignore_ascii_case(name))
+}
+
+/// Writes `value` for a setting into `~/.idfon/config.toml`, keeping the
+/// file's comments and layout. `true`/`false` and integers are stored typed,
+/// anything else as a string. Returns the file written. Running daemons read
+/// the file at start, so they need a restart to see it.
+pub fn set(name: &str, value: &str) -> Result<std::path::PathBuf, String> {
+    edit(name, |table, field| {
+        let item = if let Some(flag) = match value {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        } {
+            toml_edit::value(flag)
+        } else if let Ok(number) = value.parse::<i64>() {
+            toml_edit::value(number)
+        } else {
+            toml_edit::value(value)
+        };
+        // Index assignment keeps an existing key (and the comment above
+        // it); `insert` would replace it.
+        table[field] = item;
+    })
+}
+
+/// Removes a setting from `~/.idfon/config.toml` (the env var, if set, still
+/// applies). Returns the file written.
+pub fn unset(name: &str) -> Result<std::path::PathBuf, String> {
+    edit(name, |table, field| {
+        table.remove(field);
+    })
+}
+
+fn edit(
+    name: &str,
+    change: impl FnOnce(&mut toml_edit::Table, &str),
+) -> Result<std::path::PathBuf, String> {
+    let setting = find(name).ok_or_else(|| {
+        format!("unknown setting {name:?} (see `idfon config show` for the list)")
+    })?;
+    let path = paths::config_file();
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut document = text
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|error| format!("{} is not valid TOML: {error}", path.display()))?;
+    let (section, field) = setting.key.split_once('.').expect("keys are section.field");
+    let table = document
+        .entry(section)
+        .or_insert_with(toml_edit::table)
+        .as_table_mut()
+        .ok_or_else(|| format!("[{section}] in {} is not a table", path.display()))?;
+    change(table, field);
+    if table.is_empty() {
+        document.remove(section);
+    }
+    write_private(&path, &document.to_string())
+        .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+    Ok(path)
+}
+
+/// Atomic write (temp file + rename) with owner-only permissions: the file
+/// can hold tokens.
+fn write_private(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let temp = path.with_extension("toml.tmp");
+    std::fs::write(&temp, text)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::fs::rename(&temp, path)
+}
+
 fn resolve(
     name: &str,
     env: impl Fn(&str) -> Option<String>,
@@ -216,6 +298,28 @@ mod tests {
         merge_relay_conf(&mut file, "# legacy\nurls=https://conf\ntoken = t1\n");
         assert_eq!(table_value(&file, "relay.urls").as_deref(), Some("https://toml"));
         assert_eq!(table_value(&file, "relay.token").as_deref(), Some("t1"));
+    }
+
+    #[test]
+    fn set_keeps_comments_and_types_values() {
+        let home = std::env::temp_dir().join(format!("idfon-config-set-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("config.toml"), "# mine\n[edge]\n# the edge\nurl = \"https://old\"\n").unwrap();
+        // SAFETY: test-only; no other test reads IDFON_HOME concurrently.
+        unsafe { std::env::set_var("IDFON_HOME", &home) };
+        set("edge.url", "https://new").unwrap();
+        set("IDFON_RELAY_ONLY", "true").unwrap();
+        set("daemon.idle_exit_secs", "0").unwrap();
+        assert!(set("no.such", "x").is_err());
+        let text = std::fs::read_to_string(home.join("config.toml")).unwrap();
+        assert!(text.contains("# mine") && text.contains("# the edge"), "{text}");
+        assert!(text.contains("url = \"https://new\""), "{text}");
+        assert!(text.contains("only = true") && text.contains("idle_exit_secs = 0"), "{text}");
+        unset("relay.only").unwrap();
+        let text = std::fs::read_to_string(home.join("config.toml")).unwrap();
+        assert!(!text.contains("[relay]"), "{text}");
+        unsafe { std::env::remove_var("IDFON_HOME") };
+        std::fs::remove_dir_all(&home).unwrap();
     }
 
     #[test]
