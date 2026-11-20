@@ -23,11 +23,11 @@ impl AccountResolver for OnePeer {
 #[tokio::test]
 async fn fetches_a_resource_from_a_peer_over_h3() {
     let server = Arc::new(
-        IrohTransport::bind_with_key(Some([11; 32]))
+        IrohTransport::builder().secret_key([11; 32]).bind()
             .await
             .expect("server binds"),
     );
-    let transport = IrohTransport::bind_with_key(Some([12; 32]))
+    let transport = IrohTransport::builder().secret_key([12; 32]).bind()
         .await
         .expect("client binds");
     let _ = tokio::time::timeout(Duration::from_secs(5), server.endpoint().online()).await;

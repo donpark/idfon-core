@@ -990,7 +990,7 @@ fn json(status: StatusCode, body: impl Into<serde_json::Value>) -> Response<Resp
 mod tests {
     use super::*;
     use http_body_util::BodyExt;
-    use idfon_core::{generate_identity, issue_capability_ticket};
+    use idfon_core::{IdentityKey, TicketSpec};
 
     #[test]
     fn apns_env_fallback_recognizes_the_environment_refusal() {
@@ -1038,8 +1038,8 @@ mod tests {
         assert!(HttpApns::is_stale_token(&HttpApns::stale_token(&refused)));
         assert!(!HttpApns::is_stale_token(&refused));
 
-        let key = generate_identity();
-        let account = idfon_core::peer_id(&key);
+        let key = IdentityKey::generate();
+        let account = key.peer_id();
         let (store, routes) = routes(Some(Arc::new(StaleApns)));
         let ticket = self_ticket(&key, None, Some("2999-01-01T00:00:00Z".to_owned()));
 
@@ -1073,8 +1073,8 @@ mod tests {
 
     #[test]
     fn registration_carries_the_apns_environment() {
-        let key = generate_identity();
-        let account = idfon_core::peer_id(&key);
+        let key = IdentityKey::generate();
+        let account = key.peer_id();
         let (store, routes) = routes(Some(MockApns::new()));
         let ticket = self_ticket(&key, None, Some("2999-01-01T00:00:00Z".to_owned()));
 
@@ -1133,9 +1133,9 @@ mod tests {
 
     #[test]
     fn health_reports_counts_and_never_tokens() {
-        let key = generate_identity();
-        let account = idfon_core::peer_id(&key);
-        let other_key = generate_identity();
+        let key = IdentityKey::generate();
+        let account = key.peer_id();
+        let other_key = IdentityKey::generate();
         let (_store, routes) = routes(Some(MockApns::new()));
         let ticket = self_ticket(&key, None, Some("2999-01-01T00:00:00Z".to_owned()));
 
@@ -1173,9 +1173,9 @@ mod tests {
 
     #[test]
     fn pending_offer_survives_for_pull_and_dies_with_the_cancel() {
-        let key = generate_identity();
-        let account = idfon_core::peer_id(&key);
-        let other_key = generate_identity();
+        let key = IdentityKey::generate();
+        let account = key.peer_id();
+        let other_key = IdentityKey::generate();
         let (_store, routes) = routes(Some(MockApns::new()));
         let ticket = self_ticket(&key, None, Some("2999-01-01T00:00:00Z".to_owned()));
         let call = "22222222-2222-2222-2222-222222222222";
@@ -1236,8 +1236,8 @@ mod tests {
 
     #[test]
     fn push_first_ring_then_offer_stores_the_invite_without_a_second_push() {
-        let key = generate_identity();
-        let account = idfon_core::peer_id(&key);
+        let key = IdentityKey::generate();
+        let account = key.peer_id();
         let apns = MockApns::new();
         let (store, routes) = routes(Some(apns.clone()));
         store.register(&account, "tok-offer", "com.idfon.ios.voip", None, PushKind::Voip, None);
@@ -1369,24 +1369,25 @@ mod tests {
     }
 
     fn self_ticket(
-        key: &ed25519_dalek::SigningKey,
+        key: &idfon_core::IdentityKey,
         subject: Option<String>,
         expires_at: Option<String>,
     ) -> CapabilityTicket {
-        issue_capability_ticket(
-            key,
-            subject,
-            vec![idfon_protocol::Capability::new("message.send")],
-            expires_at,
-            "test-ticket",
-        )
+        TicketSpec {
+            subject: subject,
+            capabilities: vec![idfon_protocol::Capability::new("message.send")],
+            expires_at: expires_at,
+            ticket_id: "test-ticket".into(),
+            ..Default::default()
+        }
+        .issue(key)
         .expect("mints")
     }
 
     #[test]
     fn register_and_ring_fan_out_identifiers_only() {
-        let key = generate_identity();
-        let account = idfon_core::peer_id(&key);
+        let key = IdentityKey::generate();
+        let account = key.peer_id();
         let apns = MockApns::new();
         let (_store, routes) = routes(Some(apns.clone()));
         let ticket = self_ticket(&key, None, Some("2999-01-01T00:00:00Z".to_owned()));
@@ -1430,8 +1431,8 @@ mod tests {
     fn scored_device(
         thresholds: Option<serde_json::Value>,
     ) -> (Arc<MockApns>, PushRoutes, String, CapabilityTicket) {
-        let key = generate_identity();
-        let account = idfon_core::peer_id(&key);
+        let key = IdentityKey::generate();
+        let account = key.peer_id();
         let apns = MockApns::new();
         let (_store, routes) = routes(Some(apns.clone()));
         let ticket = self_ticket(&key, None, Some("2999-01-01T00:00:00Z".to_owned()));
@@ -1548,9 +1549,9 @@ mod tests {
 
     #[test]
     fn ring_rejects_unrelated_tickets() {
-        let callee = generate_identity();
-        let stranger = generate_identity();
-        let account = idfon_core::peer_id(&callee);
+        let callee = IdentityKey::generate();
+        let stranger = IdentityKey::generate();
+        let account = callee.peer_id();
         let apns = MockApns::new();
         let (_store, routes) = routes(Some(apns.clone()));
         let body = serde_json::json!({ "call_uuid": "uuid-1", "caller_id": "caller" });
@@ -1572,7 +1573,7 @@ mod tests {
             &routes,
             &account,
             "/_push/ring",
-            Some(&self_ticket(&callee, Some(idfon_core::peer_id(&stranger)), None)),
+            Some(&self_ticket(&callee, Some(stranger.peer_id()), None)),
             body,
         );
         assert_eq!(status, StatusCode::FORBIDDEN);
@@ -1581,8 +1582,8 @@ mod tests {
 
     #[test]
     fn expired_tickets_are_refused() {
-        let key = generate_identity();
-        let account = idfon_core::peer_id(&key);
+        let key = IdentityKey::generate();
+        let account = key.peer_id();
         let (_store, routes) = routes(None);
         let expired = self_ticket(&key, None, Some("2000-01-01T00:00:00Z".to_owned()));
         let (status, _) = post(
@@ -1597,8 +1598,8 @@ mod tests {
 
     #[test]
     fn cancel_retracts_and_unregister_stops_delivery() {
-        let key = generate_identity();
-        let account = idfon_core::peer_id(&key);
+        let key = IdentityKey::generate();
+        let account = key.peer_id();
         let apns = MockApns::new();
         let (_store, routes) = routes(Some(apns.clone()));
         let ticket = self_ticket(&key, None, None);
@@ -1645,10 +1646,10 @@ mod tests {
 
     #[test]
     fn ring_accepts_a_caller_self_issued_statement() {
-        let callee = generate_identity();
-        let caller = generate_identity();
-        let account = idfon_core::peer_id(&callee);
-        let caller_id = idfon_core::peer_id(&caller);
+        let callee = IdentityKey::generate();
+        let caller = IdentityKey::generate();
+        let account = callee.peer_id();
+        let caller_id = caller.peer_id();
         let apns = MockApns::new();
         let (_store, routes) = routes(Some(apns));
         // Registration stays strict: the caller cannot claim the ref's channel.
@@ -1673,8 +1674,8 @@ mod tests {
 
     #[test]
     fn unconfigured_push_answers_503() {
-        let key = generate_identity();
-        let account = idfon_core::peer_id(&key);
+        let key = IdentityKey::generate();
+        let account = key.peer_id();
         let (_store, routes) = routes(None);
         let (status, _) = post(
             &routes,

@@ -144,11 +144,11 @@ mod tests {
     #[tokio::test]
     async fn router_serves_and_client_fetches_over_iroh() {
         let server = Arc::new(
-            IrohTransport::bind_with_key(Some([7; 32]))
+            IrohTransport::builder().secret_key([7; 32]).bind()
                 .await
                 .expect("server binds"),
         );
-        let client_transport = IrohTransport::bind_with_key(Some([8; 32]))
+        let client_transport = IrohTransport::builder().secret_key([8; 32]).bind()
             .await
             .expect("client binds");
         let _ = tokio::time::timeout(Duration::from_secs(5), server.endpoint().online()).await;

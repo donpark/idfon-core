@@ -28,14 +28,69 @@ pub enum AuthError {
     Serialization,
 }
 
-/// Generates a new Ed25519 identity key. Keep the signing key in secure storage.
-pub fn generate_identity() -> SigningKey {
-    SigningKey::generate(&mut UnwrapErr(SysRng))
+
+
+/// A peer's identity: the Ed25519 key it signs with. The hex of its public
+/// half is the peer id (`PeerAuth.peer_id`, ticket subjects and issuers),
+/// and its secret bytes are the iroh endpoint key. Every public API that
+/// needs "who am I" takes `&IdentityKey`; it derefs to the signing key.
+#[derive(Clone, PartialEq, Eq)]
+pub struct IdentityKey(SigningKey);
+
+impl IdentityKey {
+    /// A fresh random identity. Keep it in secure storage.
+    pub fn generate() -> Self {
+        Self(SigningKey::generate(&mut UnwrapErr(SysRng)))
+    }
+
+    pub fn from_bytes(secret: [u8; 32]) -> Self {
+        Self(SigningKey::from_bytes(&secret))
+    }
+
+    /// From the 64-hex secret written by [`IdentityKey::encode`].
+    pub fn decode(hex: &str) -> Option<Self> {
+        decode_fixed::<32>(hex).map(Self::from_bytes)
+    }
+
+    /// The secret as 64 hex chars (the key-file format).
+    pub fn encode(&self) -> String {
+        encode_hex(&self.0.to_bytes())
+    }
+
+    /// The secret bytes (also the iroh endpoint secret key).
+    pub fn secret_bytes(&self) -> [u8; 32] {
+        self.0.to_bytes()
+    }
+
+    /// The public key as 64 hex chars: this identity's peer id.
+    pub fn peer_id(&self) -> String {
+        encode_hex(self.0.verifying_key().as_bytes())
+    }
+
+    pub fn signing_key(&self) -> &SigningKey {
+        &self.0
+    }
 }
 
-/// Returns the stable hexadecimal public-key identity used as `PeerAuth.peer_id`.
-pub fn peer_id(key: &SigningKey) -> String {
-    encode_hex(key.verifying_key().as_bytes())
+impl std::ops::Deref for IdentityKey {
+    type Target = SigningKey;
+
+    fn deref(&self) -> &SigningKey {
+        &self.0
+    }
+}
+
+impl From<SigningKey> for IdentityKey {
+    fn from(key: SigningKey) -> Self {
+        Self(key)
+    }
+}
+
+impl std::fmt::Debug for IdentityKey {
+    /// Never prints the secret.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("IdentityKey").field(&self.peer_id()).finish()
+    }
 }
 
 /// Mint a W3C-traceparent-shaped correlation id (`00-<32hex>-<16hex>-01`).
@@ -89,22 +144,13 @@ pub fn parse_endpoint_ref(value: &str) -> Option<iroh::EndpointId> {
     }
 }
 
-pub fn encode_signing_key(key: &SigningKey) -> String {
-    encode_hex(&key.to_bytes())
-}
 
-pub fn signing_key_bytes(key: &SigningKey) -> [u8; 32] {
-    key.to_bytes()
-}
 
-pub fn decode_signing_key(value: &str) -> Option<SigningKey> {
-    decode_fixed::<32>(value).map(|bytes| SigningKey::from_bytes(&bytes))
-}
 
 /// Signs a logical message. The endpoint ID is included to bind the proof to
 /// the endpoint that claims to represent the peer.
 pub fn sign_message(
-    key: &SigningKey,
+    key: &IdentityKey,
     endpoint_id: impl Into<String>,
     message_id: impl Into<String>,
     content: MessageContent,
@@ -123,7 +169,7 @@ pub fn sign_message(
 }
 
 pub fn sign_message_with_ticket(
-    key: &SigningKey,
+    key: &IdentityKey,
     endpoint_id: impl Into<String>,
     message_id: impl Into<String>,
     content: MessageContent,
@@ -132,7 +178,7 @@ pub fn sign_message_with_ticket(
     capability_ticket: Option<CapabilityTicket>,
 ) -> Result<MessageEnvelope, AuthError> {
     let sender = PeerAuth {
-        peer_id: peer_id(key),
+        peer_id: key.peer_id(),
         endpoint_id: endpoint_id.into(),
         signature: String::new(),
     };
@@ -324,7 +370,7 @@ impl<'de> serde::Deserialize<'de> for CapabilityTicket {
 /// Mints a ticket. `subject = None` makes it a public/bearer ticket (audience =
 /// the issuer, `bearer` set in the signed document).
 fn sign_ticket(
-    key: &SigningKey,
+    key: &IdentityKey,
     subject: Option<String>,
     expires_at: Option<String>,
     mut doc: TicketDoc,
@@ -344,9 +390,8 @@ fn sign_ticket(
     CapabilityTicket::from_delegation(Delegation::issue(key, audience, &DocText(json), expires))
 }
 
-/// What a capability ticket grants, to whom, for how long. One struct in
-/// place of the `issue_capability_ticket*` variants (which remain as thin
-/// wrappers):
+/// What a capability ticket grants, to whom, for how long. The one way to
+/// issue a ticket:
 ///
 /// ```ignore
 /// let ticket = TicketSpec::new("t-1")
@@ -410,106 +455,22 @@ impl TicketSpec {
     }
 
     /// Sign the ticket with the issuer's key.
-    pub fn issue(self, key: &SigningKey) -> Result<CapabilityTicket, AuthError> {
-        issue_capability_ticket_with_voice(
+    pub fn issue(self, key: &IdentityKey) -> Result<CapabilityTicket, AuthError> {
+        sign_ticket(
             key,
             self.subject,
-            self.conversation,
-            self.capabilities,
             self.expires_at,
-            self.ticket_id,
-            self.voice,
-            self.path_scope,
+            TicketDoc {
+                capabilities: self.capabilities,
+                conversation: self.conversation,
+                path_scope: self.path_scope,
+                ticket_id: self.ticket_id,
+                voice: self.voice,
+                relay: None,
+                bearer: false,
+            },
         )
     }
-}
-
-pub fn issue_capability_ticket(
-    key: &SigningKey,
-    subject: Option<String>,
-    capabilities: Vec<Capability>,
-    expires_at: Option<String>,
-    ticket_id: impl Into<String>,
-) -> Result<CapabilityTicket, AuthError> {
-    issue_capability_ticket_for_conversation(
-        key,
-        subject,
-        None,
-        capabilities,
-        expires_at,
-        ticket_id,
-    )
-}
-
-pub fn issue_capability_ticket_for_conversation(
-    key: &SigningKey,
-    subject: Option<String>,
-    conversation: Option<String>,
-    capabilities: Vec<Capability>,
-    expires_at: Option<String>,
-    ticket_id: impl Into<String>,
-) -> Result<CapabilityTicket, AuthError> {
-    issue_capability_ticket_with_voice(
-        key,
-        subject,
-        conversation,
-        capabilities,
-        expires_at,
-        ticket_id,
-        None,
-        None,
-    )
-}
-
-/// Like [`issue_capability_ticket`], but bounds the ticket to a path prefix
-/// (e.g. `/fs/public`). The prefix is signed, so it cannot be widened.
-pub fn issue_capability_ticket_scoped(
-    key: &SigningKey,
-    subject: Option<String>,
-    capabilities: Vec<Capability>,
-    expires_at: Option<String>,
-    ticket_id: impl Into<String>,
-    path_scope: Option<String>,
-) -> Result<CapabilityTicket, AuthError> {
-    issue_capability_ticket_with_voice(
-        key,
-        subject,
-        None,
-        capabilities,
-        expires_at,
-        ticket_id,
-        None,
-        path_scope,
-    )
-}
-
-/// Like [`issue_capability_ticket_for_conversation`], but also signs a
-/// [`VoiceRoute`] describing how the issuer wants voice carried.
-#[allow(clippy::too_many_arguments)]
-pub fn issue_capability_ticket_with_voice(
-    key: &SigningKey,
-    subject: Option<String>,
-    conversation: Option<String>,
-    capabilities: Vec<Capability>,
-    expires_at: Option<String>,
-    ticket_id: impl Into<String>,
-    voice: Option<VoiceRoute>,
-    path_scope: Option<String>,
-) -> Result<CapabilityTicket, AuthError> {
-    sign_ticket(
-        key,
-        subject,
-        expires_at,
-        TicketDoc {
-            capabilities,
-            conversation,
-            path_scope,
-            ticket_id: ticket_id.into(),
-            voice,
-            relay: None,
-            bearer: false,
-        },
-    )
 }
 
 /// The signed payload of a relay reachability grant (a "claiming" ticket): the
@@ -538,7 +499,7 @@ impl RcanCapability for RelayGrant {
 /// admits the subject on the strength of the signature; `Delegation::delegate`
 /// lets an admitted caller re-delegate a narrower grant downstream.
 pub fn issue_relay_grant(
-    key: &SigningKey,
+    key: &IdentityKey,
     subject_endpoint_id: impl Into<String>,
     relay_url: impl Into<String>,
     expires_at: Option<String>,
@@ -580,7 +541,7 @@ pub fn relay_owner_proof_bytes(identity: &str, endpoint: &str, nonce: &str) -> V
 /// `identity` is the lowercase hex public key, as the relay lists it in
 /// `IDFON_RELAY_ISSUERS`.
 pub fn sign_relay_owner_proof(
-    key: &SigningKey,
+    key: &IdentityKey,
     identity: &str,
     endpoint: &str,
     nonce: &str,
@@ -609,7 +570,7 @@ fn expiry_epoch(value: &str) -> Option<u64> {
 }
 
 pub fn sign_state_sync(
-    key: &SigningKey,
+    key: &IdentityKey,
     account_id: String,
     batch_id: String,
     events: Vec<idfon_protocol::Event>,
@@ -722,10 +683,10 @@ mod tests {
 
     #[test]
     fn ticket_spec_issues_what_it_says() {
-        let issuer = generate_identity();
-        let holder = generate_identity();
+        let issuer = IdentityKey::generate();
+        let holder = IdentityKey::generate();
         let ticket = TicketSpec::new("t-spec")
-            .subject(peer_id(&holder))
+            .subject(holder.peer_id())
             .grant(Capability::MessageReceive)
             .conversation("room-1")
             .path_scope("/fs/public")
@@ -733,8 +694,8 @@ mod tests {
             .issue(&issuer)
             .unwrap();
         let ticket = CapabilityTicket::decode(&ticket.token()).unwrap();
-        assert_eq!(ticket.issuer(), peer_id(&issuer));
-        assert_eq!(ticket.subject(), Some(peer_id(&holder)));
+        assert_eq!(ticket.issuer(), issuer.peer_id());
+        assert_eq!(ticket.subject(), Some(holder.peer_id()));
         assert_eq!(ticket.capabilities(), &[Capability::MessageReceive]);
         assert_eq!(ticket.conversation(), Some("room-1"));
         assert_eq!(ticket.path_scope(), Some("/fs/public"));
@@ -746,8 +707,8 @@ mod tests {
 
     #[test]
     fn endpoint_ref_round_trips_hex_and_z32() {
-        let key = generate_identity();
-        let id: iroh::EndpointId = peer_id(&key).parse().unwrap();
+        let key = IdentityKey::generate();
+        let id: iroh::EndpointId = key.peer_id().parse().unwrap();
         let hex = id.to_string();
         assert_eq!(hex.len(), 64);
         assert_eq!(parse_endpoint_ref(&hex), Some(id));
@@ -763,7 +724,7 @@ mod tests {
 
     #[test]
     fn signed_message_verifies_and_tampering_fails() {
-        let key = generate_identity();
+        let key = IdentityKey::generate();
         let mut message = sign_message(
             &key,
             "endpoint-a",
@@ -784,17 +745,18 @@ mod tests {
 
     #[test]
     fn capability_ticket_round_trips_and_tampering_fails() {
-        let key = generate_identity();
-        let subject = peer_id(&generate_identity());
-        let ticket = issue_capability_ticket(
-            &key,
-            Some(subject.clone()),
-            vec![Capability::MessageReceive],
-            Some("2099-01-01T00:00:00Z".into()),
-            "ticket-1",
-        )
+        let key = IdentityKey::generate();
+        let subject = IdentityKey::generate().peer_id();
+        let ticket = TicketSpec {
+            subject: Some(subject.clone()),
+            capabilities: vec![Capability::MessageReceive],
+            expires_at: Some("2099-01-01T00:00:00Z".into()),
+            ticket_id: "ticket-1".into(),
+            ..Default::default()
+        }
+        .issue(&key)
         .expect("mints");
-        assert_eq!(ticket.issuer(), peer_id(&key));
+        assert_eq!(ticket.issuer(), key.peer_id());
         assert_eq!(ticket.subject(), Some(subject));
         assert_eq!(ticket.ticket_id(), "ticket-1");
         assert!(!ticket.bearer());
@@ -819,14 +781,15 @@ mod tests {
 
     #[test]
     fn bearer_ticket_has_no_subject_and_still_verifies() {
-        let key = generate_identity();
-        let ticket = issue_capability_ticket(
-            &key,
-            None,
-            vec![Capability::MessageReceive],
-            None,
-            "t-public",
-        )
+        let key = IdentityKey::generate();
+        let ticket = TicketSpec {
+            subject: None,
+            capabilities: vec![Capability::MessageReceive],
+            expires_at: None,
+            ticket_id: "t-public".into(),
+            ..Default::default()
+        }
+        .issue(&key)
         .expect("mints");
         assert!(ticket.bearer());
         assert_eq!(ticket.subject(), None);
@@ -838,8 +801,8 @@ mod tests {
 
     #[test]
     fn voice_route_is_signed_into_the_ticket() {
-        let key = generate_identity();
-        let subject = peer_id(&generate_identity());
+        let key = IdentityKey::generate();
+        let subject = IdentityKey::generate().peer_id();
         let voice = VoiceRoute {
             mode: VoiceMode::NativeDuplex,
             audio: Some("pcm24k".into()),
@@ -848,29 +811,29 @@ mod tests {
             stt: None,
             tts: None,
         };
-        let ticket = issue_capability_ticket_with_voice(
-            &key,
-            Some(subject.clone()),
-            None,
-            vec![Capability::MessageReceive],
-            None,
-            "t-voice",
-            Some(voice.clone()),
-            None,
-        )
+        let ticket = TicketSpec {
+            subject: Some(subject.clone()),
+            conversation: None,
+            capabilities: vec![Capability::MessageReceive],
+            expires_at: None,
+            ticket_id: "t-voice".into(),
+            voice: Some(voice.clone()),
+            path_scope: None,
+        }
+        .issue(&key)
         .expect("mints");
         assert_eq!(ticket.voice(), Some(&voice));
         // A different voice route is a different signed document.
-        let plain = issue_capability_ticket_with_voice(
-            &key,
-            Some(subject),
-            None,
-            vec![Capability::MessageReceive],
-            None,
-            "t-voice",
-            None,
-            None,
-        )
+        let plain = TicketSpec {
+            subject: Some(subject),
+            conversation: None,
+            capabilities: vec![Capability::MessageReceive],
+            expires_at: None,
+            ticket_id: "t-voice".into(),
+            voice: None,
+            path_scope: None,
+        }
+        .issue(&key)
         .expect("mints");
         assert_eq!(plain.voice(), None);
         assert_ne!(ticket.token(), plain.token());
@@ -880,17 +843,18 @@ mod tests {
     fn a_holder_can_redelegate_but_not_widen() {
         use rcan::Authorizer;
 
-        let owner = generate_identity();
-        let holder = generate_identity();
-        let caller = generate_identity();
-        let ticket = issue_capability_ticket_scoped(
-            &owner,
-            Some(peer_id(&holder)),
-            vec![Capability::MessageReceive, Capability::LiveAudioSubscribe],
-            None,
-            "t-redelegate",
-            Some("/fs".into()),
-        )
+        let owner = IdentityKey::generate();
+        let holder = IdentityKey::generate();
+        let caller = IdentityKey::generate();
+        let ticket = TicketSpec {
+            subject: Some(holder.peer_id()),
+            capabilities: vec![Capability::MessageReceive, Capability::LiveAudioSubscribe],
+            expires_at: None,
+            ticket_id: "t-redelegate".into(),
+            path_scope: Some("/fs".into()),
+            ..Default::default()
+        }
+        .issue(&owner)
         .expect("mints");
 
         let doc = |capabilities: Vec<Capability>, path_scope: &str| TicketDoc {
@@ -960,7 +924,7 @@ mod tests {
 
     #[test]
     fn state_sync_signature_covers_batch_and_events() {
-        let key = generate_identity();
+        let key = IdentityKey::generate();
         let event = idfon_protocol::Event {
             event_id: "event-1".into(),
             cursor: "cursor-1".into(),
@@ -969,7 +933,7 @@ mod tests {
             identity: "default".into(),
             data: serde_json::json!({"peer_id": "alice"}),
         };
-        let mut envelope = sign_state_sync(&key, peer_id(&key), "batch-1".into(), vec![event]);
+        let mut envelope = sign_state_sync(&key, key.peer_id(), "batch-1".into(), vec![event]);
         assert_eq!(verify_state_sync(&envelope), Ok(()));
         envelope.batch_id = "batch-2".into();
         assert_eq!(
@@ -980,7 +944,7 @@ mod tests {
 
     #[test]
     fn endpoint_binding_is_authenticated() {
-        let key = generate_identity();
+        let key = IdentityKey::generate();
         let mut message = sign_message(
             &key,
             "endpoint-a",
@@ -1001,7 +965,7 @@ mod tests {
         // Cross-language contract: deploy/relay-auth/test.mjs verifies the same
         // token with node:crypto. ed25519 is deterministic, so any drift in the
         // rcan payload encoding breaks one side.
-        let key = decode_signing_key(&"07".repeat(32)).expect("fixed key");
+        let key = IdentityKey::decode(&"07".repeat(32)).expect("fixed key");
         let token = issue_relay_grant(
             &key,
             "11".repeat(32),
@@ -1021,8 +985,8 @@ mod tests {
         // Cross-language contract with deploy/relay-auth/server.mjs: the
         // owner proof bytes and their ed25519 signature. test.mjs verifies the
         // same vector with node:crypto (verifyEd25519).
-        let key = decode_signing_key(&"07".repeat(32)).expect("fixed key");
-        let identity = peer_id(&key);
+        let key = IdentityKey::decode(&"07".repeat(32)).expect("fixed key");
+        let identity = key.peer_id();
         assert_eq!(identity, "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c");
         let endpoint = "11".repeat(32);
         let nonce = "00112233445566778899aabbccddeeff";
@@ -1038,7 +1002,7 @@ mod tests {
 
     #[test]
     fn trace_is_unsigned_and_does_not_break_verification() {
-        let key = generate_identity();
+        let key = IdentityKey::generate();
         let mut message = sign_message(
             &key,
             "endpoint-a",

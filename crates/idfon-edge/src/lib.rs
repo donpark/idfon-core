@@ -408,7 +408,7 @@ pub async fn run(config: EdgeConfig) -> anyhow::Result<EdgeHandle> {
         rate_limit_per_minute,
         local_routes,
     } = config;
-    let transport = Arc::new(IrohTransport::bind_with_key(Some(key)).await?);
+    let transport = Arc::new(IrohTransport::builder().secret_key(key).port_from_config().bind().await?);
     let _ = tokio::time::timeout(ONLINE_TIMEOUT, transport.endpoint().online()).await;
     let endpoint_id = transport.endpoint().id().to_string();
     let addr_ticket = serde_json::to_string(&transport.endpoint().addr())?;

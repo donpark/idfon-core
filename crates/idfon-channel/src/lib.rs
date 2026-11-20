@@ -256,11 +256,11 @@ mod tests {
     /// Two real transports: `(server, client)`.
     async fn pair() -> (Arc<IrohTransport>, Arc<IrohTransport>) {
         let server = Arc::new(
-            IrohTransport::bind_with_key(Some(test_key()))
+            IrohTransport::builder().secret_key(test_key()).bind()
                 .await
                 .expect("server binds"),
         );
-        let client = IrohTransport::bind_with_key(Some(test_key()))
+        let client = IrohTransport::builder().secret_key(test_key()).bind()
             .await
             .expect("client binds");
         let _ = tokio::time::timeout(Duration::from_secs(5), server.endpoint().online()).await;

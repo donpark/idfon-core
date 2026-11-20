@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context};
-use idfon_core::{decode_signing_key, encode_signing_key, generate_identity, signing_key_bytes};
+use idfon_core::IdentityKey;
 use idfon_edge::{
     run, AppLinksRoutes, ApnsConfig, ApnsSender, EdgeAuth, EdgeConfig, FilesRoutes, HttpApns, PushRoutes, PushStore,
 };
@@ -422,30 +422,30 @@ fn load_or_create_key(path: &Path) -> anyhow::Result<[u8; 32]> {
         }
     }
     if let Ok(text) = std::fs::read_to_string(path) {
-        let key = decode_signing_key(text.trim()).ok_or_else(|| {
+        let key = IdentityKey::decode(text.trim()).ok_or_else(|| {
             anyhow!(
                 "invalid key file {}: expected 64 hex characters",
                 path.display()
             )
         })?;
-        return Ok(signing_key_bytes(&key));
+        return Ok(key.secret_bytes());
     }
-    let key = generate_identity();
+    let key = IdentityKey::generate();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, encode_signing_key(&key))?;
+    std::fs::write(path, key.encode())?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     }
     eprintln!("generated a new edge identity at {}", path.display());
-    Ok(signing_key_bytes(&key))
+    Ok(key.secret_bytes())
 }
 
 fn parse_key(value: &str) -> Option<[u8; 32]> {
-    decode_signing_key(value.trim()).map(|key| signing_key_bytes(&key))
+    IdentityKey::decode(value.trim()).map(|key| key.secret_bytes())
 }
 
 #[cfg(test)]

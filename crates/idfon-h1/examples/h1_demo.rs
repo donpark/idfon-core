@@ -69,7 +69,7 @@ fn parse_path(args: &mut impl Iterator<Item = String>) -> Result<String, Error> 
 }
 
 async fn serve() -> Result<(), Error> {
-    let transport = Arc::new(IrohTransport::bind().await?);
+    let transport = Arc::new(IrohTransport::builder().bind().await?);
     let addr = transport.endpoint().addr();
     println!("TICKET {}", serde_json::to_string(&addr)?);
     println!("iroh address: {}", idfon_h1::uri(addr.id, "/"));
@@ -121,7 +121,7 @@ async fn serve() -> Result<(), Error> {
 }
 
 async fn fetch(peer: &EndpointAddr, path: &str) -> Result<(), Error> {
-    let transport = Arc::new(IrohTransport::bind().await?);
+    let transport = Arc::new(IrohTransport::builder().bind().await?);
     let started = std::time::Instant::now();
     let response = H1Client::new(&transport).get(peer, path).await?;
     let elapsed = started.elapsed();
@@ -143,7 +143,7 @@ async fn converse(peer: &EndpointAddr, path: &str) -> Result<(), Error> {
         WebSocketStream,
     };
 
-    let transport = Arc::new(IrohTransport::bind().await?);
+    let transport = Arc::new(IrohTransport::builder().bind().await?);
     let client = H1Client::new(&transport);
     let mut connection = client.connect(peer).await?;
     let request = http::Request::get(path)
