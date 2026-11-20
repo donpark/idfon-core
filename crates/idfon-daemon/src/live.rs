@@ -28,9 +28,17 @@ impl Publisher {
     }
 }
 
-static LIVE_PUBLISHERS: OnceLock<Mutex<HashMap<String, Publisher>>> = OnceLock::new();
+/// A registered publisher plus what `live.list` reports about it.
+struct Running {
+    publisher: Publisher,
+    ticket: String,
+    kind: &'static str,
+    file: serde_json::Value,
+}
 
-fn publishers() -> &'static Mutex<HashMap<String, Publisher>> {
+static LIVE_PUBLISHERS: OnceLock<Mutex<HashMap<String, Running>>> = OnceLock::new();
+
+fn publishers() -> &'static Mutex<HashMap<String, Running>> {
     LIVE_PUBLISHERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -116,7 +124,15 @@ pub fn live_publish(request: &Request) -> Response {
     publishers()
         .lock()
         .expect("live publishers poisoned")
-        .insert(id.clone(), publisher);
+        .insert(
+            id.clone(),
+            Running {
+                publisher,
+                ticket: ticket.to_string(),
+                kind,
+                file: serde_json::json!(file),
+            },
+        );
     ok(
         &request.id,
         serde_json::json!({"id": id, "name": name, "ticket": ticket, "file": file, "kind": kind,
@@ -163,7 +179,7 @@ pub fn live_stop(request: &Request) -> Response {
         .expect("live publishers poisoned")
         .remove(id)
     {
-        Some(publisher) => publisher.stop(),
+        Some(running) => running.publisher.stop(),
         None => {
             return crate::error_response(
                 request.id.clone(),
@@ -461,14 +477,20 @@ pub fn live_answer(
 }
 
 /// `media.live.publishers` — list running publishers.
+/// `live.list`: running broadcasts. `ids` stays for older clients;
+/// `publishers` carries each one's ticket, kind and source file.
 pub fn live_publishers(request: &Request) -> Response {
-    let ids: Vec<String> = publishers()
-        .lock()
-        .expect("live publishers poisoned")
-        .keys()
-        .cloned()
+    let registry = publishers().lock().expect("live publishers poisoned");
+    let mut entries: Vec<(&String, &Running)> = registry.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    let ids: Vec<&String> = entries.iter().map(|(id, _)| *id).collect();
+    let publishers: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|(id, running)| {
+            serde_json::json!({"id": id, "ticket": running.ticket, "kind": running.kind, "file": running.file})
+        })
         .collect();
-    ok(&request.id, serde_json::json!({"ids": ids}))
+    ok(&request.id, serde_json::json!({"ids": ids, "publishers": publishers}))
 }
 
 fn ok(id: &str, result: serde_json::Value) -> Response {

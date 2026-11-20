@@ -263,7 +263,7 @@ fetch).
 | `live.publish` | `{ file, loop?, relay?, name? }` | `{ ticket, id }` — broadcast; ticket is a bearer capability |
 | `live.dial` | `{ to, file, relay?, seconds? }` | 1:1 session; blocks until the callee hangs up; no ticket (session-scoped) |
 | `live.answer` / `live.subscribe` | — | callee/subscription side |
-| `live.list` | — | `{ publishers: [...] }` |
+| `live.list` | — | `{ ids: [..], publishers: [{ id, kind, ticket, file }] }` |
 | `live.stop` | `{ id }` | graceful stop |
 | `session.list` / `session.start` / `session.stop` | — | session registry |
 

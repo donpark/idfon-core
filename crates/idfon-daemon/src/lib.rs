@@ -5521,16 +5521,20 @@ fn identity_create(request: &Request, store: &Arc<Mutex<Store>>) -> Response {
             false,
         );
     }
-    if state
-        .identities
-        .iter()
-        .any(|identity| identity.id == name || identity.name == name)
-    {
+    // Case-insensitive: key files are named `identity-<id>.key`, and on a
+    // case-insensitive filesystem (macOS default) "Work" and "work" would
+    // share one key file. Names differing only by case also read as one.
+    if let Some(existing) = state.identities.iter().find(|identity| {
+        identity.id.eq_ignore_ascii_case(name) || identity.name.eq_ignore_ascii_case(name)
+    }) {
         return error_response(
             request.id.clone(),
             &request.method,
             ErrorCode::InvalidRequest,
-            "identity already exists".into(),
+            format!(
+                "identity {:?} already exists (names are compared ignoring case)",
+                existing.name
+            ),
             false,
         );
     }
@@ -7416,6 +7420,26 @@ mod tests {
     }
 
     #[test]
+    fn identity_create_rejects_a_case_only_duplicate() {
+        let dir = temp_dir("identity-case");
+        let store = Arc::new(Mutex::new(Store::load(&dir).unwrap()));
+        let create = |name: &str| {
+            dispatch(
+                Request {
+                    version: PROTOCOL_VERSION,
+                    id: "c".into(),
+                    method: "identity.create".into(),
+                    params: serde_json::json!({"name": name}),
+                },
+                &store,
+            )
+        };
+        assert!(create("travel").ok);
+        let duplicate = create("Travel");
+        assert!(!duplicate.ok, "{duplicate:?}");
+    }
+
+    #[test]
     fn identity_create_is_capped() {
         let dir = temp_dir("identity-cap");
         let store = Arc::new(Mutex::new(Store::load(&dir).unwrap()));
@@ -9026,7 +9050,7 @@ mod tests {
                 version: PROTOCOL_VERSION,
                 id: "create".into(),
                 method: "identity.create".into(),
-                params: serde_json::json!({"name": "work"}),
+                params: serde_json::json!({"name": "travel"}),
             },
             &store,
         );
@@ -9036,7 +9060,7 @@ mod tests {
                 version: PROTOCOL_VERSION,
                 id: "use".into(),
                 method: "identity.use".into(),
-                params: serde_json::json!({"name": "work"}),
+                params: serde_json::json!({"name": "travel"}),
             },
             &store,
         );
@@ -9065,7 +9089,7 @@ mod tests {
             state
                 .identities
                 .iter()
-                .find(|identity| identity.id == "work")
+                .find(|identity| identity.id == "travel")
                 .unwrap()
                 .active
         );
@@ -9951,16 +9975,16 @@ mod tests {
                 version: PROTOCOL_VERSION,
                 id: "create".into(),
                 method: "identity.create".into(),
-                params: serde_json::json!({"name": "work"}),
+                params: serde_json::json!({"name": "travel"}),
             },
             &store,
         );
         assert!(response.ok);
         let state = store.lock().unwrap();
-        let account = state.identity_key("work").unwrap().peer_id();
-        let endpoint = state.endpoint_key("work").unwrap().peer_id();
+        let account = state.identity_key("travel").unwrap().peer_id();
+        let endpoint = state.endpoint_key("travel").unwrap().peer_id();
         assert_ne!(account, endpoint, "account and endpoint keys must differ");
-        assert!(dir.join("endpoint-work.key").is_file());
+        assert!(dir.join("endpoint-travel.key").is_file());
         // Identities predating the split keep one key for both roles.
         assert_eq!(
             state.identity_key("default").unwrap().peer_id(),
