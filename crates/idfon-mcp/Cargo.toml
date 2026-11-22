@@ -22,7 +22,7 @@ idfon-core = { path = "../idfon-core" }
 idfon-h3 = { path = "../idfon-h3" }
 idfon-protocol = { path = "../idfon-protocol" }
 idfon-telemetry = { path = "../idfon-telemetry", features = ["otlp"] }
-iroh = "1"
+iroh = "1.5"
 percent-encoding = "2"
 serde_json = "1"
 tracing = "0.1"
