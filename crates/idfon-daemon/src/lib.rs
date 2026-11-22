@@ -612,6 +612,19 @@ struct Live {
 
 static LIVE: RwLock<Option<Live>> = RwLock::new(None);
 
+/// The active identity's transport of the daemon running in this process,
+/// once its endpoints are bound; `None` without one (or with the fake
+/// transport). In-process packagings (iOS, and the mac app once it hosts the
+/// daemon) put call media on this endpoint rather than one of their own: a
+/// webhook-mode relay admits only known endpoint ids (idfon-edge
+/// docs/relay-auth.md), and the identity endpoint is one.
+pub async fn in_process_transport() -> Option<Arc<IrohTransport>> {
+    let live = LIVE.read().ok()?.clone()?;
+    let transport = live.transport?;
+    let identity = active_identity(&live.store);
+    transport.current_transport_async(&identity).await
+}
+
 /// Registers [`LIVE`] while a `run` is active and clears it on exit (panic
 /// included), so `request_json` never serves a stopped runtime.
 struct LiveGuard;
