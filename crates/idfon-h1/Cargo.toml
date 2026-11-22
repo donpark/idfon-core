@@ -13,7 +13,7 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "client", "server"] }
 hyper-util = { version = "0.1", features = ["service", "tokio"] }
 idfon-core = { path = "../idfon-core" }
-iroh = "1"
+iroh = "1.5"
 tokio = { version = "1", features = ["rt", "io-util", "sync", "macros"] }
 tracing = "0.1"
 

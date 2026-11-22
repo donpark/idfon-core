@@ -8,7 +8,7 @@ description = "WebSocket-shaped message channels over one ordered iroh bi-stream
 [dependencies]
 bytes = "1"
 idfon-core = { path = "../idfon-core" }
-iroh = "1"
+iroh = "1.5"
 tokio = { version = "1", features = ["rt", "io-util", "sync", "macros"] }
 tracing = "0.1"
 

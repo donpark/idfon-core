@@ -17,7 +17,7 @@ blake3 = "1"
 futures-util = "0.3"
 iroh-gossip = "0.102"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
-iroh = "1"
+iroh = "1.5"
 iroh-blobs = "0.104"
 libc = "0.2"
 ed25519-dalek = "3"

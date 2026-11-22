@@ -9,7 +9,7 @@ description = "HTTP/3 over an iroh endpoint on a side-channel ALPN, beside the m
 axum = "0.8"
 http = "1"
 idfon-core = { path = "../idfon-core" }
-iroh = "1"
+iroh = "1.5"
 iroh-h3-axum = "0.4"
 iroh-h3-client = "0.5"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }

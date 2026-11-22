@@ -14,7 +14,7 @@ ed25519-dalek = { version = "3", features = ["rand_core"] }
 # lockfile refresh: the token format is an auth wire contract.
 rcan = { git = "https://github.com/n0-computer/rcan", rev = "302152f3d3bb2d22a2975951c24fb52c81f4f414" }
 blake3 = "1"
-iroh = "1.0"
+iroh = "1.5"
 idfon-protocol = { path = "../idfon-protocol" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

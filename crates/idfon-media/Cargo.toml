@@ -16,7 +16,7 @@ crate-type = ["rlib"]
 anyhow = "1"
 bytes = "1"
 futures-util = "0.3"
-iroh = "1"
+iroh = "1.5"
 # No "capture" feature: idfon is headless audio (file source + cpal), and
 # capture drags rusty-capture -> pipewire -> libspa on Linux, which fails to
 # compile against Ubuntu 22.04/24.04 headers (needs PipeWire 1.x). Re-add only

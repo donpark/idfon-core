@@ -57,12 +57,12 @@ moq-video = { git = "https://github.com/donpark/moq", rev = "14598b93c" }
 qmux = { git = "https://github.com/donpark/moq", rev = "14598b93c" }
 
 [patch."https://github.com/n0-computer/iroh-live"]
-iroh-live = { git = "https://github.com/donpark/iroh-live", rev = "5f2e7378" }
-iroh-live-node = { git = "https://github.com/donpark/iroh-live", rev = "5f2e7378" }
-moq-ext-access = { git = "https://github.com/donpark/iroh-live", rev = "5f2e7378" }
-moq-ext-adaptive = { git = "https://github.com/donpark/iroh-live", rev = "5f2e7378" }
-moq-ext-json = { git = "https://github.com/donpark/iroh-live", rev = "5f2e7378" }
-moq-ext-player = { git = "https://github.com/donpark/iroh-live", rev = "5f2e7378" }
-moq-ext-publisher = { git = "https://github.com/donpark/iroh-live", rev = "5f2e7378" }
-moq-ext-sources = { git = "https://github.com/donpark/iroh-live", rev = "5f2e7378" }
-moq-transport-iroh = { git = "https://github.com/donpark/iroh-live", rev = "5f2e7378" }
+iroh-live = { git = "https://github.com/donpark/iroh-live", rev = "fbdcbdda" }
+iroh-live-node = { git = "https://github.com/donpark/iroh-live", rev = "fbdcbdda" }
+moq-ext-access = { git = "https://github.com/donpark/iroh-live", rev = "fbdcbdda" }
+moq-ext-adaptive = { git = "https://github.com/donpark/iroh-live", rev = "fbdcbdda" }
+moq-ext-json = { git = "https://github.com/donpark/iroh-live", rev = "fbdcbdda" }
+moq-ext-player = { git = "https://github.com/donpark/iroh-live", rev = "fbdcbdda" }
+moq-ext-publisher = { git = "https://github.com/donpark/iroh-live", rev = "fbdcbdda" }
+moq-ext-sources = { git = "https://github.com/donpark/iroh-live", rev = "fbdcbdda" }
+moq-transport-iroh = { git = "https://github.com/donpark/iroh-live", rev = "fbdcbdda" }
