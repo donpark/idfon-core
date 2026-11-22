@@ -66,7 +66,7 @@ Worked examples (per field):
 | --- | --- | --- |
 | `idfond` | `[relay]` in `~/.idfon/config.toml` | `--relay-…` flags, `IDFON_RELAY_*` |
 | `idfon` CLI | (its daemon's) | `--relay-…` flags, forwarded to the daemon it auto-starts |
-| mac app | **Relay** settings (UserDefaults) | launch args; passed to the spawned `idfond` as flags and to the app's in-process media endpoints via the FFI setter |
+| mac app | **Relay** settings (UserDefaults) | launch args; the in-process daemon + media endpoints via the FFI setter |
 | iOS app | **Relay** settings (UserDefaults) | launch args; the in-process daemon + media endpoints via the FFI setter |
 
 The resolution itself lives in one place, `idfon_core::relay`
