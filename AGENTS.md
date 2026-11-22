@@ -51,9 +51,10 @@ here can break idfon-sdk, idfon-ios and idfon-mac, which build this checkout:
   `--push-apns-key-id` for `edge.apns.p8` (C26, regressed as C28). Compose
   refuses to start without the id; never reintroduce a default, and run
   `idfon-edge/docs/edge-deploy-checklist.md` §C step 4 after any edge change.
-- **No identifiers in public artifacts.** These repos are public. Keep APNs key
-  ids, push tokens, peer/endpoint ids, call UUIDs, droplet IPs and SSH key
-  names out of commits, PR titles/bodies, issues and docs. Use placeholders
+- **No identifiers in public artifacts.** This repo is public, as is idfon-sdk;
+  the apps, idfon-edge, idfon-home, idfon-site and the archive are private. Keep
+  APNs key ids, push tokens, peer/endpoint ids, call UUIDs, droplet IPs and SSH
+  key names out of commits, PR titles/bodies, issues and docs. Use placeholders
   (`<key-id>`, `<peer>`) and local files (`~/.idfon/edge.apns.keyid`).
 - **Privacy posture lives in `README.md` ("Privacy").** Keep any new surface
   consistent with it: content end-to-end between the parties, the edge holds

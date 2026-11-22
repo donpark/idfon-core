@@ -1,25 +1,36 @@
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Mutex, OnceLock,
+        Arc, OnceLock,
     },
 };
 
-use iroh::protocol::Router;
+use idfon_core::transport::{IrohTransport, SideChannelGuard};
+use iroh::protocol::{ProtocolHandler, Router};
 use iroh::{address_lookup::memory::MemoryLookup, Endpoint};
 use iroh_blobs::{
     store::fs::FsStore, ticket::BlobTicket, BlobFormat, BlobsProtocol, ALPN as BLOBS_ALPN,
 };
 
+/// The daemon's blob store, served on identity endpoints. Blobs ride the
+/// identity endpoint (a side channel on `BLOBS_ALPN`) instead of an endpoint
+/// of their own: a relay in webhook mode (idfon-edge docs/relay-auth.md)
+/// admits only known endpoint ids, and a random-key blob endpoint never is.
 struct BlobProvider {
-    endpoint: Endpoint,
     store: FsStore,
-    #[allow(dead_code)]
-    router: Router,
+    protocol: BlobsProtocol,
+    /// Identity transports serving `BLOBS_ALPN`, by endpoint id. The transport
+    /// is kept to notice a rebind (a new transport for the same id).
+    served: HashMap<iroh::EndpointId, (Arc<IrohTransport>, SideChannelGuard)>,
+    /// Fallback provider endpoint for the fake transport (tests,
+    /// `--transport fake`), which has no identity endpoint to ride.
+    fallback: Option<(Endpoint, Router)>,
 }
 
-static PROVIDER: OnceLock<Mutex<Option<BlobProvider>>> = OnceLock::new();
+/// One provider per store root (the daemon has one; tests each bring their own).
+static PROVIDERS: OnceLock<tokio::sync::Mutex<HashMap<PathBuf, BlobProvider>>> = OnceLock::new();
 
 /// Shared runtime for the blocking `run_*` entry points. The blob provider's
 /// endpoint/router tasks live on this runtime; a runtime dropped after
@@ -30,35 +41,76 @@ fn runtime() -> &'static tokio::runtime::Runtime {
     RUNTIME.get_or_init(|| tokio::runtime::Runtime::new().expect("tokio runtime"))
 }
 
-pub async fn put(root: PathBuf, data: Vec<u8>) -> anyhow::Result<(BlobTicket, usize)> {
-    // One provider (endpoint + FsStore + router) per process, created lazily
-    // and reused. The store locks blobs.db: opening a second FsStore on the
-    // same root while this one is alive deadlocks, and the provider must stay
-    // alive anyway to serve fetchers. The lock is held across add_slice to
-    // serialize store access.
-    let mut guard = PROVIDER
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .expect("blob provider poisoned");
-    let (endpoint, store) = match guard.as_ref() {
-        Some(provider) => (provider.endpoint.clone(), provider.store.clone()),
-        None => {
-            let endpoint = idfon_core::relay::endpoint_builder().bind().await?;
-            let store = FsStore::load(root).await?;
-            let protocol = BlobsProtocol::new(store.as_ref(), None);
-            let router = Router::builder(endpoint.clone())
-                .accept(BLOBS_ALPN, protocol)
-                .spawn();
-            let provider = BlobProvider {
-                endpoint: endpoint.clone(),
-                store: store.clone(),
-                router,
-            };
-            *guard = Some(provider);
-            (endpoint, store)
+/// Forward `BLOBS_ALPN` connections on `transport` to the blob protocol.
+fn serve_on(provider: &mut BlobProvider, transport: &Arc<IrohTransport>) {
+    let id = transport.endpoint().id();
+    if let Some((served, _)) = provider.served.get(&id) {
+        if Arc::ptr_eq(served, transport) {
+            return;
         }
+    }
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<iroh::endpoint::Connection>(8);
+    let guard = transport.add_side_channel(BLOBS_ALPN, tx);
+    let protocol = provider.protocol.clone();
+    runtime().spawn(async move {
+        while let Some(connection) = rx.recv().await {
+            let protocol = protocol.clone();
+            tokio::spawn(async move {
+                let _ = protocol.accept(connection).await;
+            });
+        }
+    });
+    provider.served.insert(id, (transport.clone(), guard));
+}
+
+/// Adds `data` to the store and returns a ticket that names `transport`'s
+/// endpoint (the identity endpoint), or a fallback endpoint without one.
+pub async fn put(
+    root: PathBuf,
+    data: Vec<u8>,
+    transport: Option<Arc<IrohTransport>>,
+) -> anyhow::Result<(BlobTicket, usize)> {
+    // One store per process, created lazily and reused. It locks blobs.db:
+    // opening a second FsStore on the same root while this one is alive
+    // deadlocks, and the store must stay alive anyway to serve fetchers. The
+    // lock is held across add_slice to serialize store access.
+    let mut providers = PROVIDERS
+        .get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .await;
+    if !providers.contains_key(&root) {
+        let store = FsStore::load(&root).await?;
+        let protocol = BlobsProtocol::new(store.as_ref(), None);
+        providers.insert(
+            root.clone(),
+            BlobProvider {
+                store,
+                protocol,
+                served: HashMap::new(),
+                fallback: None,
+            },
+        );
+    }
+    let provider = providers.get_mut(&root).expect("provider just set");
+    let endpoint = match &transport {
+        Some(transport) => {
+            serve_on(provider, transport);
+            transport.endpoint().clone()
+        }
+        None => match &provider.fallback {
+            Some((endpoint, _)) => endpoint.clone(),
+            None => {
+                let endpoint = idfon_core::relay::endpoint_builder().bind().await?;
+                let router = Router::builder(endpoint.clone())
+                    .accept(BLOBS_ALPN, provider.protocol.clone())
+                    .spawn();
+                provider.fallback = Some((endpoint.clone(), router));
+                endpoint
+            }
+        },
     };
-    let content = store
+    let content = provider
+        .store
         .blobs()
         .add_slice(&data)
         .with_named_tag(format!("resource-{}", blake3::hash(&data)))
@@ -71,7 +123,13 @@ pub async fn put(root: PathBuf, data: Vec<u8>) -> anyhow::Result<(BlobTicket, us
     Ok((ticket, data.len()))
 }
 
-pub async fn fetch(ticket: String, root: PathBuf) -> anyhow::Result<PathBuf> {
+/// Fetches `ticket` into `root`, dialing from `endpoint` (the requesting
+/// identity's endpoint) or, without one, from a throwaway endpoint.
+pub async fn fetch(
+    ticket: String,
+    root: PathBuf,
+    endpoint: Option<Endpoint>,
+) -> anyhow::Result<PathBuf> {
     let ticket: BlobTicket = ticket.parse()?;
     // A collection ticket (what `sendme send` prints) names a HashSeq, not a
     // file: `export` would write the 32-byte entries. Refuse instead of
@@ -84,32 +142,33 @@ pub async fn fetch(ticket: String, root: PathBuf) -> anyhow::Result<PathBuf> {
     }
     let output = root.join(format!("{}.blob", ticket.hash()));
     // A completed transfer is the cache for all later chunk requests: check it
-    // before binding an endpoint or opening the store, so a cache hit costs one
-    // local read and no network, no blobs.db lock, and no retry sleep.
+    // before dialing or opening the store, so a cache hit costs one local read
+    // and no network, no blobs.db lock, and no retry sleep.
     if cache_matches(&output, ticket.hash()) {
         return Ok(output);
     }
-    // The sender's first pkarr publish may still be propagating when the fetch
-    // arrives; the lookup then fails and DNS negative caching would poison
-    // retries on the same endpoint. Rebind a fresh endpoint per attempt so
-    // each gets a clean resolver.
-    // ponytail: 6 attempts x 1s; awaiting publish completion on the sender
-    // would remove the guesswork.
+    // The ticket carries the provider's own addresses (direct and relay), and
+    // `connect` dials them as given, so the fetch does not depend on pkarr
+    // having propagated. Retries cover a provider that is still coming online.
+    // ponytail: 6 attempts x 1s.
     let mut last = None;
     for attempt in 0..6 {
         if attempt > 0 {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
-        // The ticket carries the provider's own addresses (direct and relay).
-        // Seed them so the download does not depend on pkarr having propagated —
-        // that race was the PeerOffline failure for freshly published blobs.
-        let lookup = MemoryLookup::from_endpoint_info([ticket.addr().clone()]);
-        let endpoint = idfon_core::relay::endpoint_builder()
-            .address_lookup(lookup)
-            .bind()
-            .await?;
-        let result = fetch_with(&ticket, &endpoint, &root, &output).await;
-        endpoint.close().await;
+        let result = match &endpoint {
+            Some(endpoint) => fetch_with(&ticket, endpoint, &root, &output).await,
+            None => {
+                let lookup = MemoryLookup::from_endpoint_info([ticket.addr().clone()]);
+                let endpoint = idfon_core::relay::endpoint_builder()
+                    .address_lookup(lookup)
+                    .bind()
+                    .await?;
+                let result = fetch_with(&ticket, &endpoint, &root, &output).await;
+                endpoint.close().await;
+                result
+            }
+        };
         match result {
             Ok(path) => return Ok(path),
             Err(error) => last = Some(error),
@@ -148,7 +207,11 @@ async fn wait_for_direct_path(
 ) -> bool {
     let deadline = tokio::time::Instant::now() + limit;
     loop {
-        if conn.paths().iter().any(|path| path.is_ip() && path.is_selected()) {
+        if conn
+            .paths()
+            .iter()
+            .any(|path| path.is_ip() && path.is_selected())
+        {
             return true;
         }
         if tokio::time::Instant::now() >= deadline {
@@ -167,29 +230,16 @@ async fn fetch_with(
     static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
     let store = FsStore::load(root).await?;
     let result = async {
-        // Dial before the downloader does, so hole punching starts while the
-        // transfer is still being set up. Paths opened on this connection are
-        // opened on the downloader's connection too, so a direct path found
-        // here is what keeps a short transfer off the relay.
-        let prewarm = match endpoint.connect(ticket.addr().clone(), BLOBS_ALPN).await {
-            Ok(conn) => {
-                let direct =
-                    wait_for_direct_path(&conn, std::time::Duration::from_secs(2)).await;
-                tracing::debug!(target: "idfon.blob", direct, "blob fetch prewarm");
-                Some(conn)
-            }
-            Err(error) => {
-                tracing::debug!(target: "idfon.blob", %error, "blob fetch prewarm failed");
-                None
-            }
-        };
-        // The downloader has no internal timeout; a stuck connection must not
+        // Dial, then give hole punching a moment before the transfer starts:
+        // a direct path found here keeps a short transfer off the relay.
+        let conn = endpoint.connect(ticket.addr().clone(), BLOBS_ALPN).await?;
+        let direct = wait_for_direct_path(&conn, std::time::Duration::from_secs(2)).await;
+        tracing::debug!(target: "idfon.blob", direct, "blob fetch connected");
+        // The transfer has no internal timeout; a stuck connection must not
         // hang the daemon request (and worker) indefinitely.
         tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            store
-                .downloader(endpoint)
-                .download(ticket.hash(), Some(ticket.addr().id)),
+            store.remote().fetch(conn.clone(), ticket.hash()),
         )
         .await??;
         // Copy the verified blob out ourselves instead of `export`: write to a
@@ -215,7 +265,7 @@ async fn fetch_with(
             let _ = tokio::fs::remove_file(&tmp).await;
             return Err(error.into());
         }
-        drop(prewarm);
+        drop(conn);
         Ok::<PathBuf, anyhow::Error>(output.to_path_buf())
     }
     .await;
@@ -228,16 +278,24 @@ async fn fetch_with(
     result
 }
 
-pub fn run_fetch(ticket: String, root: PathBuf) -> anyhow::Result<PathBuf> {
+pub fn run_fetch(
+    ticket: String,
+    root: PathBuf,
+    endpoint: Option<Endpoint>,
+) -> anyhow::Result<PathBuf> {
     // block_on on a fresh thread: the daemon calls this from tokio workers,
     // where blocking panics ("cannot start a runtime from within a runtime").
-    std::thread::spawn(move || runtime().block_on(fetch(ticket, root)))
+    std::thread::spawn(move || runtime().block_on(fetch(ticket, root, endpoint)))
         .join()
         .map_err(|_| anyhow::anyhow!("blob worker panicked"))?
 }
 
-pub fn run_put(root: PathBuf, data: Vec<u8>) -> anyhow::Result<(BlobTicket, usize)> {
-    std::thread::spawn(move || runtime().block_on(put(root, data)))
+pub fn run_put(
+    root: PathBuf,
+    data: Vec<u8>,
+    transport: Option<Arc<IrohTransport>>,
+) -> anyhow::Result<(BlobTicket, usize)> {
+    std::thread::spawn(move || runtime().block_on(put(root, data, transport)))
         .join()
         .map_err(|_| anyhow::anyhow!("blob worker panicked"))?
 }
@@ -259,6 +317,7 @@ mod tests {
             .block_on(fetch(
                 hashseq.to_string(),
                 std::env::temp_dir().join("idfon-blob-guard-test"),
+                None,
             ))
             .unwrap_err();
         assert!(error.to_string().contains("Raw"), "{error}");
@@ -287,7 +346,9 @@ mod tests {
             let ticket = BlobTicket::new(provider.addr(), content.hash, content.format);
             let fetch_root = base.join("fetched");
 
-            let first = fetch(ticket.to_string(), fetch_root.clone()).await.unwrap();
+            let first = fetch(ticket.to_string(), fetch_root.clone(), None)
+                .await
+                .unwrap();
             // Keep only the cache file, so the store's local copy cannot be
             // what makes the second fetch succeed.
             let bytes = std::fs::read(&first).unwrap();
@@ -302,12 +363,55 @@ mod tests {
 
             let second = tokio::time::timeout(
                 std::time::Duration::from_secs(3),
-                fetch(ticket.to_string(), fetch_root.clone()),
+                fetch(ticket.to_string(), fetch_root.clone(), None),
             )
             .await
             .expect("cache miss: the second fetch needed the network")
             .unwrap();
             assert_eq!(second, fetch_root.join(format!("{}.blob", ticket.hash())));
+            let _ = std::fs::remove_dir_all(&base);
+        });
+    }
+
+    /// Blobs ride the identity endpoint: the ticket names the provider's
+    /// identity endpoint id, and the receiver fetches from its own identity
+    /// endpoint (so a webhook-mode relay that admits identities admits both).
+    #[test]
+    fn put_and_fetch_ride_identity_endpoints() {
+        runtime().block_on(async {
+            let base = std::env::temp_dir()
+                .join(format!("idfon-blob-identity-test-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            let serve = |transport: Arc<IrohTransport>| {
+                tokio::spawn(async move {
+                    let _ = transport
+                        .serve(|_| async {
+                            Err(idfon_core::transport::TransportError::Failed(
+                                "unused".into(),
+                            ))
+                        })
+                        .await;
+                })
+            };
+            let provider = Arc::new(IrohTransport::builder().bind().await.unwrap());
+            let receiver = Arc::new(IrohTransport::builder().bind().await.unwrap());
+            serve(provider.clone());
+            serve(receiver.clone());
+
+            let data = vec![9u8; 256 * 1024];
+            let (ticket, _) = put(base.join("blobs"), data.clone(), Some(provider.clone()))
+                .await
+                .unwrap();
+            assert_eq!(ticket.addr().id, provider.endpoint().id());
+
+            let path = fetch(
+                ticket.to_string(),
+                base.join("fetched"),
+                Some(receiver.endpoint().clone()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(std::fs::read(path).unwrap(), data);
             let _ = std::fs::remove_dir_all(&base);
         });
     }
