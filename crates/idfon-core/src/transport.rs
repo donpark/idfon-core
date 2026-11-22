@@ -263,8 +263,17 @@ impl IrohTransport {
         // is the fallback when direct UDP is impossible (enterprise NAT); its
         // WebSocket transport uses TCP 443, which such networks allow.
         let relay = crate::relay::resolve();
+        // BBR3, as iroh-live's MoQ preset sets: call media rides this endpoint
+        // (one endpoint per device), and messages and blobs do fine on it.
+        let transport_config = iroh::endpoint::QuicTransportConfig::builder()
+            .congestion_controller_factory(std::sync::Arc::new(
+                noq_proto::congestion::Bbr3Config::default(),
+            ))
+            .build();
         let mut builder = crate::relay::apply(
-            Endpoint::builder(presets::N0).alpns(vec![MESSAGE_ALPN.to_vec()]),
+            Endpoint::builder(presets::N0)
+                .alpns(vec![MESSAGE_ALPN.to_vec()])
+                .transport_config(transport_config),
             &relay,
         );
         if let Some(key) = key {

@@ -466,9 +466,63 @@ fn release_mixer_if_idle() {
 struct CallSession {
     endpoint: Endpoint,
     node: Node,
-    router: Router,
+    accept: SessionAccept,
     publication: Option<Publication>,
     subscribers: HashMap<EndpointId, Subscriber>,
+}
+
+/// How a call session receives connections.
+enum SessionAccept {
+    /// Its own endpoint and router (no daemon in this process). Shutting the
+    /// router down closes that endpoint.
+    Owned(Router),
+    /// Side channels on the in-process daemon's identity endpoint. Dropping
+    /// the guards unmounts the call; the endpoint stays the daemon's.
+    Shared(Vec<idfon_core::transport::SideChannelGuard>),
+}
+
+impl SessionAccept {
+    async fn shutdown(self) {
+        match self {
+            Self::Owned(router) => {
+                let _ = router.shutdown().await;
+            }
+            Self::Shared(guards) => drop(guards),
+        }
+    }
+}
+
+/// Mounts `node` and the health protocol on `transport`'s endpoint as side
+/// channels, forwarding each connection to its handler.
+fn mount_on_identity(
+    transport: &idfon_core::transport::IrohTransport,
+    node: &Node,
+) -> Vec<idfon_core::transport::SideChannelGuard> {
+    use iroh::protocol::ProtocolHandler;
+    let mut guards = Vec::new();
+    for alpn in iroh_live::node::alpns() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<iroh::endpoint::Connection>(8);
+        guards.push(transport.add_side_channel(alpn, tx));
+        let node = node.clone();
+        tokio::spawn(async move {
+            while let Some(connection) = rx.recv().await {
+                let node = node.clone();
+                tokio::spawn(async move {
+                    let _ = node.accept(connection).await;
+                });
+            }
+        });
+    }
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<iroh::endpoint::Connection>(8);
+    guards.push(transport.add_side_channel(crate::health::HEALTH_ALPN, tx));
+    tokio::spawn(async move {
+        while let Some(connection) = rx.recv().await {
+            tokio::spawn(async move {
+                let _ = crate::health::HealthProtocol.accept(connection).await;
+            });
+        }
+    });
+    guards
 }
 
 /// The call's published broadcast and the ticket that names it.
@@ -516,12 +570,26 @@ pub(crate) async fn session_handle() -> anyhow::Result<SessionHandle> {
             node: session.node.clone(),
         });
     }
-    let endpoint = bind_call_endpoint().await?;
-    let layout = LiveLayout::default();
-    let node = Node::new(endpoint.clone(), layout.config());
-    // Accept side: MoQ for the peer's subscriptions plus the health ALPN
-    // (docs/media-adaptation.md §B2.2), on the session's own endpoint.
-    let router = crate::health::serve(node.mount(Router::builder(endpoint.clone()))).spawn();
+    // One endpoint per device: with the daemon in this process (iOS), the call
+    // rides the active identity's endpoint, which the relay admits; otherwise
+    // (the mac app, whose daemon is a child process) it binds its own.
+    let (endpoint, node, accept) = match idfon_daemon::in_process_transport().await {
+        Some(transport) => {
+            let endpoint = transport.endpoint().clone();
+            let node = Node::new(endpoint.clone(), LiveLayout::default().config());
+            let guards = mount_on_identity(&transport, &node);
+            (endpoint, node, SessionAccept::Shared(guards))
+        }
+        None => {
+            let endpoint = bind_call_endpoint().await?;
+            let node = Node::new(endpoint.clone(), LiveLayout::default().config());
+            // Accept side: MoQ for the peer's subscriptions plus the health
+            // ALPN (docs/media-adaptation.md §B2.2), on the session's own endpoint.
+            let router =
+                crate::health::serve(node.mount(Router::builder(endpoint.clone()))).spawn();
+            (endpoint, node, SessionAccept::Owned(router))
+        }
+    };
     let mut slot = SESSION.lock().unwrap_or_else(|poison| poison.into_inner());
     if let Some(session) = slot.as_ref() {
         // Another leg won the race: keep its session, drop ours.
@@ -530,14 +598,14 @@ pub(crate) async fn session_handle() -> anyhow::Result<SessionHandle> {
             node: session.node.clone(),
         };
         drop(slot);
-        let _ = router.shutdown().await;
+        accept.shutdown().await;
         return Ok(handle);
     }
     tracing::info!(target: "idfon.media", id = %endpoint.id().fmt_short(), "call session started");
     *slot = Some(CallSession {
         endpoint: endpoint.clone(),
         node: node.clone(),
-        router,
+        accept,
         publication: None,
         subscribers: HashMap::new(),
     });
@@ -568,7 +636,7 @@ fn release_session_if_idle() {
     if let Some(session) = idle {
         tracing::info!(target: "idfon.media", "call session shut down");
         tokio_executor(async move {
-            let _ = session.router.shutdown().await;
+            session.accept.shutdown().await;
         });
     }
 }
@@ -1596,6 +1664,13 @@ fn stop_subscriber(mut subscriber: Subscriber) {
     }
 }
 
+/// Resolves once `stop` is set (polled every 50 ms).
+async fn wait_for_stop(stop: &AtomicBool) {
+    while !stop.load(Ordering::Relaxed) {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 /// Why one subscribe attempt ended.
 #[derive(Debug)]
 enum SubscribeEndError {
@@ -1708,10 +1783,16 @@ async fn subscribe_decode_once(
                     .map_err(|_| anyhow::anyhow!("dial timed out"))??;
             used_session = Some(dialed);
         }
-        let subscription = session
+        // A subscribe to a broadcast that is gone (the far end hung up between
+        // attempts) waits for it indefinitely; poll the stop flag so a hangup
+        // here still ends the leg (and `stop_subscriber`'s join returns).
+        let subscribe = session
             .node
-            .subscribe(ticket.path().clone(), Reach::Direct(ticket.peer()))
-            .await?;
+            .subscribe(ticket.path().clone(), Reach::Direct(ticket.peer()));
+        let subscription = tokio::select! {
+            subscription = subscribe => subscription?,
+            _ = wait_for_stop(stop) => return Ok(true),
+        };
         if let Some(serving) = subscription.session() {
             used_session = Some(serving);
         }
@@ -3547,6 +3628,139 @@ mod tests {
 
         super::media_live_unsubscribe();
         super::media_audio_clear_playback_cb();
+    }
+
+    /// Hanging up the publication first leaves the listen leg resubscribing to
+    /// a broadcast that is gone; that subscribe waits indefinitely, so the
+    /// unsubscribe that follows must still end the leg (it hung the join).
+    #[test]
+    fn unsubscribe_ends_a_leg_resubscribing_to_a_gone_broadcast() {
+        let _guard = crate::util::MEDIA_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        unsafe extern "C" fn discard(
+            _: *const std::ffi::c_void,
+            _: *const u8,
+            _: usize,
+            _: u32,
+            _: u32,
+            _: u64,
+        ) {
+        }
+        assert_eq!(super::media_audio_set_playback_cb(std::ptr::null(), discard), 0);
+        let ticket_text =
+            super::start_live(true, false, false, None, AudioCodec::Opus, 48_000, 1)
+                .expect("publish");
+        let ticket: super::BroadcastTicket = ticket_text.parse().expect("ticket");
+        assert_eq!(
+            super::start_listen_leg(remote_listener(), ticket, Some(publisher_addr())),
+            0,
+            "subscribe"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
+        while super::media_live_state() != super::SUB_PLAYING
+            && std::time::Instant::now() < deadline
+        {
+            super::media_audio_push_frames(vec![0.05f32; 960].as_ptr(), 960, 1);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(super::media_live_state(), super::SUB_PLAYING, "subscriber never played");
+
+        super::media_live_stop();
+        // Past the first backoff (200 ms): the leg is back in `subscribe`.
+        std::thread::sleep(std::time::Duration::from_millis(1_500));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            super::media_live_unsubscribe();
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok(),
+            "unsubscribe hung on a leg waiting for a gone broadcast"
+        );
+        super::media_audio_clear_playback_cb();
+    }
+
+    /// One endpoint per device: with the daemon running in this process (as on
+    /// iOS), a call publishes on the active identity's endpoint (which a
+    /// webhook-mode relay admits), a separate node can subscribe to it, and
+    /// hanging up unmounts the call without closing the daemon's endpoint.
+    #[test]
+    fn live_call_rides_the_in_process_identity_endpoint() {
+        let _guard = crate::util::MEDIA_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let dir = std::env::temp_dir().join(format!("idfon-inproc-call-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("data dir");
+        let socket = dir.join("d.sock");
+        let config = idfon_daemon::DaemonConfig {
+            socket: socket.clone(),
+            data_dir: dir.join("data"),
+            transport: None,
+            idle_exit: None,
+        };
+        let daemon = std::thread::spawn(move || idfon_daemon::run_blocking(config));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let transport = loop {
+            if let Some(transport) = super::tokio_executor(idfon_daemon::in_process_transport()) {
+                break transport;
+            }
+            assert!(std::time::Instant::now() < deadline, "daemon never bound");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        };
+
+        unsafe extern "C" fn discard(
+            _: *const std::ffi::c_void,
+            _: *const u8,
+            _: usize,
+            _: u32,
+            _: u32,
+            _: u64,
+        ) {
+        }
+        assert_eq!(super::media_audio_set_playback_cb(std::ptr::null(), discard), 0);
+        let ticket_text =
+            super::start_live(true, false, false, None, AudioCodec::Opus, 48_000, 1)
+                .expect("publish");
+        let ticket: super::BroadcastTicket = ticket_text.parse().expect("ticket");
+        assert_eq!(ticket.peer(), transport.endpoint().id(), "call is on the identity endpoint");
+        assert_eq!(
+            super::start_listen_leg(remote_listener(), ticket, Some(publisher_addr())),
+            0,
+            "subscribe"
+        );
+        std::thread::spawn(|| {
+            for _ in 0..400u32 {
+                let frame = vec![0.05f32; 960];
+                super::media_audio_push_frames(frame.as_ptr(), 960, 1);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
+        while super::media_live_state() != super::SUB_PLAYING
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert_eq!(super::media_live_state(), super::SUB_PLAYING, "subscriber never played");
+
+        super::media_live_stop();
+        super::media_live_unsubscribe();
+        super::media_audio_clear_playback_cb();
+        assert!(!super::call_live(), "the session is gone after hangup");
+        assert!(!transport.endpoint().is_closed(), "hangup left the daemon's endpoint open");
+
+        let mut client = idfon_client::Client::connect(&socket.to_string_lossy()).expect("connect");
+        let shutdown = serde_json::json!({
+            "version": idfon_protocol::PROTOCOL_VERSION,
+            "id": "shutdown",
+            "method": "daemon.shutdown",
+            "params": {},
+        });
+        client.request(shutdown.to_string().as_bytes()).expect("shutdown");
+        daemon.join().expect("daemon thread").expect("daemon exit");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The stereo E2E without hardware (docs/stereo-calls.md): a shell-pushed
