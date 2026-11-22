@@ -2645,8 +2645,8 @@ fn dispatch_with_transport(
         "access.check" => access_check(&request, store),
         "session.start" => media_session_start(&request, store),
         "session.stop" => media_session_stop(&request, store),
-        "blob.put" => media_resource_put(&request, store),
-        "blob.get" => media_resource_fetch(&request, store),
+        "blob.put" => media_resource_put(&request, store, transport),
+        "blob.get" => media_resource_fetch(&request, store, transport),
         "session.list" => media_sessions(&request, store),
         "live.publish" => live::live_publish(&request),
         "live.dial" => live_dial_dispatch(&request, store),
@@ -4925,7 +4925,11 @@ fn media_session_stop(request: &Request, store: &Arc<Mutex<Store>>) -> Response 
     )
 }
 
-fn media_resource_put(request: &Request, store: &Arc<Mutex<Store>>) -> Response {
+fn media_resource_put(
+    request: &Request,
+    store: &Arc<Mutex<Store>>,
+    transport: Option<&Arc<TransportMode>>,
+) -> Response {
     let Some(id) = request
         .params
         .get("resource_id")
@@ -4965,7 +4969,7 @@ fn media_resource_put(request: &Request, store: &Arc<Mutex<Store>>) -> Response 
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
     {
-        return media_resource_finish(request, &resource_path, &identity, id, store);
+        return media_resource_finish(request, &resource_path, &identity, id, store, transport);
     }
     let Some(data) = decode_resource_bytes(request) else {
         return error_response(
@@ -5018,7 +5022,10 @@ fn media_resource_put(request: &Request, store: &Arc<Mutex<Store>>) -> Response 
             true,
         );
     }
-    let blob_ticket = match blob::run_put(state.data_dir.join("blobs"), data.clone()) {
+    // Served on the identity's own endpoint (relay-admitted), not a blob one.
+    let identity_transport =
+        transport.and_then(|transport| transport.current_transport(&identity));
+    let blob_ticket = match blob::run_put(state.data_dir.join("blobs"), data.clone(), identity_transport) {
         Ok((ticket, _)) => ticket.to_string(),
         Err(error) => {
             return error_response(
@@ -5091,6 +5098,7 @@ fn media_resource_finish(
     identity: &str,
     id: &str,
     store: &Arc<Mutex<Store>>,
+    transport: Option<&Arc<TransportMode>>,
 ) -> Response {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
@@ -5114,7 +5122,10 @@ fn media_resource_finish(
         }
     };
     let data_dir = store.lock().expect("store mutex poisoned").data_dir.clone();
-    let blob_ticket = match blob::run_put(data_dir.join("blobs"), bytes.clone()) {
+    // Served on the identity's own endpoint (relay-admitted), not a blob one.
+    let identity_transport =
+        transport.and_then(|transport| transport.current_transport(identity));
+    let blob_ticket = match blob::run_put(data_dir.join("blobs"), bytes.clone(), identity_transport) {
         Ok((ticket, _)) => ticket.to_string(),
         Err(error) => {
             return error_response(
@@ -5160,7 +5171,11 @@ fn reject_oversize(request: &Request, size: usize) -> Option<Response> {
     None
 }
 
-fn media_resource_fetch(request: &Request, store: &Arc<Mutex<Store>>) -> Response {
+fn media_resource_fetch(
+    request: &Request,
+    store: &Arc<Mutex<Store>>,
+    transport: Option<&Arc<TransportMode>>,
+) -> Response {
     let Some(id) = request
         .params
         .get("resource_id")
@@ -5186,7 +5201,13 @@ fn media_resource_fetch(request: &Request, store: &Arc<Mutex<Store>>) -> Respons
         .get("blob_ticket")
         .and_then(serde_json::Value::as_str)
     {
-        match blob::run_fetch(ticket.into(), data_dir.join("blobs-fetched")) {
+        // Dial from the requesting identity's endpoint (relay-admitted).
+        let identity =
+            request_text(&request.params, "identity").unwrap_or_else(|| "default".into());
+        let endpoint = transport
+            .and_then(|transport| transport.current_transport(&identity))
+            .map(|transport| transport.endpoint().clone());
+        match blob::run_fetch(ticket.into(), data_dir.join("blobs-fetched"), endpoint) {
             Ok(path) => std::fs::read(path),
             Err(error) => {
                 return error_response(
