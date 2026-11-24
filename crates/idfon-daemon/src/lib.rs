@@ -4363,7 +4363,11 @@ fn receive_message(request: &Request, store: &Arc<Mutex<Store>>) -> Response {
         r#type: "message.received".into(),
         timestamp: now,
         identity,
-        data: serde_json::json!({"message_id": envelope.message_id, "peer_id": envelope.sender.peer_id, "conversation": envelope.conversation, "text": match &envelope.content { idfon_protocol::MessageContent::Text { text } => text }}),
+        // `idempotency_key` is the sender's key for this message: unlike
+        // `message_id` (per recipient), a room send carries one base key to
+        // every member, so apps use it to name a message (reactions, edits,
+        // receipts: docs/chat-envelopes.md).
+        data: serde_json::json!({"message_id": envelope.message_id, "peer_id": envelope.sender.peer_id, "conversation": envelope.conversation, "idempotency_key": envelope.idempotency_key, "text": match &envelope.content { idfon_protocol::MessageContent::Text { text } => text }}),
     });
     if state.events.len() > EVENT_RETENTION {
         let excess = state.events.len() - EVENT_RETENTION;
@@ -8757,6 +8761,10 @@ mod tests {
             grant.identity == "default"
                 && grant.subject == peer_id
                 && grant.capability == idfon_protocol::Capability::MessageSend
+        }));
+        // The event names the sender's key, which apps use to refer to it.
+        assert!(store.lock().unwrap().events.iter().any(|event| {
+            event.r#type == "message.received" && event.data["idempotency_key"] == "retry-1"
         }));
 
         let mut tampered = message;
