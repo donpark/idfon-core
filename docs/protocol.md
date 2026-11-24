@@ -161,7 +161,7 @@ keeps standard `URL` fields. `peer.add` also accepts a `contact_ticket`
 
 | method | params | result |
 |---|---|---|
-| `message.send` | `{ to, text, idempotency_key, capability_ticket?, retries? }` (`capability_ticket` is the holder's rcan token string) | `{ authenticated, message_id, operation_id, status: "queued" }` — returns immediately; delivery proceeds in the daemon (retries per `retries`), confirm via `operation.wait`. Sender needs a `message.send` grant for the peer (own daemon); the receiver needs `message.receive` for the sender. A successful send auto-establishes the local receive side of the reply path. |
+| `message.send` | `{ to, text, idempotency_key, capability_ticket?, retries?, durable? }` (`capability_ticket` is the holder's rcan token string) | `{ authenticated, message_id, operation_id, status: "queued" }` — returns immediately; delivery proceeds in the daemon (retries per `retries`), confirm via `operation.wait`. Sender needs a `message.send` grant for the peer (own daemon); the receiver needs `message.receive` for the sender. A successful send auto-establishes the local receive side of the reply path. `durable: true` makes it an outbox item: if every attempt fails it goes back to `queued` ("not sent yet") instead of `failed`, and is retried later (see `operation.resume`). Chat messages set it; time-bound sends (call signaling) must not. |
 | `message.receive` | — | receive-side helper used by the transport; not called by shells. |
 
 The `event.wait`/`event.list` methods below are how received messages surface: a
@@ -186,13 +186,24 @@ type currently emitted is `message.received`.
 ### Operations
 
 Async operations (message sends, transfers) are persisted with ids and
-terminal statuses `delivered | failed | expired | cancelled`.
+terminal statuses `delivered | failed | expired | cancelled`. A durable send
+(the outbox) that cannot be delivered yet rests at `queued`, which is not
+terminal: `operation.wait` on it runs to its timeout. Every status change is
+an `operation.state_changed` event `{ operation_id, status, message_id }`.
+
+**Outbox retries.** Queued sends are retried at daemon start, whenever a
+peer's message arrives (proof it is reachable: its queued sends go), and on
+`operation.resume` — which the apps call on their own reachability signals
+(foreground, network change, opening the chat). Each retry claims its sends
+first, so overlapping triggers never send one message twice. Cancelling a
+queued send (`operation.cancel`) withdraws it; nothing left the device.
 
 | method | params | result |
 |---|---|---|
 | `operation.get` | `{ operation_id, timeout_ms? }` | `{ operation: { status, ... } }` |
 | `operation.wait` | `{ operation_id, timeout_ms? }` | polls server-side until a terminal status |
 | `operation.cancel` | `{ operation_id }` | `{}` |
+| `operation.resume` | `{ target? }` (peer id, name or alias) | `{ resumed }` — retries queued sends now (all peers, or `target`'s); returns how many it claimed |
 
 ### Access (capabilities)
 

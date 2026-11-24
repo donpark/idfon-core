@@ -259,6 +259,12 @@ pub struct Operation {
     pub outbound: Option<MessageEnvelope>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery: Option<DeliveryPolicy>,
+    /// An outbox item: a send that cannot be delivered yet stays `Queued`
+    /// ("not sent yet") and is retried when the peer is reachable again,
+    /// instead of ending `Failed`. Chat messages set it; call signaling and
+    /// other time-bound sends do not (a late call invite is worse than none).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub durable: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
