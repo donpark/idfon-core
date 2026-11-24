@@ -165,7 +165,12 @@ keeps standard `URL` fields. `peer.add` also accepts a `contact_ticket`
 | `message.receive` | — | receive-side helper used by the transport; not called by shells. |
 
 The `event.wait`/`event.list` methods below are how received messages surface: a
-`message.received` event with `data: { message_id, peer_id, text }`. Signaled
+`message.received` event with `data: { message_id, peer_id, conversation,
+idempotency_key, text }`. `message_id` is per recipient (a room send makes one
+per member); `idempotency_key` is the sender's key for the message, and a room
+send gives every member the same base key with a `:<member>` suffix, so apps
+use the part before the first `:` to name a message (see
+`docs/chat-envelopes.md`). Signaled
 blob transfers ride the same path as text with an `IDFON-DATA/1` envelope
 (`ticket=`, `size=` lines). Artifacts and selections use the same mechanism:
 an `IDFON-ARTIFACT/1` envelope publishes a durable result and an `IDFON-REF/1`
