@@ -159,6 +159,7 @@ Shell surface (v1, additive; unknown fields stay ignorable):
 | `room.join` | `{ room, name?, members? }` | `{ room }` — imports a copied room id into local state |
 | `room.list` | — | `{ rooms: [Room] }` |
 | `room.send` | `{ room, text, idempotency_key }` | `{ operation_ids: [...] }` — direct path returns one per member; gossip returns one room operation |
+| `room.update` | `{ room, name?, members?, icon?, repo?, kind? }` | `{ room }` — replaces the given fields (`members` replaces the list); local only, re-joins gossip when members change. Apps announce changes to the other members themselves (the iOS app's `IDFON-GROUP/1` invite) |
 | `room.leave` | `{ room }` | `{}` — local only |
 
 `room.send` uses direct N-way `message.send` fan-out for small or unavailable

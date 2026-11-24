@@ -2619,6 +2619,7 @@ fn dispatch_with_transport(
         "room.list" => room_list(&request, store),
         "room.send" => room_send(&request, store, transport),
         "room.leave" => room_leave(&request, store),
+        "room.update" => room_update(&request, store, transport),
         "room.call.join" => room_calls::join(&request, store, transport),
         "room.call.leave" => room_calls::leave(&request, store, transport),
         "room.call.status" => room_calls::status(&request, store),
@@ -3406,6 +3407,97 @@ fn room_list(request: &Request, store: &Arc<Mutex<Store>>) -> Response {
         .cloned()
         .collect();
     success(request, serde_json::json!({ "rooms": rooms }))
+}
+
+/// `room.update { room, name?, members?, icon?, repo?, kind? }` — change a
+/// room's local record: the given fields replace the stored ones (`members`
+/// replaces the whole list). Membership stays local (docs/chatrooms.md);
+/// apps tell the other members with their own invite message. A changed
+/// member list re-joins the gossip topic with the new peers.
+fn room_update(
+    request: &Request,
+    store: &Arc<Mutex<Store>>,
+    transport: Option<&Arc<TransportMode>>,
+) -> Response {
+    let room_ref = request_text(&request.params, "room").unwrap_or_default();
+    let identity_ref =
+        request_text(&request.params, "identity").unwrap_or_else(|| "default".into());
+    let member_refs: Option<Vec<String>> = request
+        .params
+        .get("members")
+        .and_then(serde_json::Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        });
+    let mut state = store.lock().expect("store mutex poisoned");
+    let identity_id = identity_id_of(&state, &identity_ref);
+    let members = member_refs.map(|refs| {
+        refs.iter()
+            .map(|member_ref| resolve_peer_id(&state, &identity_id, member_ref))
+            .collect::<Vec<_>>()
+    });
+    let Some(room) = state
+        .rooms
+        .iter_mut()
+        .find(|room| room.identity == identity_id && room_matches(room, &room_ref))
+    else {
+        return error_response(
+            request.id.clone(),
+            &request.method,
+            ErrorCode::InvalidRequest,
+            format!("room not found: {room_ref}"),
+            false,
+        );
+    };
+    if let Some(name) = request_text(&request.params, "name") {
+        room.name = (!name.is_empty()).then_some(name);
+    }
+    if let Some(icon) = request_text(&request.params, "icon") {
+        room.icon = (!icon.is_empty()).then_some(icon);
+    }
+    if let Some(repo) = request_text(&request.params, "repo") {
+        room.repo = (!repo.is_empty()).then_some(repo);
+    }
+    if let Some(kind) = request_text(&request.params, "kind").filter(|kind| !kind.is_empty()) {
+        room.kind = kind;
+    }
+    let members_changed = members.as_ref().is_some_and(|members| members != &room.members);
+    if let Some(members) = members {
+        room.members = members;
+    }
+    let room = room.clone();
+    record_state_event(
+        &mut state,
+        &room.identity,
+        "room.updated",
+        serde_json::json!({"room": room}),
+    );
+    let dir = state.data_dir.clone();
+    let _ = state.save(&dir);
+    drop(state);
+    if members_changed {
+        let key = format!("{}:{}", room.identity, room.id);
+        if let Some(topic) = gossip_topics()
+            .lock()
+            .expect("gossip topics poisoned")
+            .remove(&key)
+        {
+            topic.task.abort();
+        }
+        if let (Some(transport), Ok(handle)) = (transport, tokio::runtime::Handle::try_current()) {
+            let (identity, room_id, members) = (room.identity.clone(), room.id.clone(), room.members.clone());
+            let store = Arc::clone(store);
+            let transport = Arc::clone(transport);
+            handle.spawn(async move {
+                join_gossip_room(identity, room_id, members, store, transport).await;
+            });
+        }
+    }
+    success(request, serde_json::json!({ "room": room }))
 }
 
 /// `room.leave { room }` — local only; the other members are not told.
@@ -10494,6 +10586,38 @@ mod tests {
             durable: true,
         });
         assert_eq!(resume_queued(&store, &transport, None, true, 1), 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `room.update` replaces the given fields; members resolve like
+    /// `room.create`; an unknown room is an error.
+    #[test]
+    fn room_update_changes_name_and_members() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let dir = temp_dir("room-update");
+        let store = Arc::new(Mutex::new(Store::load(&dir).unwrap()));
+        let transport = Arc::new(TransportMode::Fake(FakeTransport::default()));
+        let rpc = |method: &str, params: serde_json::Value| -> Response {
+            dispatch_with_transport(
+                Request { version: PROTOCOL_VERSION, id: method.into(), method: method.into(), params },
+                &store,
+                Some(&transport),
+            )
+        };
+        let created = rpc("room.create", serde_json::json!({"id": "r_test", "name": "Weekend", "kind": "group", "members": ["alice"]}));
+        assert!(created.ok, "{created:?}");
+        let updated = rpc("room.update", serde_json::json!({"room": "r_test", "name": "Weekend plans", "members": ["alice", "bob"], "repo": "github.com/x/y"}));
+        let ResponseBody::Success { result, .. } = updated.body else { panic!("update failed") };
+        assert_eq!(result["room"]["name"], "Weekend plans");
+        assert_eq!(result["room"]["members"], serde_json::json!(["alice", "bob"]));
+        assert_eq!(result["room"]["repo"], "github.com/x/y");
+        assert_eq!(result["room"]["kind"], "group", "untouched fields stay");
+        let state = store.lock().unwrap();
+        assert_eq!(state.rooms[0].members, vec!["alice".to_string(), "bob".to_string()]);
+        assert!(state.events.iter().any(|event| event.r#type == "room.updated"));
+        drop(state);
+        assert!(!rpc("room.update", serde_json::json!({"room": "r_missing", "name": "x"})).ok);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
