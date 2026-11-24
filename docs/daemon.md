@@ -31,7 +31,7 @@ Two properties the code enforces:
   `media.session.*`, `policy.*`, `identity.*`, … They serve the moment the
   store opens, so no client's display data ever waits for endpoint binding.
 - **Transport-dependent functions accept `Option<&…>`** — `message.send`,
-  `room.*`, `events.sync`, `contact.ticket`, `identity.use`, `mcp.listen`,
+  `room.*`, `events.sync`, `contact.ticket`, `mcp.listen`,
   `media.live.answer`, `gateway.*`, `provider.*` fail closed with a *retryable*
   error while the endpoints bind (a send never records an operation that is
   doomed to fail); `peer.add` degrades gracefully (its transport use is
@@ -78,6 +78,11 @@ scale:
   shared stores. These must outlive agents and be singletons.
 - **Agents (interactive):** view state, event polling, live media — already
   direct, no daemon mediation needed.
+
+**One identity, one endpoint (2026-11-24).** Identities collapsed into
+`default`; what were identities are tags on contacts (`docs/identity.md`). The
+per-identity machinery below still exists, but a store holds one identity, so
+startup binds one endpoint. Historical notes follow.
 
 **The daemon runs one endpoint per identity, concurrently.**
 `idfon_core::transport::TransportManager` holds a

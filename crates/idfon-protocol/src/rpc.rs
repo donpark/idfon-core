@@ -137,11 +137,33 @@ methods! {
     "daemon.status" => DaemonStatus {}
     "daemon.shutdown" => DaemonShutdown {}
 
-    // Identity
+    // Identity: one you (identities became tags, 2026-11-24).
     "identity.list" => IdentityList {}
-    "identity.create" => IdentityCreate { pub name: String }
-    "identity.use" => IdentityUse { pub name: String }
-    "identity.delete" => IdentityDelete { pub name: String }
+    "identity.rename" => IdentityRename {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub identity: Option<String>,
+        pub name: String,
+    }
+
+    // Tags and what contacts can see (docs/identity.md)
+    "tag.list" => TagList {}
+    "tag.set" => TagSet {
+        pub name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub hide_presence: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub hide_photo: Option<bool>,
+    }
+    "tag.rename" => TagRename { pub name: String, pub to: String }
+    "tag.delete" => TagDelete { pub name: String }
+    "visibility.get" => VisibilityGet {}
+    "visibility.set" => VisibilitySet {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub presence: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub photo: Option<bool>,
+    }
+    "visibility.audience" => VisibilityAudience { pub aspect: String }
 
     // Peers
     "peer.list" => PeerList {}
@@ -184,6 +206,13 @@ methods! {
         pub aliases: Option<Vec<String>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub call_mode: Option<String>,
+        /// Replace the contact's tags.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub tags: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub add_tag: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub remove_tag: Option<String>,
     }
     "peer.remove" => PeerRemove {
         #[serde(rename = "ref", alias = "peer")]

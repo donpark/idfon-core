@@ -469,6 +469,59 @@ pub struct Peer {
     /// §5.1: tapping the contact row dials straight into the chat's call.
     #[serde(default)]
     pub instant_call: bool,
+    /// Tags on this contact (Work, Family…): list filters, and what the
+    /// contact can see of you through each tag's rule (`TagRule`,
+    /// docs/identity.md). Identities collapsed into these (2026-11-24).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// This contact's own overrides of what they can see (wins over tags).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<Visibility>,
+}
+
+/// What a contact can see of you (docs/identity.md). `None` = no choice
+/// here: the next level decides (contact override → tag rules → defaults
+/// → shown).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Visibility {
+    /// "Online" (presence, D-4). Never "last seen".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence: Option<bool>,
+    /// Your profile photo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub photo: Option<bool>,
+}
+
+impl Visibility {
+    /// The choice for one aspect: "presence" or "photo".
+    pub fn choice(&self, aspect: &str) -> Option<bool> {
+        match aspect {
+            "presence" => self.presence,
+            "photo" => self.photo,
+            _ => None,
+        }
+    }
+}
+
+/// A tag's rule: what contacts with this tag can't see. A contact with
+/// several tags is hidden from an aspect when any of them hides it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TagRule {
+    pub name: String,
+    #[serde(default)]
+    pub hide_presence: bool,
+    #[serde(default)]
+    pub hide_photo: bool,
+}
+
+impl TagRule {
+    pub fn hides(&self, aspect: &str) -> bool {
+        match aspect {
+            "presence" => self.hide_presence,
+            "photo" => self.hide_photo,
+            _ => false,
+        }
+    }
 }
 
 impl Peer {

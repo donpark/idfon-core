@@ -151,6 +151,11 @@ pub async fn fetch(
     // `connect` dials them as given, so the fetch does not depend on pkarr
     // having propagated. Retries cover a provider that is still coming online.
     // ponytail: 6 attempts x 1s.
+    // A ticket for one of our own blobs names our own endpoint, which can't
+    // dial itself ("connecting to ourself is not supported"): fetch it from
+    // a throwaway endpoint instead. With one identity (docs/identity.md)
+    // there is no second identity endpoint to do it.
+    let endpoint = endpoint.filter(|endpoint| endpoint.id() != ticket.addr().id);
     let mut last = None;
     for attempt in 0..6 {
         if attempt > 0 {

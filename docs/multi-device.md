@@ -200,6 +200,8 @@ requirement.
 
 ## 11. Lazy mobile binding (landed 2026-09-16)
 
+*Superseded 2026-11-24: a store holds one identity (`docs/identity.md`).*
+
 The daemon now honours `IDFON_LAZY_IDENTITIES` (set by the iOS app): startup
 binds and wires only `default` and the active identity, and `identity.use`
 binds a switched-to identity on demand. Desktop is unchanged (all identities

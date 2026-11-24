@@ -27,6 +27,8 @@ fn sample() -> Peer {
         call_mode: None,
         pinned: false,
         instant_call: false,
+        tags: Vec::new(),
+        visibility: None,
     }
 }
 

@@ -332,10 +332,22 @@ struct Store {
     mcp_command: Option<String>,
     #[serde(default)]
     sessions: Vec<idfon_protocol::MediaSession>,
-    /// One-shot marker: the D4 preset identities are provisioned once per
-    /// store (see `ensure_presets`).
+    /// Legacy one-shot marker of the D4 preset identities (Work / Personal /
+    /// Private). Presets are no longer created (identities are tags,
+    /// 2026-11-24); kept so old stores still parse.
     #[serde(default)]
     presets_v1: bool,
+    /// One-shot marker: every identity collapsed into `default`, the others
+    /// becoming tags (see `ensure_single_identity`).
+    #[serde(default)]
+    single_identity_v1: bool,
+    /// What contacts with each tag can't see of you (docs/identity.md).
+    #[serde(default)]
+    tag_rules: Vec<idfon_protocol::TagRule>,
+    /// What contacts see of you unless a tag or their own override says
+    /// otherwise (`None` = shown).
+    #[serde(default)]
+    visibility: idfon_protocol::Visibility,
     /// One-shot marker: stored `call_mode: bar` values from before the field
     /// became optional were the old implicit default, not a choice; they are
     /// cleared once so each contact kind gets the shell's default (see
@@ -381,8 +393,8 @@ impl Store {
             if let Some(snapshot) = snapshot {
                 let mut store: Self = serde_json::from_str(&snapshot).map_err(io::Error::other)?;
                 store.data_dir = data_dir.to_path_buf();
+                store.ensure_single_identity(data_dir)?;
                 store.ensure_identity_keys(data_dir)?;
-                store.ensure_presets(data_dir)?;
                 store.ensure_call_mode_auto(data_dir)?;
                 store.ensure_ring_scores(data_dir)?;
                 return Ok(store);
@@ -393,8 +405,8 @@ impl Store {
             Ok(bytes) => {
                 let mut store: Self = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
                 store.data_dir = data_dir.to_path_buf();
+                store.ensure_single_identity(data_dir)?;
                 store.ensure_identity_keys(data_dir)?;
-                store.ensure_presets(data_dir)?;
                 store.ensure_call_mode_auto(data_dir)?;
                 store.ensure_ring_scores(data_dir)?;
                 Ok(store)
@@ -420,7 +432,10 @@ impl Store {
                     mcp_discovery: Vec::new(),
                     mcp_command: None,
                     sessions: Vec::new(),
-                    presets_v1: false,
+                    presets_v1: true,
+                    single_identity_v1: true,
+                    tag_rules: Vec::new(),
+                    visibility: Default::default(),
                     // A fresh store has no legacy implicit `bar` to clear.
                     call_mode_auto_v1: true,
                     ring_score_v1: true,
@@ -429,7 +444,7 @@ impl Store {
                 };
                 let mut store = store;
                 store.ensure_identity_keys(data_dir)?;
-                store.ensure_presets(data_dir)?;
+                store.save(data_dir)?;
                 Ok(store)
             }
             Err(error) => Err(error),
@@ -472,33 +487,104 @@ impl Store {
         self.save(data_dir)
     }
 
-    /// D4/D20: preset identities at first launch — Work / Personal / Private,
-    /// renamable. The existing `default` identity migrates into the presets
-    /// (its name becomes Personal; the id stays `default`, so endpoint keys
-    /// and paired peers keep working). Marked `presets_v1`, so a preset the
-    /// user later deletes or renames stays gone.
-    fn ensure_presets(&mut self, data_dir: &Path) -> io::Result<()> {
-        if self.presets_v1 {
+    /// 2026-11-24 (Don): identities are tags that decide what a contact can
+    /// see of you, not separate selves. Collapse every identity into
+    /// `default` — one endpoint. Each other identity's contacts move to
+    /// `default` tagged with that identity's name (merged when the same
+    /// contact was under both), and its grants, rooms, events, operations,
+    /// policies and sessions follow. Its key files stay on disk but no longer
+    /// bind, so contacts who knew you only through that identity must add
+    /// you again (docs/identity.md; no users yet).
+    fn ensure_single_identity(&mut self, data_dir: &Path) -> io::Result<()> {
+        if self.single_identity_v1 {
             return Ok(());
         }
+        self.single_identity_v1 = true;
         self.presets_v1 = true;
-        for identity in &mut self.identities {
-            if identity.id == "default" && identity.name == "Default" {
-                identity.name = "Personal".into();
-            }
+        if !self.identities.iter().any(|identity| identity.id == "default") {
+            return self.save(data_dir);
         }
-        for name in ["Work", "Personal", "Private"] {
-            if !self.identities.iter().any(|identity| identity.name == name) {
-                self.identities.push(Identity {
-                    id: name.into(),
-                    name: name.into(),
-                    endpoint_id: None,
-                    public_key: None,
-                    active: false,
+        let others: Vec<(String, String)> = self
+            .identities
+            .iter()
+            .filter(|identity| identity.id != "default")
+            .map(|identity| (identity.id.clone(), identity.name.clone()))
+            .collect();
+        for (id, tag) in &others {
+            let moving: Vec<idfon_protocol::Peer> =
+                self.peers.iter().filter(|peer| &peer.identity == id).cloned().collect();
+            self.peers.retain(|peer| &peer.identity != id);
+            for mut peer in moving {
+                if let Some(existing) = self
+                    .peers
+                    .iter_mut()
+                    .find(|other| other.identity == "default" && other.id == peer.id)
+                {
+                    add_tag(&mut existing.tags, tag);
+                    continue;
+                }
+                peer.identity = "default".into();
+                add_tag(&mut peer.tags, tag);
+                if self.peers.iter().any(|other| other.identity == "default" && other.name == peer.name) {
+                    peer.name = format!("{} ({tag})", peer.name);
+                }
+                self.peers.push(peer);
+            }
+            for grant in &mut self.grants {
+                if &grant.identity == id {
+                    grant.identity = "default".into();
+                }
+            }
+            let default_rooms: Vec<String> = self
+                .rooms
+                .iter()
+                .filter(|room| room.identity == "default")
+                .map(|room| room.id.clone())
+                .collect();
+            self.rooms
+                .retain(|room| !(&room.identity == id && default_rooms.contains(&room.id)));
+            for room in &mut self.rooms {
+                if &room.identity == id {
+                    room.identity = "default".into();
+                }
+            }
+            for event in &mut self.events {
+                if &event.identity == id {
+                    event.identity = "default".into();
+                }
+            }
+            for operation in &mut self.operations {
+                if &operation.identity == id {
+                    operation.identity = "default".into();
+                }
+            }
+            for policy in &mut self.policies {
+                if &policy.identity == id {
+                    policy.identity = "default".into();
+                }
+            }
+            for session in &mut self.sessions {
+                if &session.identity == id {
+                    session.identity = "default".into();
+                }
+            }
+            for record in &mut self.mcp_discovery {
+                if &record.identity == id {
+                    record.identity = "default".into();
+                }
+            }
+            if !self.tag_rules.iter().any(|rule| rule.name.eq_ignore_ascii_case(tag)) {
+                self.tag_rules.push(idfon_protocol::TagRule {
+                    name: tag.clone(),
+                    hide_presence: false,
+                    hide_photo: false,
                 });
             }
         }
-        self.ensure_identity_keys(data_dir)?;
+        self.identities.retain(|identity| identity.id == "default");
+        for identity in &mut self.identities {
+            identity.active = true;
+        }
         self.save(data_dir)
     }
 
@@ -540,19 +626,6 @@ impl Store {
     /// every peer record that already points at it.
     fn endpoint_key(&self, identity_id: &str) -> io::Result<idfon_core::IdentityKey> {
         endpoint_key_in(&self.data_dir, identity_id)
-    }
-
-    /// Creates a dedicated transport key for a new identity (idempotent).
-    fn ensure_endpoint_key(&self, identity_id: &str) -> io::Result<()> {
-        let path = self.data_dir.join(format!("endpoint-{identity_id}.key"));
-        if path.exists() {
-            return Ok(());
-        }
-        let key = idfon_core::IdentityKey::generate();
-        std::fs::write(&path, key.encode())?;
-        #[cfg(unix)]
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-        Ok(())
     }
 
     /// The inbound MCP relay command: `IDFON_MCP_COMMAND` (per-process, keeps
@@ -2685,6 +2758,16 @@ fn dispatch_with_transport(
         }
         "peer.add" => peer_add(&request, store, transport),
         "peer.update" => peer_update(&request, store),
+        "tag.list" => tag_list(&request, store),
+        "tag.set" => tag_set(&request, store),
+        "tag.rename" => tag_rename(&request, store),
+        "tag.delete" => tag_delete(&request, store),
+        "visibility.get" => {
+            let state = store.lock().expect("store mutex poisoned");
+            success(&request, serde_json::json!({"visibility": visibility_view(&state.visibility)}))
+        }
+        "visibility.set" => visibility_set(&request, store),
+        "visibility.audience" => visibility_audience(&request, store),
         "peer.device.add" => peer_device_add(&request, store),
         "peer.device.update" => peer_device_update(&request, store),
         "peer.device.remove" => peer_device_remove(&request, store),
@@ -2759,9 +2842,23 @@ fn dispatch_with_transport(
         "live.list" => live::live_publishers(&request),
         "policy.set" => policy_set(&request, store),
         "policy.dry_run" => policy_dry_run(&request, store),
-        "identity.create" => identity_create(&request, store),
+        // Identities are tags now (2026-11-24, docs/identity.md): there is
+        // one you, with one endpoint.
+        "identity.create" => error_response(
+            request.id.clone(),
+            &request.method,
+            ErrorCode::InvalidRequest,
+            "there is one identity now; tag contacts instead (tag.set, peer.update tags)".into(),
+            false,
+        ),
         "identity.rename" => identity_rename(&request, store),
-        "identity.delete" => identity_delete(&request, store),
+        "identity.delete" => error_response(
+            request.id.clone(),
+            &request.method,
+            ErrorCode::InvalidRequest,
+            "the only identity can't be deleted; delete all data instead".into(),
+            false,
+        ),
         "identity.use" => {
             let name = request
                 .params
@@ -2934,6 +3031,45 @@ fn request_text(params: &serde_json::Value, name: &str) -> Option<String> {
 fn random_room_id() -> String {
     let key = idfon_core::IdentityKey::generate();
     format!("r_{}", &key.peer_id()[..32])
+}
+
+/// A list of tag names from `params[key]`, trimmed and deduplicated.
+fn request_tags(params: &serde_json::Value, key: &str) -> Vec<String> {
+    let mut tags = Vec::new();
+    for tag in params
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+    {
+        add_tag(&mut tags, tag);
+    }
+    tags
+}
+
+/// Add `tag` once (case-insensitive).
+fn add_tag(tags: &mut Vec<String>, tag: &str) {
+    let tag = tag.trim();
+    if !tag.is_empty() && !tags.iter().any(|existing| existing.eq_ignore_ascii_case(tag)) {
+        tags.push(tag.to_owned());
+    }
+}
+
+/// Whether `peer` may see `aspect` ("presence" | "photo") of you: their own
+/// override, else hidden when any of their tags hides it, else the default
+/// (shown unless turned off). docs/identity.md.
+fn peer_sees(state: &Store, peer: &idfon_protocol::Peer, aspect: &str) -> bool {
+    if let Some(choice) = peer.visibility.as_ref().and_then(|v| v.choice(aspect)) {
+        return choice;
+    }
+    let hidden = peer.tags.iter().any(|tag| {
+        state
+            .tag_rules
+            .iter()
+            .any(|rule| rule.name.eq_ignore_ascii_case(tag) && rule.hides(aspect))
+    });
+    !hidden && state.visibility.choice(aspect).unwrap_or(true)
 }
 
 fn identity_id_of(state: &Store, identity_ref: &str) -> String {
@@ -5727,166 +5863,6 @@ fn identity_rename(request: &Request, store: &Arc<Mutex<Store>>) -> Response {
     )
 }
 
-/// A10: identity creation is capped — no minting hundreds of personas.
-// shortcut: fixed cap, becomes permission- or payment-gated if that is how
-// identity creation gets monetized (A10).
-const MAX_IDENTITIES: usize = 6;
-
-fn identity_create(request: &Request, store: &Arc<Mutex<Store>>) -> Response {
-    let Some(name) = request
-        .params
-        .get("name")
-        .and_then(serde_json::Value::as_str)
-        .filter(|value| !value.is_empty())
-    else {
-        return error_response(
-            request.id.clone(),
-            &request.method,
-            ErrorCode::InvalidRequest,
-            "name is required".into(),
-            false,
-        );
-    };
-    let mut state = store.lock().expect("store mutex poisoned");
-    if state.identities.len() >= MAX_IDENTITIES {
-        return error_response(
-            request.id.clone(),
-            &request.method,
-            ErrorCode::InvalidRequest,
-            format!("identity limit reached ({MAX_IDENTITIES})"),
-            false,
-        );
-    }
-    // Case-insensitive: key files are named `identity-<id>.key`, and on a
-    // case-insensitive filesystem (macOS default) "Work" and "work" would
-    // share one key file. Names differing only by case also read as one.
-    if let Some(existing) = state.identities.iter().find(|identity| {
-        identity.id.eq_ignore_ascii_case(name) || identity.name.eq_ignore_ascii_case(name)
-    }) {
-        return error_response(
-            request.id.clone(),
-            &request.method,
-            ErrorCode::InvalidRequest,
-            format!(
-                "identity {:?} already exists (names are compared ignoring case)",
-                existing.name
-            ),
-            false,
-        );
-    }
-    let identity = Identity {
-        id: name.into(),
-        name: name.into(),
-        endpoint_id: None,
-        public_key: None,
-        active: false,
-    };
-    state.identities.push(identity.clone());
-    let data_dir = state.data_dir.clone();
-    if let Err(error) = state.ensure_identity_keys(&data_dir) {
-        return error_response(
-            request.id.clone(),
-            &request.method,
-            ErrorCode::Internal,
-            error.to_string(),
-            true,
-        );
-    }
-    // New identities get a dedicated transport key, so the identity key is a
-    // signing-only account key from birth (existing identities keep their
-    // legacy endpoint id; see `Store::endpoint_key`).
-    if let Err(error) = state.ensure_endpoint_key(&identity.id) {
-        return error_response(
-            request.id.clone(),
-            &request.method,
-            ErrorCode::Internal,
-            error.to_string(),
-            true,
-        );
-    }
-    record_state_event(
-        &mut state,
-        &identity.id,
-        "identity.created",
-        serde_json::json!({"identity": identity}),
-    );
-    if let Err(error) = state.save(&data_dir) {
-        return error_response(
-            request.id.clone(),
-            &request.method,
-            ErrorCode::Internal,
-            error.to_string(),
-            true,
-        );
-    }
-    success(request, serde_json::json!({"identity": identity}))
-}
-
-fn identity_delete(request: &Request, store: &Arc<Mutex<Store>>) -> Response {
-    let Some(name) = request
-        .params
-        .get("name")
-        .and_then(serde_json::Value::as_str)
-    else {
-        return error_response(
-            request.id.clone(),
-            &request.method,
-            ErrorCode::InvalidRequest,
-            "name is required".into(),
-            false,
-        );
-    };
-    let mut state = store.lock().expect("store mutex poisoned");
-    let Some(index) = state
-        .identities
-        .iter()
-        .position(|identity| identity.id == name || identity.name == name)
-    else {
-        return error_response(
-            request.id.clone(),
-            &request.method,
-            ErrorCode::InvalidRequest,
-            "identity not found".into(),
-            false,
-        );
-    };
-    if state.identities[index].active || state.identities.len() == 1 {
-        return error_response(
-            request.id.clone(),
-            &request.method,
-            ErrorCode::InvalidRequest,
-            "cannot delete active or last identity".into(),
-            false,
-        );
-    }
-    let id = state.identities.remove(index).id;
-    // A9: an identity's world dies with it — the relationships under it go too.
-    // shortcut: message/event history is not purged — the log is global
-    // append-only state today; purge with per-identity history if it grows.
-    state.peers.retain(|peer| peer.identity != id);
-    state.grants.retain(|grant| grant.identity != id);
-    state.rooms.retain(|room| room.identity != id);
-    record_state_event(
-        &mut state,
-        &id,
-        "identity.deleted",
-        serde_json::json!({"identity": id}),
-    );
-    let data_dir = state.data_dir.clone();
-    if let Err(error) = state.save(&data_dir) {
-        return error_response(
-            request.id.clone(),
-            &request.method,
-            ErrorCode::Internal,
-            error.to_string(),
-            true,
-        );
-    }
-    let _ = std::fs::remove_file(data_dir.join(format!("identity-{id}.key")));
-    let _ = std::fs::remove_file(data_dir.join(format!("endpoint-{id}.key")));
-    success(request, serde_json::json!({"deleted": id}))
-}
-
 /// The sender's ring score from `peer.add`/`peer.update`: `Ok(None)` when
 /// absent (leave it alone), `Ok(Some(None))` for `"auto"` (clear: the shell's
 /// default for the contact's kind), `Ok(Some(Some(score)))` otherwise.
@@ -6083,6 +6059,8 @@ fn peer_add(
         call_mode: None,
         pinned: false,
         instant_call: false,
+        tags: request_tags(&request.params, "tags"),
+        visibility: None,
     };
     // Contact metadata (§19 model deltas): Favorites pin (D7) and the
     // instant-call flag (§5.1), settable at add time like `call_mode`.
@@ -6149,6 +6127,8 @@ fn peer_add(
                 call_mode: None,
                 pinned: false,
                 instant_call: false,
+                tags: Vec::new(),
+                visibility: None,
             };
             if !reciprocal.id.is_empty() {
                 state.peers.retain(|candidate| {
@@ -6209,6 +6189,150 @@ fn peer_add(
         );
     }
     success(request, serde_json::json!({"peer": peer}))
+}
+
+/// `tag.list` — every tag in use or with a rule: `{name, hide_presence,
+/// hide_photo, count}` (count = contacts with it).
+fn tag_list(request: &Request, store: &Arc<Mutex<Store>>) -> Response {
+    let state = store.lock().expect("store mutex poisoned");
+    let mut names: Vec<String> = state.tag_rules.iter().map(|rule| rule.name.clone()).collect();
+    for peer in &state.peers {
+        for tag in &peer.tags {
+            add_tag(&mut names, tag);
+        }
+    }
+    let tags: Vec<serde_json::Value> = names
+        .iter()
+        .map(|name| {
+            let rule = state.tag_rules.iter().find(|rule| rule.name.eq_ignore_ascii_case(name));
+            let count = state
+                .peers
+                .iter()
+                .filter(|peer| peer.tags.iter().any(|tag| tag.eq_ignore_ascii_case(name)))
+                .count();
+            serde_json::json!({
+                "name": name,
+                "hide_presence": rule.is_some_and(|rule| rule.hide_presence),
+                "hide_photo": rule.is_some_and(|rule| rule.hide_photo),
+                "count": count,
+            })
+        })
+        .collect();
+    success(request, serde_json::json!({"tags": tags}))
+}
+
+/// `tag.set { name, hide_presence?, hide_photo? }` — create a tag or change
+/// what its contacts can't see.
+fn tag_set(request: &Request, store: &Arc<Mutex<Store>>) -> Response {
+    let Some(name) = request_text(&request.params, "name").map(|name| name.trim().to_owned()).filter(|name| !name.is_empty()) else {
+        return error_response(request.id.clone(), &request.method, ErrorCode::InvalidRequest, "name is required".into(), false);
+    };
+    let mut state = store.lock().expect("store mutex poisoned");
+    let index = match state.tag_rules.iter().position(|rule| rule.name.eq_ignore_ascii_case(&name)) {
+        Some(index) => index,
+        None => {
+            state.tag_rules.push(idfon_protocol::TagRule { name: name.clone(), hide_presence: false, hide_photo: false });
+            state.tag_rules.len() - 1
+        }
+    };
+    if let Some(hide) = request.params.get("hide_presence").and_then(serde_json::Value::as_bool) {
+        state.tag_rules[index].hide_presence = hide;
+    }
+    if let Some(hide) = request.params.get("hide_photo").and_then(serde_json::Value::as_bool) {
+        state.tag_rules[index].hide_photo = hide;
+    }
+    let rule = state.tag_rules[index].clone();
+    save_or_error(request, &mut state, serde_json::json!({"tag": rule}))
+}
+
+/// `tag.rename { name, to }` — on the rule and on every contact.
+fn tag_rename(request: &Request, store: &Arc<Mutex<Store>>) -> Response {
+    let (Some(name), Some(to)) = (
+        request_text(&request.params, "name"),
+        request_text(&request.params, "to").map(|to| to.trim().to_owned()).filter(|to| !to.is_empty()),
+    ) else {
+        return error_response(request.id.clone(), &request.method, ErrorCode::InvalidRequest, "name and to are required".into(), false);
+    };
+    let mut state = store.lock().expect("store mutex poisoned");
+    if !name.eq_ignore_ascii_case(&to) && state.tag_rules.iter().any(|rule| rule.name.eq_ignore_ascii_case(&to)) {
+        return error_response(request.id.clone(), &request.method, ErrorCode::InvalidRequest, format!("a tag named {to} exists"), false);
+    }
+    for rule in &mut state.tag_rules {
+        if rule.name.eq_ignore_ascii_case(&name) {
+            rule.name = to.clone();
+        }
+    }
+    for peer in &mut state.peers {
+        for tag in &mut peer.tags {
+            if tag.eq_ignore_ascii_case(&name) {
+                *tag = to.clone();
+            }
+        }
+    }
+    save_or_error(request, &mut state, serde_json::json!({"renamed": true}))
+}
+
+/// `tag.delete { name }` — the rule, and the tag on every contact.
+fn tag_delete(request: &Request, store: &Arc<Mutex<Store>>) -> Response {
+    let Some(name) = request_text(&request.params, "name") else {
+        return error_response(request.id.clone(), &request.method, ErrorCode::InvalidRequest, "name is required".into(), false);
+    };
+    let mut state = store.lock().expect("store mutex poisoned");
+    state.tag_rules.retain(|rule| !rule.name.eq_ignore_ascii_case(&name));
+    for peer in &mut state.peers {
+        peer.tags.retain(|tag| !tag.eq_ignore_ascii_case(&name));
+    }
+    save_or_error(request, &mut state, serde_json::json!({"deleted": true}))
+}
+
+/// The defaults as the apps read them: every aspect resolved (shown unless
+/// turned off).
+fn visibility_view(visibility: &idfon_protocol::Visibility) -> serde_json::Value {
+    serde_json::json!({
+        "presence": visibility.presence.unwrap_or(true),
+        "photo": visibility.photo.unwrap_or(true),
+    })
+}
+
+/// `visibility.set { presence?, photo? }` — what contacts see of you unless
+/// a tag or their own override says otherwise (D-4: "a toggle hides it").
+fn visibility_set(request: &Request, store: &Arc<Mutex<Store>>) -> Response {
+    let mut state = store.lock().expect("store mutex poisoned");
+    if let Some(value) = request.params.get("presence").and_then(serde_json::Value::as_bool) {
+        state.visibility.presence = Some(value);
+    }
+    if let Some(value) = request.params.get("photo").and_then(serde_json::Value::as_bool) {
+        state.visibility.photo = Some(value);
+    }
+    let view = visibility_view(&state.visibility);
+    save_or_error(request, &mut state, serde_json::json!({"visibility": view}))
+}
+
+/// `visibility.audience { aspect }` — the contacts who may see `aspect`
+/// ("presence" | "photo") of you: who the apps send presence or the photo
+/// to. Blocked contacts are the apps' to leave out.
+fn visibility_audience(request: &Request, store: &Arc<Mutex<Store>>) -> Response {
+    let aspect = request_text(&request.params, "aspect").unwrap_or_default();
+    if aspect != "presence" && aspect != "photo" {
+        return error_response(request.id.clone(), &request.method, ErrorCode::InvalidRequest, "aspect must be presence or photo".into(), false);
+    }
+    let state = store.lock().expect("store mutex poisoned");
+    let peers: Vec<&str> = state
+        .peers
+        .iter()
+        .filter(|peer| peer_sees(&state, peer, &aspect))
+        .map(|peer| peer.id.as_str())
+        .collect();
+    success(request, serde_json::json!({"aspect": aspect, "peers": peers}))
+}
+
+/// Save the store and answer `result`, or answer the save error.
+fn save_or_error(request: &Request, state: &mut Store, result: serde_json::Value) -> Response {
+    let data_dir = state.data_dir.clone();
+    if let Err(error) = state.save(&data_dir) {
+        return error_response(request.id.clone(), &request.method, ErrorCode::Internal, error.to_string(), true);
+    }
+    success(request, result)
 }
 
 fn peer_update(request: &Request, store: &Arc<Mutex<Store>>) -> Response {
@@ -6293,6 +6417,35 @@ fn peer_update(request: &Request, store: &Arc<Mutex<Store>>) -> Response {
         .and_then(serde_json::Value::as_bool)
     {
         peer.instant_call = instant_call;
+    }
+    // Tags (docs/identity.md): `tags` replaces the set; `add_tag` /
+    // `remove_tag` change one.
+    if request.params.get("tags").is_some_and(serde_json::Value::is_array) {
+        peer.tags = request_tags(&request.params, "tags");
+    }
+    if let Some(tag) = request_text(&request.params, "add_tag") {
+        add_tag(&mut peer.tags, &tag);
+    }
+    if let Some(tag) = request_text(&request.params, "remove_tag") {
+        peer.tags.retain(|existing| !existing.eq_ignore_ascii_case(&tag));
+    }
+    // `visibility`: this contact's overrides ({presence?, photo?}; a null
+    // field clears that override, a null object clears them all).
+    match request.params.get("visibility") {
+        Some(serde_json::Value::Null) => peer.visibility = None,
+        Some(serde_json::Value::Object(fields)) => {
+            let mut visibility = peer.visibility.clone().unwrap_or_default();
+            for (aspect, value) in fields {
+                let choice = value.as_bool();
+                match aspect.as_str() {
+                    "presence" => visibility.presence = choice,
+                    "photo" => visibility.photo = choice,
+                    _ => {}
+                }
+            }
+            peer.visibility = (visibility != idfon_protocol::Visibility::default()).then_some(visibility);
+        }
+        _ => {}
     }
     if let Some(devices) = request
         .params
@@ -7637,71 +7790,154 @@ mod tests {
         assert!(show.ok, "{show:?}");
     }
 
-    #[test]
-    fn preset_identities_provision_once_and_migrate_default() {
-        let dir = temp_dir("presets");
-        let store = Store::load(&dir).unwrap();
-        assert_eq!(
-            store
-                .identities
-                .iter()
-                .find(|identity| identity.id == "default")
-                .map(|identity| identity.name.as_str()),
-            Some("Personal")
-        );
-        for preset in ["Work", "Personal", "Private"] {
-            assert!(store
-                .identities
-                .iter()
-                .any(|identity| identity.name == preset));
+    fn test_peer(id: &str, identity: &str, name: &str) -> idfon_protocol::Peer {
+        idfon_protocol::Peer {
+            id: id.into(),
+            identity: identity.into(),
+            name: name.into(),
+            endpoint_id: None,
+            endpoint_addr: None,
+            devices: Vec::new(),
+            aliases: vec![],
+            ring_score: None,
+            call_mode: None,
+            pinned: false,
+            instant_call: false,
+            tags: Vec::new(),
+            visibility: None,
         }
-        // One-shot (`presets_v1`): a preset the user deletes stays deleted.
-        let mut store = store;
-        store.identities.retain(|identity| identity.name != "Work");
-        store.save(&dir).unwrap();
-        let reloaded = Store::load(&dir).unwrap();
-        assert!(!reloaded
-            .identities
-            .iter()
-            .any(|identity| identity.name == "Work"));
     }
 
     #[test]
-    fn identity_create_rejects_a_case_only_duplicate() {
-        let dir = temp_dir("identity-case");
+    fn a_fresh_store_has_one_identity() {
+        let dir = temp_dir("one-identity");
+        let store = Store::load(&dir).unwrap();
+        assert_eq!(store.identities.len(), 1, "no Work/Personal/Private presets");
+        assert_eq!(store.identities[0].id, "default");
+        assert!(store.identities[0].active);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn old_identities_collapse_into_tags() {
+        let dir = temp_dir("collapse");
+        let mut store = Store::load(&dir).unwrap();
+        // An old store: the D4 presets, each with contacts.
+        store.single_identity_v1 = false;
+        store.identities[0].name = "Personal".into();
+        for name in ["Work", "Private"] {
+            store.identities.push(Identity {
+                id: name.into(),
+                name: name.into(),
+                endpoint_id: None,
+                public_key: None,
+                active: false,
+            });
+        }
+        store.peers.push(test_peer("alice", "default", "Alice"));
+        store.peers.push(test_peer("alice", "Work", "Alice")); // the same contact, twice
+        store.peers.push(test_peer("bob", "Work", "Bob"));
+        store.peers.push(test_peer("bob2", "Private", "Bob")); // a name clash
+        store.grants.push(idfon_protocol::CapabilityGrant {
+            capability: idfon_protocol::Capability::MessageSend,
+            identity: "Work".into(),
+            subject: "bob".into(),
+            conversation: None,
+            active_at: "0".into(),
+            expires_at: None,
+            revision: 0,
+            revoked_at: None,
+        });
+        store.save(&dir).unwrap();
+
+        let store = Store::load(&dir).unwrap();
+        assert_eq!(store.identities.len(), 1);
+        assert!(store.peers.iter().all(|peer| peer.identity == "default"));
+        let alice: Vec<_> = store.peers.iter().filter(|peer| peer.id == "alice").collect();
+        assert_eq!(alice.len(), 1, "merged");
+        assert_eq!(alice[0].tags, vec!["Work".to_string()]);
+        let bob = store.peers.iter().find(|peer| peer.id == "bob").unwrap();
+        assert_eq!(bob.tags, vec!["Work".to_string()]);
+        let bob2 = store.peers.iter().find(|peer| peer.id == "bob2").unwrap();
+        assert_eq!(bob2.name, "Bob (Private)");
+        assert_eq!(bob2.tags, vec!["Private".to_string()]);
+        assert!(store.grants.iter().all(|grant| grant.identity == "default"));
+        assert!(store.tag_rules.iter().any(|rule| rule.name == "Work"));
+        assert!(store.tag_rules.iter().any(|rule| rule.name == "Private"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn creating_or_deleting_an_identity_is_refused() {
+        let dir = temp_dir("identity-refused");
         let store = Arc::new(Mutex::new(Store::load(&dir).unwrap()));
-        let create = |name: &str| {
+        let call = |method: &str| {
             dispatch(
                 Request {
                     version: PROTOCOL_VERSION,
                     id: "c".into(),
-                    method: "identity.create".into(),
-                    params: serde_json::json!({"name": name}),
+                    method: method.into(),
+                    params: serde_json::json!({"name": "travel"}),
                 },
                 &store,
             )
         };
-        assert!(create("travel").ok);
-        let duplicate = create("Travel");
-        assert!(!duplicate.ok, "{duplicate:?}");
+        assert!(!call("identity.create").ok);
+        assert!(!call("identity.delete").ok);
+        assert_eq!(store.lock().unwrap().identities.len(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
-    fn identity_create_is_capped() {
-        let dir = temp_dir("identity-cap");
+    fn tags_decide_what_contacts_see() {
+        let dir = temp_dir("tags");
         let store = Arc::new(Mutex::new(Store::load(&dir).unwrap()));
-        let request = |name: &str| Request {
-            version: PROTOCOL_VERSION,
-            id: "create".into(),
-            method: "identity.create".into(),
-            params: serde_json::json!({ "name": name }),
-        };
-        // A fresh store already carries the three presets.
-        assert_eq!(store.lock().unwrap().identities.len(), 3);
-        for index in 0..(MAX_IDENTITIES - 3) {
-            assert!(identity_create(&request(&format!("Extra{index}")), &store).ok);
+        {
+            let mut state = store.lock().unwrap();
+            for (id, name) in [("a", "Ann"), ("b", "Ben"), ("c", "Cy")] {
+                state.peers.push(test_peer(id, "default", name));
+            }
         }
-        assert!(!identity_create(&request("OneTooMany"), &store).ok);
+        let call = |method: &str, params: serde_json::Value| {
+            dispatch(
+                Request { version: PROTOCOL_VERSION, id: "t".into(), method: method.into(), params },
+                &store,
+            )
+        };
+        let result = |response: Response| match response.body {
+            ResponseBody::Success { result, .. } => result,
+            ResponseBody::Failure { error, .. } => panic!("{error:?}"),
+        };
+        let audience = |aspect: &str| -> Vec<String> {
+            let value = result(call("visibility.audience", serde_json::json!({"aspect": aspect})));
+            serde_json::from_value(value["peers"].clone()).unwrap()
+        };
+        assert!(call("peer.update", serde_json::json!({"ref": "a", "add_tag": "Work"})).ok);
+        assert!(call("peer.update", serde_json::json!({"ref": "b", "tags": ["work", "Family"]})).ok);
+        // Work hides presence: Ann and Ben (any tag hiding it) can't see it.
+        assert!(call("tag.set", serde_json::json!({"name": "Work", "hide_presence": true})).ok);
+        assert_eq!(audience("presence"), vec!["c"]);
+        assert_eq!(audience("photo"), vec!["a", "b", "c"]);
+        // A contact's own override wins over its tags.
+        assert!(call("peer.update", serde_json::json!({"ref": "b", "visibility": {"presence": true}})).ok);
+        assert_eq!(audience("presence"), vec!["b", "c"]);
+        // The default (D-4 "a toggle hides it") hides from everyone else.
+        assert!(call("visibility.set", serde_json::json!({"presence": false})).ok);
+        assert_eq!(audience("presence"), vec!["b"]);
+        let tags = result(call("tag.list", serde_json::json!({})));
+        let work = tags["tags"].as_array().unwrap().iter().find(|tag| tag["name"] == "Work").unwrap();
+        assert_eq!(work["count"], 2);
+        assert_eq!(work["hide_presence"], true);
+        assert!(call("tag.rename", serde_json::json!({"name": "Work", "to": "Office"})).ok);
+        assert!(store.lock().unwrap().peers.iter().find(|peer| peer.id == "a").unwrap().tags == vec!["Office".to_string()]);
+        assert!(call("tag.delete", serde_json::json!({"name": "Office"})).ok);
+        assert!(store.lock().unwrap().peers.iter().all(|peer| !peer.tags.iter().any(|tag| tag == "Office")));
+        assert!(call("peer.update", serde_json::json!({"ref": "b", "remove_tag": "family", "visibility": null})).ok);
+        let state = store.lock().unwrap();
+        let ben = state.peers.iter().find(|peer| peer.id == "b").unwrap();
+        assert!(ben.tags.is_empty() && ben.visibility.is_none());
+        drop(state);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -7720,74 +7956,8 @@ mod tests {
             )
         };
         assert!(rename("default", "Home").ok);
-        assert_eq!(
-            store
-                .lock()
-                .unwrap()
-                .identities
-                .iter()
-                .find(|identity| identity.id == "default")
-                .map(|identity| identity.name.as_str()),
-            Some("Home")
-        );
-        // Names collide with names and ids (same rule as create).
-        assert!(!rename("Work", "Home").ok);
-        assert!(!rename("Work", "Private").ok);
-        assert!(rename("Work", "Office").ok);
-    }
-
-    #[test]
-    fn identity_delete_removes_the_relationships() {
-        let dir = temp_dir("identity-delete");
-        let store = Arc::new(Mutex::new(Store::load(&dir).unwrap()));
-        let delete = |name: &str| {
-            dispatch(
-                Request {
-                    version: PROTOCOL_VERSION,
-                    id: "delete".into(),
-                    method: "identity.delete".into(),
-                    params: serde_json::json!({"name": name}),
-                },
-                &store,
-            )
-        };
-        // The active identity (and the last one) is gated.
-        assert!(!delete("default").ok);
-        {
-            let mut state = store.lock().unwrap();
-            state.peers.push(idfon_protocol::Peer {
-                id: "work-peer".into(),
-                identity: "Work".into(),
-                name: "Coworker".into(),
-                endpoint_id: None,
-                endpoint_addr: None,
-                devices: Vec::new(),
-                aliases: vec![],
-                ring_score: None,
-                call_mode: None,
-                pinned: false,
-                instant_call: false,
-            });
-            state.grants.push(idfon_protocol::CapabilityGrant {
-                capability: idfon_protocol::Capability::MessageSend,
-                identity: "Work".into(),
-                subject: "work-peer".into(),
-                conversation: None,
-                active_at: "0".into(),
-                expires_at: None,
-                revision: 0,
-                revoked_at: None,
-            });
-        }
-        assert!(delete("Work").ok);
-        let state = store.lock().unwrap();
-        assert!(!state
-            .identities
-            .iter()
-            .any(|identity| identity.id == "Work" || identity.name == "Work"));
-        // A9: the identity's relationships die with it.
-        assert!(!state.peers.iter().any(|peer| peer.identity == "Work"));
-        assert!(!state.grants.iter().any(|grant| grant.identity == "Work"));
+        assert_eq!(store.lock().unwrap().identities[0].name, "Home");
+        assert_eq!(store.lock().unwrap().identities[0].id, "default");
     }
 
     #[test]
@@ -7808,6 +7978,8 @@ mod tests {
                 call_mode: None,
                 pinned: false,
                 instant_call: false,
+                tags: Vec::new(),
+                visibility: None,
             });
         }
         let update = |params: serde_json::Value| {
@@ -7872,65 +8044,6 @@ mod tests {
             .find(|room| room.id == "r_plain")
             .unwrap();
         assert_eq!(plain.kind, "project");
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn send_rides_the_relationships_identity() {
-        let dir = temp_dir("send-identity");
-        let store = Arc::new(Mutex::new(Store::load(&dir).unwrap()));
-        let transport = Arc::new(TransportMode::new("fake", None, None).await.unwrap());
-        let key = idfon_core::IdentityKey::generate();
-        let peer_id = key.peer_id();
-        {
-            let mut state = store.lock().unwrap();
-            state.peers.push(idfon_protocol::Peer {
-                id: peer_id.clone(),
-                identity: "Work".into(),
-                name: "Coworker".into(),
-                endpoint_id: Some("ep".into()),
-                endpoint_addr: None,
-                devices: Vec::new(),
-                aliases: vec![],
-                ring_score: None,
-                call_mode: None,
-                pinned: false,
-                instant_call: false,
-            });
-            state.grants.push(idfon_protocol::CapabilityGrant {
-                capability: idfon_protocol::Capability::MessageSend,
-                identity: "Work".into(),
-                subject: peer_id.clone(),
-                conversation: None,
-                active_at: "0".into(),
-                expires_at: None,
-                revision: 0,
-                revoked_at: None,
-            });
-        }
-        let send = |key: &str, identity: Option<&str>| {
-            let mut params = serde_json::json!({
-                "to": peer_id.clone(),
-                "text": "hello",
-                "idempotency_key": key,
-            });
-            if let Some(identity) = identity {
-                params["identity"] = serde_json::Value::String(identity.into());
-            }
-            send_message(
-                &Request {
-                    version: PROTOCOL_VERSION,
-                    id: "send".into(),
-                    method: "message.send".into(),
-                    params,
-                },
-                &store,
-                Some(&transport),
-            )
-        };
-        // D20: no explicit identity → the target peer's line (Work) routes it.
-        assert!(send("k1", None).ok);
-        // An explicit identity wins — and the Work peer is not on Personal.
-        assert!(!send("k2", Some("Personal")).ok);
     }
 
     #[test]
@@ -8119,6 +8232,8 @@ mod tests {
                 call_mode: None,
                 pinned: false,
                 instant_call: false,
+                tags: Vec::new(),
+                visibility: None,
             });
             state.grants.push(idfon_protocol::CapabilityGrant {
                 capability: idfon_protocol::Capability::MessageSend,
@@ -8250,6 +8365,8 @@ mod tests {
                 call_mode: None,
                 pinned: false,
                 instant_call: false,
+                tags: Vec::new(),
+                visibility: None,
             };
             ensure_account_alias(&mut peer);
             state.peers.push(peer);
@@ -8388,6 +8505,8 @@ mod tests {
                 call_mode: None,
                 pinned: false,
                 instant_call: false,
+                tags: Vec::new(),
+                visibility: None,
             });
             state.grants.push(idfon_protocol::CapabilityGrant {
                 capability: idfon_protocol::Capability::new("resource.read"),
@@ -8538,6 +8657,8 @@ mod tests {
                 call_mode: None,
                 pinned: false,
                 instant_call: false,
+                tags: Vec::new(),
+                visibility: None,
             });
             state.grants.push(idfon_protocol::CapabilityGrant {
                 capability: idfon_protocol::Capability::new("resource.read"),
@@ -8598,6 +8719,8 @@ mod tests {
                 call_mode: None,
                 pinned: false,
                 instant_call: false,
+                tags: Vec::new(),
+                visibility: None,
             };
             ensure_account_alias(&mut peer);
             state.peers.push(peer);
@@ -8738,6 +8861,8 @@ mod tests {
             call_mode: None,
             pinned: false,
             instant_call: false,
+            tags: Vec::new(),
+            visibility: None,
         });
         state.grants.push(idfon_protocol::CapabilityGrant {
             capability: idfon_protocol::Capability::MessageReceive,
@@ -8811,6 +8936,8 @@ mod tests {
             call_mode: None,
             pinned: false,
             instant_call: false,
+            tags: Vec::new(),
+            visibility: None,
         });
         let ticket = idfon_core::TicketSpec {
             subject: None,
@@ -8892,6 +9019,8 @@ mod tests {
             call_mode: None,
             pinned: false,
             instant_call: false,
+            tags: Vec::new(),
+            visibility: None,
         });
         let ticket = idfon_core::TicketSpec {
             subject: None,
@@ -8987,6 +9116,8 @@ mod tests {
             call_mode: None,
             pinned: false,
             instant_call: false,
+            tags: Vec::new(),
+            visibility: None,
         });
         let ticket = idfon_core::TicketSpec {
             subject: None,
@@ -9044,6 +9175,8 @@ mod tests {
             call_mode: None,
             pinned: false,
             instant_call: false,
+            tags: Vec::new(),
+            visibility: None,
         });
         state.grants.push(idfon_protocol::CapabilityGrant {
             capability: idfon_protocol::Capability::MessageReceive,
@@ -9145,6 +9278,8 @@ mod tests {
             call_mode: None,
             pinned: false,
             instant_call: false,
+            tags: Vec::new(),
+            visibility: None,
         });
         state.grants.push(idfon_protocol::CapabilityGrant {
             capability: idfon_protocol::Capability::MessageReceive,
@@ -9294,65 +9429,24 @@ mod tests {
     }
 
     #[test]
-    fn identity_and_peer_mutations_persist() {
+    fn peer_mutations_persist() {
         let dir = temp_dir("management");
         let store = Arc::new(Mutex::new(Store::load(&dir).unwrap()));
-        let create = dispatch(
-            Request {
-                version: PROTOCOL_VERSION,
-                id: "create".into(),
-                method: "identity.create".into(),
-                params: serde_json::json!({"name": "travel"}),
-            },
-            &store,
-        );
-        assert!(create.ok);
-        let use_identity = dispatch(
-            Request {
-                version: PROTOCOL_VERSION,
-                id: "use".into(),
-                method: "identity.use".into(),
-                params: serde_json::json!({"name": "travel"}),
-            },
-            &store,
-        );
-        assert!(use_identity.ok);
         let add = dispatch(
             Request {
                 version: PROTOCOL_VERSION,
                 id: "add".into(),
                 method: "peer.add".into(),
-                params: serde_json::json!({"id": "peer-1", "name": "Alice", "aliases": ["alice@work"]}),
+                params: serde_json::json!({"id": "peer-1", "name": "Alice", "aliases": ["alice@work"], "tags": ["Work"]}),
             },
             &store,
         );
-        assert!(add.ok);
+        assert!(add.ok, "{add:?}");
         let state = Store::load(&dir).unwrap();
-        assert_eq!(state.identities.len(), 4); // 3 presets + the one above
-        assert!(
-            !state
-                .identities
-                .iter()
-                .find(|identity| identity.id == "default")
-                .unwrap()
-                .active
-        );
-        assert!(
-            state
-                .identities
-                .iter()
-                .find(|identity| identity.id == "travel")
-                .unwrap()
-                .active
-        );
-        assert!(state.peers[0]
-            .aliases
-            .iter()
-            .any(|alias| alias == "alice@work"));
-        assert!(state.peers[0]
-            .aliases
-            .contains(&idfon_core::account_alias("peer-1")));
-        assert!(dir.join("identity-work.key").is_file());
+        assert_eq!(state.identities.len(), 1);
+        assert!(state.peers[0].aliases.iter().any(|alias| alias == "alice@work"));
+        assert!(state.peers[0].aliases.contains(&idfon_core::account_alias("peer-1")));
+        assert_eq!(state.peers[0].tags, vec!["Work".to_string()]);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -9531,6 +9625,8 @@ mod tests {
                 call_mode: None,
                 pinned: false,
                 instant_call: false,
+                tags: Vec::new(),
+                visibility: None,
             });
             let data_dir = state.data_dir.clone();
             state.save(&data_dir).unwrap();
@@ -9729,6 +9825,8 @@ mod tests {
                     call_mode: mode,
                     pinned: false,
                     instant_call: false,
+                    tags: Vec::new(),
+                    visibility: None,
                 });
             }
             store.save(&dir).unwrap();
@@ -9776,6 +9874,8 @@ mod tests {
                 call_mode: None,
                 pinned: false,
                 instant_call: false,
+                tags: Vec::new(),
+                visibility: None,
             });
             identity.public_key.unwrap()
         };
@@ -9963,6 +10063,8 @@ mod tests {
             call_mode: None,
             pinned: false,
             instant_call: false,
+            tags: Vec::new(),
+            visibility: None,
         };
         let event = idfon_protocol::Event {
             event_id: "peer-event-1".into(),
@@ -10220,30 +10322,13 @@ mod tests {
     }
 
     #[test]
-    fn new_identity_gets_a_distinct_endpoint_key() {
+    fn the_identity_predating_the_split_keeps_one_key() {
         let dir = temp_dir("endpoint-key");
-        let store = Arc::new(Mutex::new(Store::load(&dir).unwrap()));
-        let response = dispatch(
-            Request {
-                version: PROTOCOL_VERSION,
-                id: "create".into(),
-                method: "identity.create".into(),
-                params: serde_json::json!({"name": "travel"}),
-            },
-            &store,
-        );
-        assert!(response.ok);
-        let state = store.lock().unwrap();
-        let account = state.identity_key("travel").unwrap().peer_id();
-        let endpoint = state.endpoint_key("travel").unwrap().peer_id();
-        assert_ne!(account, endpoint, "account and endpoint keys must differ");
-        assert!(dir.join("endpoint-travel.key").is_file());
-        // Identities predating the split keep one key for both roles.
+        let state = Store::load(&dir).unwrap();
         assert_eq!(
             state.identity_key("default").unwrap().peer_id(),
             state.endpoint_key("default").unwrap().peer_id()
         );
-        drop(state);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -10277,7 +10362,7 @@ mod tests {
         assert!(dir.join("state.db").is_file());
         std::fs::remove_file(dir.join("state.json")).unwrap();
         let restored = Store::load(&dir).unwrap();
-        assert_eq!(restored.identities.len(), 3); // Work / Personal / Private
+        assert_eq!(restored.identities.len(), 1); // one you (identities are tags)
         assert_eq!(restored.identities[0].id, "default");
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -10286,7 +10371,7 @@ mod tests {
     fn first_load_creates_default_identity_and_persists_it() {
         let dir = temp_dir("identity");
         let store = Store::load(&dir).unwrap();
-        assert_eq!(store.identities.len(), 3); // `default` + the D4 presets
+        assert_eq!(store.identities.len(), 1); // one you (identities are tags)
         assert_eq!(store.identities[0].id, "default");
         assert!(store.identities[0].public_key.is_some());
         assert!(dir.join("state.json").is_file());
@@ -10314,6 +10399,8 @@ mod tests {
             call_mode: None,
             pinned: false,
             instant_call: false,
+            tags: Vec::new(),
+            visibility: None,
         });
         store.save(&dir).unwrap();
         let store = Arc::new(Mutex::new(Store::load(&dir).unwrap()));
@@ -10350,6 +10437,8 @@ mod tests {
                 call_mode: None,
                 pinned: false,
                 instant_call: false,
+                tags: Vec::new(),
+                visibility: None,
             });
         }
         store.save(&dir).unwrap();
@@ -10395,6 +10484,8 @@ mod tests {
                 call_mode: None,
                 pinned: false,
                 instant_call: false,
+                tags: Vec::new(),
+                visibility: None,
             });
             state.grants.push(idfon_protocol::CapabilityGrant {
                 capability: idfon_protocol::Capability::MessageSend,
@@ -10495,6 +10586,8 @@ mod tests {
                 call_mode: None,
                 pinned: false,
                 instant_call: false,
+                tags: Vec::new(),
+                visibility: None,
             });
             state.grants.push(idfon_protocol::CapabilityGrant {
                 capability: idfon_protocol::Capability::MessageSend,
@@ -10677,6 +10770,8 @@ mod tests {
                     call_mode: None,
                     pinned: false,
                     instant_call: false,
+                    tags: Vec::new(),
+                    visibility: None,
                 });
                 for capability in [idfon_protocol::Capability::MessageSend, idfon_protocol::Capability::MessageReceive] {
                     state.grants.push(idfon_protocol::CapabilityGrant {
