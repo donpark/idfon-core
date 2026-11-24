@@ -234,9 +234,84 @@ members who are not each other's contacts can still be told. Durable.
 
 - `members` lists everyone, the sender included. A sender who is leaving sends
   it without themselves; a member left out by someone else was removed.
-- A receiver accepts a new group only from an unblocked contact, and a change
-  only from a current member.
+- A receiver accepts a new group only from an unblocked contact (or from the
+  person whose group link it opened, see "Group links"), and a change only
+  from a current member.
 - A member the receiver doesn't know is added as a peer with message grants
   scoped to that room (`access.grant` with `conversation`), and is not shown as
   a contact.
 - `kind` is `group`, or `project` when the group has an icon or repository.
+
+## Group links
+
+A group link lets someone who isn't a contact yet ask to join a group. It is
+an app convention on top of contact requests (`protocol.md`, "Contact
+requests"); the daemon knows nothing about it.
+
+### The link
+
+```
+https://idfon.net/go/join/<payload>
+idfon://join/<payload>
+```
+
+`<payload>` is base64url (no padding) of:
+
+```json
+{"v": 1, "room": "<room id>", "name": "Weekend", "contact": "idfon://add/<card>", "token": "<hex>"}
+```
+
+- `contact` is the inviter's card link (`contact-exchange.md`), so the joiner
+  can add them.
+- `token` is 16 random bytes as hex. The inviter's app makes it the first time
+  it shares a link to that group and keeps it; the token travels only inside
+  the link and the join request below. Resetting the link makes a new one, and
+  links with the old token stop working. It is the app's check, not a daemon
+  capability.
+
+### Joining
+
+The joiner's app asks first, then:
+
+1. Adds the inviter as a peer from `contact`, unless they already are one. An
+   inviter known only this way stays out of the contact list, like a group
+   member.
+2. Sends the inviter one plain-text message whose **last line** is the join
+   line:
+
+   ```
+   Ann would like to join “Weekend”.
+   idfon-join: <room id> <token> <joiner's name>
+   ```
+
+   The first line is for people: an app that doesn't know group links shows
+   it as an ordinary request. Only the last line counts. The name is the rest
+   of that line after the token (newlines in it become spaces).
+3. Remembers that it asked this inviter for this room, and accepts that one
+   group invite (`IDFON-GROUP/1` for that room, from that inviter) even though
+   the inviter isn't a regular contact. Any other group from them is still
+   ignored.
+
+**Why plain text.** The joiner isn't a peer of the inviter's identity yet. From
+an unknown sender, the inviter's daemon holds only plain text, as a contact
+request, and refuses every `IDFON-*` envelope. So the request can't be an
+envelope; it is a sentence with a machine-readable last line.
+
+### Letting them in
+
+The inviter's app reads held requests (`request.list`, on a `contact.request`
+event). It lets one in without asking only when a held text ends in a join line
+whose token is that group's current token on this device. Then it:
+
+- accepts the request scoped to the group: `request.accept { request_id, name:
+  <joiner's name>, conversation: <room id> }`. The joiner gets message grants
+  for that room only, like a member met through a group, and stays out of the
+  contact list. Held messages outside the room are dropped, the join text
+  included, so it never becomes a chat message.
+- adds them to the room and sends the group to every member (`IDFON-GROUP/1`,
+  above), which is how the joiner learns they're in.
+
+A join line with a wrong or old token is an ordinary request, left for the
+person to accept, delete or block. A join from someone who is already a
+contact arrives as a normal `message.received` with no conversation; with a
+valid token the app adds them the same way and doesn't show the text.
