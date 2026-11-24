@@ -319,6 +319,14 @@ struct Store {
     policies: Vec<idfon_protocol::LocalPolicy>,
     #[serde(default)]
     revoked_tickets: Vec<String>,
+    /// Held messages from senders who aren't peers (docs/protocol.md
+    /// "Contact requests"), oldest first.
+    #[serde(default)]
+    contact_requests: Vec<idfon_protocol::ContactRequest>,
+    /// Senders whose request was declined with `block`: refused without a
+    /// request while they aren't peers.
+    #[serde(default)]
+    blocked_senders: Vec<BlockedSender>,
     /// Endpoint ids this daemon admitted at the relay's auth service
     /// (`relay_auth`); revocation is the set difference against live
     /// peers/identities (idfon-edge/docs/relay-auth.md §6).
@@ -363,6 +371,14 @@ struct Store {
     /// Group-call sessions (G1): runtime only, rebuilt as members re-announce.
     #[serde(skip)]
     room_calls: room_calls::RoomCalls,
+}
+
+/// A sender blocked from making contact requests to `identity`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct BlockedSender {
+    identity: String,
+    peer_id: String,
+    blocked_at: String,
 }
 
 impl Store {
@@ -428,6 +444,8 @@ impl Store {
                     rooms: Vec::new(),
                     policies: Vec::new(),
                     revoked_tickets: Vec::new(),
+                    contact_requests: Vec::new(),
+                    blocked_senders: Vec::new(),
                     relay_admitted: Vec::new(),
                     mcp_discovery: Vec::new(),
                     mcp_command: None,
@@ -1429,7 +1447,7 @@ fn spawn_receiver(
     tokio::spawn(async move {
         let receiver_identity = identity.clone();
         let result = manager
-            .serve(&identity, move |message| {
+            .serve_with_remote_addr(&identity, move |message, remote| {
                 let store = Arc::clone(&store);
                 let identity = receiver_identity.clone();
                 let transport = Arc::clone(&transport);
@@ -1437,10 +1455,19 @@ fn spawn_receiver(
                     // A message from a peer proves it is reachable: retry
                     // whatever is waiting for it in the outbox.
                     let sender = message.sender.peer_id.clone();
+                    // The connection's view of the sender's address, kept
+                    // with a contact request so accepting can dial back. Only
+                    // when the authenticated remote is the claimed endpoint.
+                    let remote_addr = (remote.id.to_string() == message.sender.endpoint_id)
+                        .then(|| serde_json::to_string(&remote).ok())
+                        .flatten();
                     let mut params = serde_json::to_value(message).map_err(|error| {
                         idfon_core::transport::TransportError::Failed(error.to_string())
                     })?;
                     params["identity"] = serde_json::Value::String(identity);
+                    if let Some(remote_addr) = remote_addr {
+                        params[REMOTE_ADDR_PARAM] = serde_json::Value::String(remote_addr);
+                    }
                     let request = Request {
                         version: PROTOCOL_VERSION,
                         id: format!(
@@ -2636,6 +2663,7 @@ fn provider_stop(request: &Request, identity: &str) -> Response {
 /// (`relay_auth`, idfon-edge/docs/relay-auth.md §6); they poke the enrollment loop.
 const RELAY_ENROLL_MUTATIONS: &[&str] = &[
     "peer.add",
+    "request.accept",
     "peer.update",
     "peer.device.add",
     "peer.device.update",
@@ -2709,6 +2737,10 @@ fn dispatch_with_transport(
         "contact.ticket" => contact_ticket(&request, store, transport),
         "contact.export" => contact_export(&request, store, transport),
         "contact.import" => contact_import(&request, store, transport),
+        "request.list" => request_list(&request, store),
+        "request.accept" => request_accept(&request, store),
+        "request.decline" => request_decline(&request, store),
+        "request.unblock" => request_unblock(&request, store),
         "daemon.status" => {
             let state = store.lock().expect("store mutex poisoned");
             let identity_ref =
@@ -4383,14 +4415,9 @@ fn receive_message(request: &Request, store: &Arc<Mutex<Store>>) -> Response {
         );
     drop(state);
     if !known_peer {
-        tracing::warn!(target: "idfon.daemon", identity = %receiving_identity, message_id = %envelope.message_id, sender = %envelope.sender.peer_id, sender_endpoint = %envelope.sender.endpoint_id, trace = ?envelope.trace, "message receive rejected: unknown peer");
-        return error_response(
-            request.id.clone(),
-            &request.method,
-            ErrorCode::Unauthorized,
-            "sender is not a persisted peer".into(),
-            false,
-        );
+        // Not a contact: hold plain text as a contact request instead of
+        // refusing it (docs/protocol.md "Contact requests").
+        return hold_contact_request(request, store, &receiving_identity, &envelope);
     }
     if !allowed {
         tracing::warn!(target: "idfon.daemon", identity = %receiving_identity, message_id = %envelope.message_id, sender = %envelope.sender.peer_id, trace = ?envelope.trace, "message receive rejected: capability denied");
@@ -4562,6 +4589,555 @@ fn receive_message(request: &Request, store: &Arc<Mutex<Store>>) -> Response {
             "operation_id": operation.operation_id,
             "status": "delivered",
         }),
+    )
+}
+
+/// Param the transport receiver adds to `message.receive`: the sender's dial
+/// address as the connection saw it (JSON text). Kept with a contact request.
+const REMOTE_ADDR_PARAM: &str = "remote_endpoint_addr";
+/// Contact-request bounds (docs/protocol.md "Contact requests"): pending
+/// senders per identity (the oldest is dropped), messages held per sender,
+/// and bytes per held text.
+const MAX_REQUEST_SENDERS: usize = 64;
+const MAX_REQUEST_MESSAGES: usize = 20;
+const MAX_REQUEST_TEXT_BYTES: usize = 8 * 1024;
+
+/// An `IDFON-*/N` envelope (a file, call, receipt, card…): the first line
+/// names it. Never held as a contact request.
+fn is_envelope(text: &str) -> bool {
+    let first = text.lines().next().unwrap_or_default().trim_end();
+    first
+        .strip_prefix("IDFON-")
+        .and_then(|rest| rest.split_once('/'))
+        .is_some_and(|(name, version)| {
+            !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '-')
+                && !version.is_empty()
+                && version.chars().all(|c| c.is_ascii_digit())
+        })
+}
+
+/// The refusal an unknown sender got before contact requests, unchanged so a
+/// blocked sender can't tell they are blocked.
+fn refuse_unknown_sender(
+    request: &Request,
+    identity: &str,
+    envelope: &idfon_protocol::MessageEnvelope,
+    reason: &str,
+) -> Response {
+    tracing::warn!(target: "idfon.daemon", identity = %identity, message_id = %envelope.message_id, sender = %envelope.sender.peer_id, sender_endpoint = %envelope.sender.endpoint_id, trace = ?envelope.trace, reason, "message receive rejected: unknown peer");
+    error_response(
+        request.id.clone(),
+        &request.method,
+        ErrorCode::Unauthorized,
+        "sender is not a persisted peer".into(),
+        false,
+    )
+}
+
+fn contact_request_id(identity: &str, peer_id: &str, message_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    for part in [identity, peer_id, message_id] {
+        hasher.update(part.as_bytes());
+        hasher.update([0]);
+    }
+    let digest = hasher.finalize();
+    let hex: String = digest[..8].iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("req_{hex}")
+}
+
+fn push_event(
+    state: &mut Store,
+    identity: &str,
+    event_id: String,
+    event_type: &str,
+    data: serde_json::Value,
+) {
+    let cursor = format!("cur_{:020}", next_event_number(&state.events));
+    state.events.push(idfon_protocol::Event {
+        event_id,
+        cursor,
+        r#type: event_type.into(),
+        timestamp: now(),
+        identity: identity.into(),
+        data,
+    });
+    if state.events.len() > EVENT_RETENTION {
+        let excess = state.events.len() - EVENT_RETENTION;
+        state.events.drain(..excess);
+    }
+}
+
+/// A verified message from a sender who isn't a peer: hold plain text as a
+/// contact request and acknowledge it, so the sender's outbox marks it
+/// delivered. Envelopes (files and the like), blocked senders and messages
+/// past the bounds are refused.
+fn hold_contact_request(
+    request: &Request,
+    store: &Arc<Mutex<Store>>,
+    identity: &str,
+    envelope: &idfon_protocol::MessageEnvelope,
+) -> Response {
+    let idfon_protocol::MessageContent::Text { text } = &envelope.content;
+    let sender = &envelope.sender.peer_id;
+    let mut state = store.lock().expect("store mutex poisoned");
+    if state
+        .blocked_senders
+        .iter()
+        .any(|blocked| blocked.identity == identity && &blocked.peer_id == sender)
+    {
+        return refuse_unknown_sender(request, identity, envelope, "blocked");
+    }
+    if is_envelope(text) {
+        return refuse_unknown_sender(request, identity, envelope, "not text");
+    }
+    let refuse = |message: &str| {
+        tracing::warn!(target: "idfon.daemon", identity = %identity, message_id = %envelope.message_id, sender = %sender, reason = message, "contact request refused");
+        error_response(
+            request.id.clone(),
+            &request.method,
+            ErrorCode::CapabilityDenied,
+            message.into(),
+            false,
+        )
+    };
+    if text.len() > MAX_REQUEST_TEXT_BYTES {
+        return refuse("message is too long for a contact request");
+    }
+    let position = state
+        .contact_requests
+        .iter()
+        .position(|held| held.identity == identity && &held.peer_id == sender);
+    if let Some(index) = position {
+        let held = &state.contact_requests[index];
+        if let Some(existing) = held.messages.iter().find(|message| {
+            message.idempotency_key == envelope.idempotency_key
+                && message.conversation == envelope.conversation
+        }) {
+            if &existing.text != text {
+                return error_response(
+                    request.id.clone(),
+                    &request.method,
+                    ErrorCode::IdempotencyKeyConflict,
+                    "idempotency key was reused with different content".into(),
+                    false,
+                );
+            }
+            return success(
+                request,
+                serde_json::json!({"message_id": existing.message_id, "status": "duplicate"}),
+            );
+        }
+        if held.messages.len() >= MAX_REQUEST_MESSAGES {
+            return refuse("contact request is full");
+        }
+    }
+    let received_at = now();
+    let request_id = match position {
+        Some(index) => state.contact_requests[index].request_id.clone(),
+        None => {
+            while state
+                .contact_requests
+                .iter()
+                .filter(|held| held.identity == identity)
+                .count()
+                >= MAX_REQUEST_SENDERS
+            {
+                let oldest = state
+                    .contact_requests
+                    .iter()
+                    .position(|held| held.identity == identity)
+                    .expect("counted above");
+                let dropped = state.contact_requests.remove(oldest);
+                tracing::info!(target: "idfon.daemon", identity = %identity, request_id = %dropped.request_id, "contact request dropped: too many pending");
+            }
+            let request_id = contact_request_id(identity, sender, &envelope.message_id);
+            state.contact_requests.push(idfon_protocol::ContactRequest {
+                request_id: request_id.clone(),
+                identity: identity.into(),
+                peer_id: sender.clone(),
+                endpoint_id: envelope.sender.endpoint_id.clone(),
+                endpoint_addr: None,
+                received_at: received_at.clone(),
+                messages: Vec::new(),
+            });
+            request_id
+        }
+    };
+    let held = state
+        .contact_requests
+        .iter_mut()
+        .find(|held| held.request_id == request_id)
+        .expect("held above");
+    // The latest claim and address win: they are what a reply should dial.
+    if !envelope.sender.endpoint_id.is_empty() {
+        held.endpoint_id = envelope.sender.endpoint_id.clone();
+    }
+    // Only an address for the signed endpoint claim: room gossip hands raw
+    // JSON to `message.receive`, so a relayer could add this param.
+    if let Some(address) = request_text(&request.params, REMOTE_ADDR_PARAM).filter(|address| {
+        serde_json::from_str::<EndpointAddr>(address)
+            .is_ok_and(|parsed| parsed.id.to_string() == envelope.sender.endpoint_id)
+    }) {
+        held.endpoint_addr = Some(address);
+    }
+    held.messages.push(idfon_protocol::HeldMessage {
+        message_id: envelope.message_id.clone(),
+        text: text.clone(),
+        conversation: envelope.conversation.clone(),
+        idempotency_key: envelope.idempotency_key.clone(),
+        received_at,
+    });
+    let endpoint_id = held.endpoint_id.clone();
+    push_event(
+        &mut state,
+        identity,
+        format!("evt_req_{}", envelope.message_id),
+        "contact.request",
+        serde_json::json!({
+            "request_id": request_id,
+            "peer_id": sender,
+            "endpoint_id": endpoint_id,
+            "conversation": envelope.conversation,
+            "text": text,
+            "idempotency_key": envelope.idempotency_key,
+        }),
+    );
+    tracing::info!(target: "idfon.daemon", identity = %identity, message_id = %envelope.message_id, sender = %sender, request_id = %request_id, "message held as contact request");
+    let data_dir = state.data_dir.clone();
+    if let Err(error) = state.save(&data_dir) {
+        return error_response(
+            request.id.clone(),
+            &request.method,
+            ErrorCode::Internal,
+            error.to_string(),
+            true,
+        );
+    }
+    success(
+        request,
+        serde_json::json!({
+            "message_id": envelope.message_id,
+            "status": "held",
+            "request_id": request_id,
+        }),
+    )
+}
+
+/// `request.list` — pending contact requests, newest first.
+fn request_list(request: &Request, store: &Arc<Mutex<Store>>) -> Response {
+    let identity = request_text(&request.params, "identity");
+    let state = store.lock().expect("store mutex poisoned");
+    let requests: Vec<_> = state
+        .contact_requests
+        .iter()
+        .rev()
+        .filter(|held| identity.as_deref().is_none_or(|value| held.identity == value))
+        .collect();
+    success(request, serde_json::json!({"requests": requests}))
+}
+
+/// A short, unused contact name for an accepted sender: a prefix of its id.
+fn short_peer_name(state: &Store, identity: &str, peer_id: &str) -> String {
+    let taken = |name: &str| {
+        state
+            .peers
+            .iter()
+            .any(|peer| peer.identity == identity && peer.name == name)
+    };
+    let chars: Vec<char> = peer_id.chars().collect();
+    (8..chars.len())
+        .step_by(4)
+        .map(|length| chars[..length].iter().collect::<String>())
+        .find(|name| !taken(name))
+        .unwrap_or_else(|| peer_id.to_owned())
+}
+
+/// `request.accept` — make the sender a peer, grant `message.send` and
+/// `message.receive` (scoped to `conversation` when given), then deliver the
+/// held messages the grant covers as ordinary `message.received` events.
+fn request_accept(request: &Request, store: &Arc<Mutex<Store>>) -> Response {
+    let invalid = |message: &str| {
+        error_response(
+            request.id.clone(),
+            &request.method,
+            ErrorCode::InvalidRequest,
+            message.into(),
+            false,
+        )
+    };
+    let Some(request_id) = request_text(&request.params, "request_id") else {
+        return invalid("request_id is required");
+    };
+    let name = request_text(&request.params, "name").filter(|value| !value.trim().is_empty());
+    let conversation =
+        request_text(&request.params, "conversation").filter(|value| !value.is_empty());
+    let mut state = store.lock().expect("store mutex poisoned");
+    let Some(index) = state
+        .contact_requests
+        .iter()
+        .position(|held| held.request_id == request_id)
+    else {
+        return invalid("contact request not found");
+    };
+    let held = state.contact_requests[index].clone();
+    let identity = held.identity.clone();
+    let existing = state
+        .peers
+        .iter()
+        .find(|peer| peer.identity == identity && peer.id == held.peer_id)
+        .cloned();
+    let peer = match existing {
+        // Added some other way since: keep that record as it is.
+        Some(peer) => peer,
+        None => {
+            let name = match name {
+                Some(name) => {
+                    if state
+                        .peers
+                        .iter()
+                        .any(|peer| peer.identity == identity && peer.name == name)
+                    {
+                        return invalid("peer name already exists");
+                    }
+                    name
+                }
+                None => short_peer_name(&state, &identity, &held.peer_id),
+            };
+            // No address from the connection (the message came over a room's
+            // gossip): an id-only address, which iroh resolves by discovery.
+            let endpoint_addr = held.endpoint_addr.clone().or_else(|| {
+                held.endpoint_id
+                    .parse::<iroh::EndpointId>()
+                    .ok()
+                    .and_then(|id| serde_json::to_string(&EndpointAddr::new(id)).ok())
+            });
+            let mut peer = idfon_protocol::Peer {
+                id: held.peer_id.clone(),
+                identity: identity.clone(),
+                name,
+                endpoint_id: (!held.endpoint_id.is_empty()).then(|| held.endpoint_id.clone()),
+                endpoint_addr,
+                devices: Vec::new(),
+                aliases: Vec::new(),
+                ring_score: None,
+                call_mode: None,
+                pinned: false,
+                instant_call: false,
+                tags: Vec::new(),
+                visibility: None,
+            };
+            ensure_account_alias(&mut peer);
+            state.peers.push(peer.clone());
+            record_state_event(
+                &mut state,
+                &identity,
+                "peer.created",
+                serde_json::json!({"peer": peer}),
+            );
+            peer
+        }
+    };
+    state
+        .blocked_senders
+        .retain(|blocked| !(blocked.identity == identity && blocked.peer_id == peer.id));
+    for capability in [
+        idfon_protocol::Capability::MessageSend,
+        idfon_protocol::Capability::MessageReceive,
+    ] {
+        if state.grants.iter().any(|grant| {
+            grant.identity == identity
+                && grant.subject == peer.id
+                && grant.capability == capability
+                && grant.conversation == conversation
+                && grant.revoked_at.is_none()
+        }) {
+            continue;
+        }
+        let revision = state
+            .grants
+            .iter()
+            .filter(|grant| {
+                grant.identity == identity
+                    && grant.subject == peer.id
+                    && grant.capability == capability
+            })
+            .map(|grant| grant.revision)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let grant = idfon_protocol::CapabilityGrant {
+            capability,
+            identity: identity.clone(),
+            subject: peer.id.clone(),
+            conversation: conversation.clone(),
+            active_at: "0".into(),
+            expires_at: None,
+            revision,
+            revoked_at: None,
+        };
+        state.grants.push(grant.clone());
+        record_state_event(
+            &mut state,
+            &identity,
+            "grant.created",
+            serde_json::json!({"grant": grant}),
+        );
+    }
+    // Held messages outside an accepted conversation stay undelivered: the
+    // sender is admitted to that conversation only.
+    for message in held.messages.iter().filter(|message| {
+        conversation.is_none() || message.conversation == conversation
+    }) {
+        if state.messages.iter().any(|known| {
+            known.sender.peer_id == held.peer_id
+                && known.idempotency_key == message.idempotency_key
+                && known.conversation == message.conversation
+        }) {
+            continue;
+        }
+        // `messages` is the receive dedup index; the signature was verified
+        // when the message was held.
+        state.messages.push(idfon_protocol::MessageEnvelope {
+            message_id: message.message_id.clone(),
+            sender: idfon_protocol::PeerAuth {
+                peer_id: held.peer_id.clone(),
+                endpoint_id: held.endpoint_id.clone(),
+                signature: String::new(),
+            },
+            content: idfon_protocol::MessageContent::Text {
+                text: message.text.clone(),
+            },
+            idempotency_key: message.idempotency_key.clone(),
+            capability_ticket: None,
+            conversation: message.conversation.clone(),
+            trace: None,
+            telemetry: None,
+            context: None,
+        });
+        push_event(
+            &mut state,
+            &identity,
+            format!("evt_{}", message.message_id),
+            "message.received",
+            serde_json::json!({
+                "message_id": message.message_id,
+                "peer_id": held.peer_id,
+                "conversation": message.conversation,
+                "idempotency_key": message.idempotency_key,
+                "text": message.text,
+            }),
+        );
+    }
+    state.contact_requests.remove(index);
+    tracing::info!(target: "idfon.daemon", identity = %identity, request_id = %request_id, peer = %peer.id, conversation = ?conversation, "contact request accepted");
+    let data_dir = state.data_dir.clone();
+    if let Err(error) = state.save(&data_dir) {
+        return error_response(
+            request.id.clone(),
+            &request.method,
+            ErrorCode::Internal,
+            error.to_string(),
+            true,
+        );
+    }
+    success(request, serde_json::json!({"peer": peer}))
+}
+
+/// `request.decline` — drop a contact request; `block` also refuses the
+/// sender's future messages (until `request.unblock` or they become a peer).
+fn request_decline(request: &Request, store: &Arc<Mutex<Store>>) -> Response {
+    let Some(request_id) = request_text(&request.params, "request_id") else {
+        return error_response(
+            request.id.clone(),
+            &request.method,
+            ErrorCode::InvalidRequest,
+            "request_id is required".into(),
+            false,
+        );
+    };
+    let block = request
+        .params
+        .get("block")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let mut state = store.lock().expect("store mutex poisoned");
+    let Some(index) = state
+        .contact_requests
+        .iter()
+        .position(|held| held.request_id == request_id)
+    else {
+        return error_response(
+            request.id.clone(),
+            &request.method,
+            ErrorCode::InvalidRequest,
+            "contact request not found".into(),
+            false,
+        );
+    };
+    let held = state.contact_requests.remove(index);
+    if block
+        && !state
+            .blocked_senders
+            .iter()
+            .any(|blocked| blocked.identity == held.identity && blocked.peer_id == held.peer_id)
+    {
+        state.blocked_senders.push(BlockedSender {
+            identity: held.identity.clone(),
+            peer_id: held.peer_id.clone(),
+            blocked_at: now(),
+        });
+    }
+    tracing::info!(target: "idfon.daemon", identity = %held.identity, request_id = %request_id, block, "contact request declined");
+    let data_dir = state.data_dir.clone();
+    if let Err(error) = state.save(&data_dir) {
+        return error_response(
+            request.id.clone(),
+            &request.method,
+            ErrorCode::Internal,
+            error.to_string(),
+            true,
+        );
+    }
+    success(
+        request,
+        serde_json::json!({"request_id": request_id, "peer_id": held.peer_id, "blocked": block}),
+    )
+}
+
+/// `request.unblock` — let a blocked sender make contact requests again.
+fn request_unblock(request: &Request, store: &Arc<Mutex<Store>>) -> Response {
+    let Some(peer_id) = request_text(&request.params, "peer_id") else {
+        return error_response(
+            request.id.clone(),
+            &request.method,
+            ErrorCode::InvalidRequest,
+            "peer_id is required".into(),
+            false,
+        );
+    };
+    let identity = request_text(&request.params, "identity").unwrap_or_else(|| "default".into());
+    let mut state = store.lock().expect("store mutex poisoned");
+    let before = state.blocked_senders.len();
+    state
+        .blocked_senders
+        .retain(|blocked| !(blocked.identity == identity && blocked.peer_id == peer_id));
+    let unblocked = state.blocked_senders.len() != before;
+    let data_dir = state.data_dir.clone();
+    if let Err(error) = state.save(&data_dir) {
+        return error_response(
+            request.id.clone(),
+            &request.method,
+            ErrorCode::Internal,
+            error.to_string(),
+            true,
+        );
+    }
+    success(
+        request,
+        serde_json::json!({"peer_id": peer_id, "unblocked": unblocked}),
     )
 }
 
@@ -6102,6 +6678,10 @@ fn peer_add(
         peer.instant_call = instant_call;
     }
     ensure_account_alias(&mut peer);
+    // Adding someone deliberately overrides an earlier block of their requests.
+    state
+        .blocked_senders
+        .retain(|blocked| !(blocked.identity == peer.identity && blocked.peer_id == peer.id));
     state
         .peers
         .retain(|candidate| !(candidate.identity == peer.identity && candidate.id == peer.id));
@@ -8936,6 +9516,312 @@ mod tests {
                 ..
             }
         ));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A signed `message.receive` for the contact-request tests.
+    fn signed_text(
+        key: &idfon_core::IdentityKey,
+        message_id: &str,
+        text: &str,
+        idempotency_key: &str,
+        conversation: Option<&str>,
+    ) -> Request {
+        let message = idfon_core::sign_message(
+            key,
+            endpoint_of(key).to_string(),
+            message_id,
+            idfon_protocol::MessageContent::Text { text: text.into() },
+            idempotency_key,
+            conversation.map(str::to_owned),
+        )
+        .unwrap();
+        let mut params = serde_json::to_value(&message).unwrap();
+        params["identity"] = "default".into();
+        Request {
+            version: PROTOCOL_VERSION,
+            id: message_id.into(),
+            method: "message.receive".into(),
+            params,
+        }
+    }
+
+    /// The test sender's endpoint id (derived from its key, as on a device
+    /// without a separate endpoint key).
+    fn endpoint_of(key: &idfon_core::IdentityKey) -> iroh::EndpointId {
+        iroh::SecretKey::from_bytes(&key.to_bytes()).public()
+    }
+
+    fn rpc_call(store: &Arc<Mutex<Store>>, method: &str, params: serde_json::Value) -> Response {
+        dispatch(
+            Request {
+                version: PROTOCOL_VERSION,
+                id: method.into(),
+                method: method.into(),
+                params,
+            },
+            store,
+        )
+    }
+
+    fn result_of(response: &Response) -> serde_json::Value {
+        match &response.body {
+            ResponseBody::Success { result, .. } => result.clone(),
+            ResponseBody::Failure { error, .. } => panic!("unexpected failure: {error:?}"),
+        }
+    }
+
+    fn events_of(store: &Arc<Mutex<Store>>, event_type: &str) -> Vec<serde_json::Value> {
+        store
+            .lock()
+            .unwrap()
+            .events
+            .iter()
+            .filter(|event| event.r#type == event_type)
+            .map(|event| event.data.clone())
+            .collect()
+    }
+
+    #[test]
+    fn unknown_sender_text_becomes_a_contact_request() {
+        let dir = temp_dir("request-held");
+        let store = Arc::new(Mutex::new(Store::load(&dir).unwrap()));
+        let sender = idfon_core::IdentityKey::generate();
+        let address = serde_json::to_string(&EndpointAddr::new(endpoint_of(&sender))).unwrap();
+        let mut first = signed_text(&sender, "msg-1", "hi, it's me", "k1", None);
+        first.params[REMOTE_ADDR_PARAM] = address.clone().into();
+        let response = dispatch(first, &store);
+        assert!(response.ok, "held, not refused: the sender's outbox marks it delivered");
+        assert_eq!(result_of(&response)["status"], "held");
+        // An address for some other endpoint is ignored (room gossip passes
+        // raw JSON, so the param can't be trusted on its own).
+        let mut second = signed_text(&sender, "msg-2", "are you there?", "k2", None);
+        let other = idfon_core::IdentityKey::generate();
+        second.params[REMOTE_ADDR_PARAM] =
+            serde_json::to_string(&EndpointAddr::new(endpoint_of(&other))).unwrap().into();
+        assert!(dispatch(second, &store).ok);
+        // A resend of the same key is a duplicate, not a third message.
+        assert_eq!(
+            result_of(&dispatch(signed_text(&sender, "msg-1b", "hi, it's me", "k1", None), &store))["status"],
+            "duplicate"
+        );
+
+        let requests = result_of(&rpc_call(&store, "request.list", serde_json::json!({})))["requests"].clone();
+        assert_eq!(requests.as_array().unwrap().len(), 1, "one request per sender");
+        let held = &requests[0];
+        assert_eq!(held["peer_id"], sender.peer_id());
+        assert_eq!(held["endpoint_id"], endpoint_of(&sender).to_string());
+        assert_eq!(held["endpoint_addr"], address);
+        assert_eq!(held["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(held["messages"][1]["text"], "are you there?");
+        assert_eq!(held["messages"][1]["idempotency_key"], "k2");
+
+        let events = events_of(&store, "contact.request");
+        assert_eq!(events.len(), 2, "one event per held message");
+        assert_eq!(events[0]["request_id"], held["request_id"]);
+        assert_eq!(events[0]["text"], "hi, it's me");
+        assert_eq!(events[0]["idempotency_key"], "k1");
+        assert!(events_of(&store, "message.received").is_empty());
+        assert!(store.lock().unwrap().peers.is_empty(), "nothing is auto-accepted");
+
+        // Persisted with the rest of the state.
+        drop(store);
+        let reloaded = Store::load(&dir).unwrap();
+        assert_eq!(reloaded.contact_requests.len(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn accepting_a_request_delivers_it_and_later_messages_pass() {
+        let dir = temp_dir("request-accept");
+        let store = Arc::new(Mutex::new(Store::load(&dir).unwrap()));
+        let sender = idfon_core::IdentityKey::generate();
+        assert!(dispatch(signed_text(&sender, "msg-1", "hello", "k1", None), &store).ok);
+        let request_id = events_of(&store, "contact.request")[0]["request_id"].clone();
+
+        let response = rpc_call(
+            &store,
+            "request.accept",
+            serde_json::json!({"request_id": request_id, "name": "Sam"}),
+        );
+        let peer = result_of(&response)["peer"].clone();
+        assert_eq!(peer["id"], sender.peer_id());
+        assert_eq!(peer["name"], "Sam");
+        assert_eq!(peer["endpoint_id"], endpoint_of(&sender).to_string());
+        // No address from a connection: dialed by id (discovery).
+        let address: EndpointAddr =
+            serde_json::from_str(peer["endpoint_addr"].as_str().unwrap()).unwrap();
+        assert_eq!(address.id, endpoint_of(&sender));
+
+        let received = events_of(&store, "message.received");
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0]["text"], "hello");
+        assert_eq!(received[0]["idempotency_key"], "k1");
+        assert_eq!(received[0]["peer_id"], sender.peer_id());
+        assert!(result_of(&rpc_call(&store, "request.list", serde_json::json!({})))["requests"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        for capability in [
+            idfon_protocol::Capability::MessageSend,
+            idfon_protocol::Capability::MessageReceive,
+        ] {
+            assert!(has_grant(&store.lock().unwrap(), "default", &sender.peer_id(), &capability));
+        }
+
+        // Later messages pass directly, and a resend of the held one is a duplicate.
+        let later = dispatch(signed_text(&sender, "msg-2", "thanks", "k2", None), &store);
+        assert_eq!(result_of(&later)["status"], "delivered");
+        assert_eq!(events_of(&store, "message.received").len(), 2);
+        assert_eq!(
+            result_of(&dispatch(signed_text(&sender, "msg-1", "hello", "k1", None), &store))["status"],
+            "duplicate"
+        );
+        assert!(events_of(&store, "contact.request").len() == 1);
+
+        // Unnamed accepts get a short id.
+        let other = idfon_core::IdentityKey::generate();
+        assert!(dispatch(signed_text(&other, "msg-3", "hey", "k3", None), &store).ok);
+        let request_id = events_of(&store, "contact.request")[1]["request_id"].clone();
+        let peer = result_of(&rpc_call(&store, "request.accept", serde_json::json!({"request_id": request_id})))["peer"].clone();
+        assert!(other.peer_id().starts_with(peer["name"].as_str().unwrap()));
+        assert!(peer["name"].as_str().unwrap().len() < other.peer_id().len());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn accepting_with_a_conversation_admits_only_that_conversation() {
+        let dir = temp_dir("request-scoped");
+        let store = Arc::new(Mutex::new(Store::load(&dir).unwrap()));
+        let joiner = idfon_core::IdentityKey::generate();
+        assert!(dispatch(signed_text(&joiner, "msg-1", "joining", "k1", Some("room-1")), &store).ok);
+        assert!(dispatch(signed_text(&joiner, "msg-2", "and a DM", "k2", None), &store).ok);
+        let request_id = events_of(&store, "contact.request")[0]["request_id"].clone();
+        assert_eq!(events_of(&store, "contact.request")[0]["conversation"], "room-1");
+
+        assert!(rpc_call(
+            &store,
+            "request.accept",
+            serde_json::json!({"request_id": request_id, "conversation": "room-1"}),
+        )
+        .ok);
+        let received = events_of(&store, "message.received");
+        assert_eq!(received.len(), 1, "only the room message is delivered");
+        assert_eq!(received[0]["conversation"], "room-1");
+        {
+            let state = store.lock().unwrap();
+            let receive = idfon_protocol::Capability::MessageReceive;
+            assert!(has_grant_for_conversation(&state, "default", &joiner.peer_id(), &receive, Some("room-1")));
+            assert!(!has_grant_for_conversation(&state, "default", &joiner.peer_id(), &receive, None));
+            assert!(!has_grant_for_conversation(&state, "default", &joiner.peer_id(), &receive, Some("room-2")));
+        }
+        assert!(dispatch(signed_text(&joiner, "msg-3", "in the room", "k3", Some("room-1")), &store).ok);
+        let outside = dispatch(signed_text(&joiner, "msg-4", "elsewhere", "k4", None), &store);
+        assert!(matches!(
+            outside.body,
+            ResponseBody::Failure { error: ApiError { code: ErrorCode::CapabilityDenied, .. }, .. }
+        ));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn declining_with_block_refuses_later_messages() {
+        let dir = temp_dir("request-block");
+        let store = Arc::new(Mutex::new(Store::load(&dir).unwrap()));
+        let sender = idfon_core::IdentityKey::generate();
+        assert!(dispatch(signed_text(&sender, "msg-1", "buy now", "k1", None), &store).ok);
+        let request_id = events_of(&store, "contact.request")[0]["request_id"].clone();
+        let declined = rpc_call(
+            &store,
+            "request.decline",
+            serde_json::json!({"request_id": request_id, "block": true}),
+        );
+        assert_eq!(result_of(&declined)["blocked"], true);
+
+        let refused = dispatch(signed_text(&sender, "msg-2", "buy now!!", "k2", None), &store);
+        assert!(matches!(
+            refused.body,
+            ResponseBody::Failure { error: ApiError { code: ErrorCode::Unauthorized, .. }, .. }
+        ));
+        assert!(store.lock().unwrap().contact_requests.is_empty());
+        assert_eq!(events_of(&store, "contact.request").len(), 1, "no request for a blocked sender");
+        // Blocks persist.
+        assert_eq!(Store::load(&dir).unwrap().blocked_senders.len(), 1);
+
+        let unblocked = rpc_call(&store, "request.unblock", serde_json::json!({"peer_id": sender.peer_id()}));
+        assert_eq!(result_of(&unblocked)["unblocked"], true);
+        assert!(dispatch(signed_text(&sender, "msg-3", "sorry", "k3", None), &store).ok);
+        assert_eq!(store.lock().unwrap().contact_requests.len(), 1);
+
+        // A plain decline drops the request without blocking.
+        let request_id = store.lock().unwrap().contact_requests[0].request_id.clone();
+        assert!(rpc_call(&store, "request.decline", serde_json::json!({"request_id": request_id})).ok);
+        assert!(store.lock().unwrap().blocked_senders.is_empty());
+        assert!(dispatch(signed_text(&sender, "msg-4", "again", "k4", None), &store).ok);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn files_and_envelopes_from_unknown_senders_are_refused() {
+        let dir = temp_dir("request-file");
+        let store = Arc::new(Mutex::new(Store::load(&dir).unwrap()));
+        let sender = idfon_core::IdentityKey::generate();
+        for (index, text) in [
+            "IDFON-FILE/1\nname=photo.png\nticket=t",
+            "IDFON-TYPING/1\nstate=on",
+            "IDFON-UI-ACTION/1\ncard=c\naction=a",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let response = dispatch(
+                signed_text(&sender, &format!("msg-{index}"), text, &format!("k{index}"), None),
+                &store,
+            );
+            assert!(matches!(
+                response.body,
+                ResponseBody::Failure { error: ApiError { code: ErrorCode::Unauthorized, .. }, .. }
+            ), "{text}");
+        }
+        assert!(store.lock().unwrap().contact_requests.is_empty());
+        assert!(!is_envelope("IDFON is great"));
+        assert!(!is_envelope("IDFON-FILE/one"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn contact_request_bounds_hold() {
+        let dir = temp_dir("request-caps");
+        let store = Arc::new(Mutex::new(Store::load(&dir).unwrap()));
+        let sender = idfon_core::IdentityKey::generate();
+        let too_long = "x".repeat(MAX_REQUEST_TEXT_BYTES + 1);
+        assert!(!dispatch(signed_text(&sender, "msg-long", &too_long, "k-long", None), &store).ok);
+        let at_limit = "x".repeat(MAX_REQUEST_TEXT_BYTES);
+        assert!(dispatch(signed_text(&sender, "msg-limit", &at_limit, "k-limit", None), &store).ok);
+        for index in 1..MAX_REQUEST_MESSAGES {
+            assert!(dispatch(
+                signed_text(&sender, &format!("msg-{index}"), "more", &format!("k{index}"), None),
+                &store
+            )
+            .ok);
+        }
+        let over = dispatch(signed_text(&sender, "msg-over", "one more", "k-over", None), &store);
+        assert!(!over.ok, "at most {MAX_REQUEST_MESSAGES} messages per sender");
+        assert_eq!(store.lock().unwrap().contact_requests[0].messages.len(), MAX_REQUEST_MESSAGES);
+
+        // More senders than the cap: the oldest request is dropped.
+        let first_id = store.lock().unwrap().contact_requests[0].request_id.clone();
+        for index in 0..MAX_REQUEST_SENDERS {
+            let other = idfon_core::IdentityKey::generate();
+            assert!(dispatch(signed_text(&other, &format!("m-{index}"), "hi", "k", None), &store).ok);
+        }
+        let state = store.lock().unwrap();
+        assert_eq!(state.contact_requests.len(), MAX_REQUEST_SENDERS);
+        assert!(!state.contact_requests.iter().any(|held| held.request_id == first_id));
+        drop(state);
+        // Newest first.
+        let requests = result_of(&rpc_call(&store, "request.list", serde_json::json!({})))["requests"].clone();
+        assert_eq!(requests[0]["messages"][0]["message_id"], format!("m-{}", MAX_REQUEST_SENDERS - 1));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

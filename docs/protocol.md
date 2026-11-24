@@ -182,7 +182,7 @@ keeps standard `URL` fields. `peer.add` also accepts a `contact_ticket`
 | method | params | result |
 |---|---|---|
 | `message.send` | `{ to, text, idempotency_key, capability_ticket?, retries?, durable? }` (`capability_ticket` is the holder's rcan token string) | `{ authenticated, message_id, operation_id, status: "queued" }` — returns immediately; delivery proceeds in the daemon (retries per `retries`), confirm via `operation.wait`. Sender needs a `message.send` grant for the peer (own daemon); the receiver needs `message.receive` for the sender. A successful send auto-establishes the local receive side of the reply path. `durable: true` makes it an outbox item: if every attempt fails it goes back to `queued` ("not sent yet") instead of `failed`, and is retried later (see `operation.resume`). Chat messages set it; time-bound sends (call signaling) must not. |
-| `message.receive` | — | receive-side helper used by the transport; not called by shells. |
+| `message.receive` | — | receive-side helper used by the transport; not called by shells. A sender who isn't a peer is held as a contact request (see "Contact requests"). |
 
 The `event.wait`/`event.list` methods below are how received messages surface: a
 `message.received` event with `data: { message_id, peer_id, conversation,
@@ -200,8 +200,9 @@ one or more trailing `IDFON-*/1` envelopes; see `docs/idfon-artifacts.md`.
 ### Events
 
 Events are persisted per identity, FIFO, with monotonically increasing
-`cur_<20 digits>` cursors, retained up to `EVENT_RETENTION`. The only event
-type currently emitted is `message.received`.
+`cur_<20 digits>` cursors, retained up to `EVENT_RETENTION`. Messages surface
+as `message.received`; a message held from a sender who isn't a peer surfaces
+as `contact.request` (see "Contact requests").
 
 | method | params | result |
 |---|---|---|
@@ -257,6 +258,40 @@ picture of your screen travels as an `IDFON-FILE/1` marked `screen=1`, and
 `screen.read`. The apps ask first, and grant it briefly for "Allow once" (with
 `expires_at`) or standing for "During calls". `screen.point` records that a peer's
 pointer may open by itself during a call with them. The apps check that one.
+
+### Contact requests
+
+A verified message from a sender who isn't a peer of the receiving identity is
+**held as a contact request** instead of refused, the way "unknown senders"
+work in phone messaging. This makes one-way adds work: someone who scanned your
+code or got your card adds you and writes; you see a request. It is also how a
+group join link reaches the group's owner.
+
+- The sender gets an ordinary success acknowledgment (`status: "held"` in the
+  `message.receive` result), so their outbox marks the message delivered.
+- Only **plain text** is held. A message that is an `IDFON-*/N` envelope (a
+  file, call, receipt, card, typing…) is refused as before (`unauthorized`,
+  "sender is not a persisted peer").
+- One request per sender per receiving identity, persisted with the rest of
+  the state. Later messages append to it.
+- Bounds: at most 20 messages per sender and 8 KiB of text per message (past
+  either, `capability_denied`); at most 64 pending senders per identity (a new
+  one drops the oldest request).
+- A sender blocked with `request.decline { block: true }` is refused with the
+  same `unauthorized` error an unknown sender used to get, and makes no
+  request. The block lasts until `request.unblock` or until they are added as
+  a peer (`peer.add`, `request.accept`).
+- Nothing is accepted automatically.
+
+Each held message emits a `contact.request` event with `data: { request_id,
+peer_id, endpoint_id, conversation, text, idempotency_key }`.
+
+| method | params | result |
+|---|---|---|
+| `request.list` | — | `{ requests: [ContactRequest] }`, newest first. ContactRequest = `{ request_id, identity, peer_id, endpoint_id, endpoint_addr, received_at, messages: [{ message_id, text, conversation, idempotency_key, received_at }] }`; `endpoint_addr` is the sender's dial address (JSON text) as seen on the connection, or `null` |
+| `request.accept` | `{ request_id, name?, conversation? }` | `{ peer }` — adds the sender as a peer (named `name`, else a short prefix of their id; dialed at `endpoint_addr`, else by id through discovery), grants `message.send` and `message.receive` for them (scoped to `conversation` when given, like a group member's grants), then emits each held message the grant covers as an ordinary `message.received` event and removes the request. With `conversation`, held messages outside it are dropped |
+| `request.decline` | `{ request_id, block? }` | `{ request_id, peer_id, blocked }` — drops the request; `block: true` also refuses the sender's future messages |
+| `request.unblock` | `{ peer_id }` | `{ peer_id, unblocked }` |
 
 ### Invocation results
 

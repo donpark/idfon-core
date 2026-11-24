@@ -479,6 +479,38 @@ pub struct Peer {
     pub visibility: Option<Visibility>,
 }
 
+/// Messages from a sender who isn't a peer, held until the person accepts
+/// or declines (docs/protocol.md "Contact requests"). One per sender per
+/// receiving identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContactRequest {
+    pub request_id: String,
+    /// The receiving identity.
+    #[serde(default)]
+    pub identity: String,
+    /// The sender's signing identity (the verified signer).
+    pub peer_id: String,
+    pub endpoint_id: String,
+    /// The sender's dial address (JSON text) as seen on the connection;
+    /// `None` when the message came another way.
+    #[serde(default)]
+    pub endpoint_addr: Option<String>,
+    pub received_at: String,
+    #[serde(default)]
+    pub messages: Vec<HeldMessage>,
+}
+
+/// One text message held in a [`ContactRequest`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeldMessage {
+    pub message_id: MessageId,
+    pub text: String,
+    #[serde(default)]
+    pub conversation: Option<String>,
+    pub idempotency_key: String,
+    pub received_at: String,
+}
+
 /// What a contact can see of you (docs/identity.md). `None` = no choice
 /// here: the next level decides (contact override → tag rules → defaults
 /// → shown).
