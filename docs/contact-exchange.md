@@ -42,7 +42,7 @@ app "Share Contact Card"                                      ▼
 | My Card (QR + Share + Save to Contacts) | iOS Contacts tab → Add menu → "My Card"; mac sidebar → "My Card…" (exports the active identity's card) |
 | Share an identity's card (any line) | iOS Identities list → tap a row (swipe "Ticket" copies the raw ticket token); mac sidebar → identity submenu → "Share Contact Card…" |
 | QR scan | iOS Add menu → "Scan QR Code" (mac has no scanner; show the code and let the phone scan); the scanner decodes the whole envelope, so `capability`/`auth` ride along like a tapped link |
-| `.vcf` document open ("Open in IDfon") | `CFBundleDocumentTypes` (`public.vcard`) in both Info.plists |
+| `.vcf` document open ("Open in idfon") | `CFBundleDocumentTypes` (`public.vcard`) in both Info.plists |
 | Save to system Contacts (name + idfon URL) | `CNContactStore` (`NSContactsUsageDescription` in both Info.plists) |
 | Share a peer's card | iOS contact detail → "…" menu; mac contact context menu |
 
