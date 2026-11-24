@@ -34,7 +34,7 @@ kept because it records decisions; **design** = not all implemented.
 | `config.md` | where idfon keeps things (home, daemon data, socket, `config.toml`), profiles, every setting and its env var, the `/tmp` data migration, `idfon config path`/`show` (as-built) | finding a file, adding a setting, running a second daemon, or debugging "wrong identity" |
 | `chatrooms.md` | rooms, direct fan-out, gossip |
 | `identity.md` | one you: identities collapsed into tags on contacts, what each tag lets contacts see (presence, photo), the migration |
-| `chat-envelopes.md` | typing, read receipts, reactions, edits, group invites: the app-to-app envelopes and how they name a message |
+| `chat-envelopes.md` | typing, read receipts, reactions, edits, presence, profile photos, doorbell keys, knocks, cards, group invites: the app-to-app envelopes and how they name a message |
 | `mcp-transport.md` | idfon as an MCP transport binding (implemented) |
 | `idfon-h1.md` | HTTP/1.1 over iroh: serve an existing `axum::Router` with WebSockets, SSE and chunked bodies, `RemoteId` peer identity, client + upgrade handle (slices 1–2 of #142 tested; voxl demo pending) |
 | `idfon-channel.md` | message channels over iroh with no HTTP: WebSocket-shaped send/recv on one ordered bi-stream per channel, channel-name sharding and its isolation test, the measured WS-vs-channel overhead A/B (library; no consumer wired yet) |
