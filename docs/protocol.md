@@ -251,6 +251,13 @@ are `message.send`, `message.receive`, `voice.message.send`,
 `recording.fetch`, `recording.retain`, and `mcp.transport`, but any dotted name
 is accepted, so a provider can define its own without a protocol change.
 
+The daemon enforces one of them on what leaves the device: **`screen.read`**. A
+picture of your screen travels as an `IDFON-FILE/1` marked `screen=1`, and
+`message.send` refuses it (`capability_denied`) unless the recipient holds
+`screen.read`. The apps ask first, and grant it briefly for "Allow once" (with
+`expires_at`) or standing for "During calls". `screen.point` records that a peer's
+pointer may open by itself during a call with them. The apps check that one.
+
 ### Invocation results
 
 One shared vocabulary for the result of an invoked capability:
