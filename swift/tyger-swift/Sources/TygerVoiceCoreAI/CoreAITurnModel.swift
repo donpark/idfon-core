@@ -1,3 +1,5 @@
+// The iOS Simulator SDK has no CoreAI; CoreAIUnavailable.swift stands in there.
+#if canImport(CoreAI)
 import CoreAI
 import Dispatch
 import Foundation
@@ -438,3 +440,4 @@ private extension Array {
         }
     }
 }
+#endif

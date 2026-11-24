@@ -31,8 +31,10 @@ let package = Package(
         .target(
             name: "TygerVoiceCoreAI",
             dependencies: ["TygerVoice"],
-            path: "Sources/TygerVoiceCoreAI",
-            linkerSettings: [.linkedFramework("CoreAI")]
+            // No explicit `linkedFramework("CoreAI")`: `import CoreAI` autolinks
+            // it where it exists, and the iOS Simulator SDK has none (the
+            // source is `#if canImport(CoreAI)`-guarded).
+            path: "Sources/TygerVoiceCoreAI"
         ),
         .testTarget(
             name: "TygerVoiceTests",

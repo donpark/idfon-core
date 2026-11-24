@@ -1,3 +1,5 @@
+// The iOS Simulator SDK has no CoreAI; CoreAIUnavailable.swift stands in there.
+#if canImport(CoreAI)
 import CoreAI
 
 /// Fill an NDArray's backing buffer from a flat sequence (row-major).
@@ -51,3 +53,4 @@ func readNDArray(_ array: NDArray, as type: Float.Type, count: Int) -> [Float] {
     }
     return out
 }
+#endif
