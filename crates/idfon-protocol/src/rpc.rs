@@ -265,6 +265,26 @@ methods! {
     // Contact cards
     "contact.ticket" => ContactTicket {}
 
+    // Contact requests: held messages from senders who aren't peers
+    // (docs/protocol.md "Contact requests").
+    "request.list" => RequestList {}
+    "request.accept" => RequestAccept {
+        pub request_id: String,
+        /// The new contact's name; a short id when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub name: Option<String>,
+        /// Admit the sender to this conversation (a room) only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub conversation: Option<String>,
+    }
+    "request.decline" => RequestDecline {
+        pub request_id: String,
+        /// Also refuse the sender's future messages.
+        #[serde(default, skip_serializing_if = "is_false")]
+        pub block: bool,
+    }
+    "request.unblock" => RequestUnblock { pub peer_id: String }
+
     // Messaging
     "message.send" => MessageSend {
         #[serde(rename = "to", alias = "peer")]

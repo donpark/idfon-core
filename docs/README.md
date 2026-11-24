@@ -13,7 +13,7 @@ kept because it records decisions; **design** = not all implemented.
 | `../AGENTS.md` | repository working rules and the iOS shipping checklist (gated IPA, credentials, build numbers, upload verification, TestFlight push smoke test) | shipping an iOS update or checking agent workflow rules |
 | `communication-model.md` | identities, peers, messages, grants | anything about the core model |
 | `daemon.md` | why there is a daemon at all; the daemon as packaging of the feature functions | questioning the process model |
-| `protocol.md` | daemon JSON IPC methods/params | adding/changing an RPC or a client |
+| `protocol.md` | daemon JSON IPC methods/params, contact requests (unknown senders) | adding/changing an RPC or a client |
 | `build.md` | which subprojects to rebuild after a change; the Rust/FFI target dirs; `pnpm build`/`pnpm voice build` orchestration; build-time options (`IDFON_TTS_PHONON`) | touching a shared crate or the c-ffi crate, unsure what needs rebuilding, building/cleaning everything, or toggling a build-time option |
 
 ## Platforms and apps

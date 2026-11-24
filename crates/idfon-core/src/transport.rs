@@ -381,6 +381,34 @@ impl IrohTransport {
             .await
     }
 
+    /// Like [`Self::serve`], but also gives the handler the sender's dial
+    /// address as this endpoint knows it after the handshake: the
+    /// authenticated remote id plus the paths iroh has for it. A receiver
+    /// can use it to answer a sender it has no record of (contact requests,
+    /// docs/protocol.md).
+    pub async fn serve_with_remote_addr<F, Fut>(&self, handler: F) -> Result<(), TransportError>
+    where
+        F: Fn(MessageEnvelope, EndpointAddr) -> Fut + Clone + Send + Sync + 'static,
+        Fut: Future<Output = Result<MessageAck, TransportError>> + Send + 'static,
+    {
+        let endpoint = self.endpoint.clone();
+        self.serve_with_peer(move |message, remote_id| {
+            let endpoint = endpoint.clone();
+            let handler = handler.clone();
+            async move {
+                let address = match endpoint.remote_info(remote_id).await {
+                    Some(info) => EndpointAddr::from_parts(
+                        remote_id,
+                        info.into_addrs().map(|address| address.into_addr()),
+                    ),
+                    None => EndpointAddr::new(remote_id),
+                };
+                handler(message, address).await
+            }
+        })
+        .await
+    }
+
     /// Like [`Self::serve`], but also gives the handler Iroh's authenticated
     /// remote endpoint ID. Protocols that carry a signed endpoint ID should
     /// compare it with this value before accepting the message.
@@ -645,6 +673,30 @@ impl TransportManager {
                 .await
                 .ok_or_else(|| TransportError::Failed("identity transport not found".into()))?;
             match current.serve(handler.clone()).await {
+                // A rebind closed the old endpoint: serve the new one.
+                Err(TransportError::Closed) => continue,
+                result => return result,
+            }
+        }
+    }
+
+    /// [`Self::serve`] with the sender's dial address
+    /// ([`IrohTransport::serve_with_remote_addr`]).
+    pub async fn serve_with_remote_addr<F, Fut>(
+        &self,
+        identity: &str,
+        handler: F,
+    ) -> Result<(), TransportError>
+    where
+        F: Fn(MessageEnvelope, EndpointAddr) -> Fut + Clone + Send + Sync + 'static,
+        Fut: Future<Output = Result<MessageAck, TransportError>> + Send + 'static,
+    {
+        loop {
+            let current = self
+                .current(identity)
+                .await
+                .ok_or_else(|| TransportError::Failed("identity transport not found".into()))?;
+            match current.serve_with_remote_addr(handler.clone()).await {
                 // A rebind closed the old endpoint: serve the new one.
                 Err(TransportError::Closed) => continue,
                 result => return result,

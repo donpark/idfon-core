@@ -37,6 +37,13 @@ aspect. The apps send presence and the photo only to that list, leaving out
 blocked contacts. They are app-to-app envelopes, so the sending app is where
 the rule is enforced.
 
+## Adding someone one way
+
+Adding a contact from their card or code works without them adding you back.
+Your first message reaches them as a **contact request** (held, not shown as a
+chat), and they accept or decline it. Accepting adds you as their contact and
+delivers what you wrote. See protocol.md, "Contact requests".
+
 ## Identity methods
 
 - `identity.list` lists the one identity. `identity.rename { name }` changes
