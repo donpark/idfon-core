@@ -3048,6 +3048,14 @@ fn request_tags(params: &serde_json::Value, key: &str) -> Vec<String> {
     tags
 }
 
+/// The grant that lets a peer receive pictures of your screen.
+const SCREEN_READ: &str = "screen.read";
+
+/// A screen capture on the wire: a file envelope marked `screen=1`.
+fn is_screen_capture(text: &str) -> bool {
+    text.starts_with("IDFON-FILE/1\n") && text.lines().any(|line| line.trim() == "screen=1")
+}
+
 /// Add `tag` once (case-insensitive).
 fn add_tag(tags: &mut Vec<String>, tag: &str) {
     let tag = tag.trim();
@@ -3919,6 +3927,21 @@ fn send_message(
             &request.method,
             ErrorCode::CapabilityDenied,
             "message.send capability denied".into(),
+            false,
+        );
+    }
+    // A picture of your screen (an `IDFON-FILE/1` marked `screen=1`) leaves
+    // only for a peer you let see it: the `screen.read` grant (the app makes
+    // a short one for "Allow once"). The app asks; the daemon holds the line
+    // even if the app gets it wrong (idfon-home docs/ios-ui-audit.md §5.4).
+    if is_screen_capture(&text)
+        && !has_grant(&state, &identity.id, &peer.id, &idfon_protocol::Capability::new(SCREEN_READ))
+    {
+        return error_response(
+            request.id.clone(),
+            &request.method,
+            ErrorCode::CapabilityDenied,
+            "screen.read capability denied".into(),
             false,
         );
     }
@@ -10687,6 +10710,49 @@ mod tests {
             durable: true,
         });
         assert_eq!(resume_queued(&store, &transport, None, true, 1), 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// §5.4: a screen capture leaves only for a peer holding `screen.read`
+    /// (ungranted capability envelopes are refused by the daemon itself).
+    #[test]
+    fn screen_captures_need_the_screen_read_grant() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let dir = temp_dir("screen-grant");
+        let store = Arc::new(Mutex::new(Store::load(&dir).unwrap()));
+        {
+            let mut state = store.lock().unwrap();
+            let mut bob = test_peer("bob", "default", "Bob");
+            bob.endpoint_id = Some("bob-endpoint".into());
+            state.peers.push(bob);
+            state.grants.push(idfon_protocol::CapabilityGrant {
+                capability: idfon_protocol::Capability::MessageSend,
+                identity: "default".into(),
+                subject: "bob".into(),
+                conversation: None,
+                active_at: "0".into(),
+                expires_at: None,
+                revision: 1,
+                revoked_at: None,
+            });
+        }
+        let transport = Arc::new(TransportMode::Fake(FakeTransport::default()));
+        let rpc = |method: &str, params: serde_json::Value| -> Response {
+            dispatch_with_transport(
+                Request { version: PROTOCOL_VERSION, id: method.into(), method: method.into(), params },
+                &store,
+                Some(&transport),
+            )
+        };
+        let capture = "IDFON-FILE/1\nname=screenshot.png\nticket=t\nscreen=1";
+        let send = |text: &str, key: &str| rpc("message.send", serde_json::json!({"to": "bob", "text": text, "idempotency_key": key, "retries": 0}));
+        let denied = send(capture, "k1");
+        assert!(!denied.ok, "no screen.read grant: refused");
+        assert!(format!("{denied:?}").contains("screen.read"));
+        assert!(send("IDFON-FILE/1\nname=photo.png\nticket=t", "k2").ok, "an ordinary file needs no screen grant");
+        assert!(rpc("access.grant", serde_json::json!({"identity": "default", "subject": "bob", "capability": "screen.read"})).ok);
+        assert!(send(capture, "k3").ok, "granted: it goes");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
