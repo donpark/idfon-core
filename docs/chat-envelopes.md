@@ -1,7 +1,7 @@
 # Chat envelopes
 
 The small messages the apps exchange around a conversation: typing, read
-receipts, reactions, edits, and group invites. Each one is a whole message by
+receipts, reactions, edits, presence, profile photos, and group invites. Each one is a whole message by
 itself (never mixed with text), sent with `message.send`, or `room.send` in a
 group. They are `IDFON-*/1` text envelopes like the others (`reply-blocks.md`):
 a first line naming the envelope, then `key=value` lines. A client that does not
@@ -69,6 +69,33 @@ Replaces the text of the sender's own earlier message (base64 so the new text
 can never look like an envelope). The receiver applies it only when the
 referenced message's author is the envelope's sender, and marks the message
 "Edited". Durable (outbox).
+
+### Presence — `IDFON-PRESENCE/1`
+
+```
+IDFON-PRESENCE/1
+state=online
+```
+
+"Online" (never "last seen"). An app sends `online` when it comes to the
+front and every couple of minutes while it stays there, and `offline` when it
+leaves. It sends only to the contacts allowed to see it
+(`visibility.audience { aspect: "presence" }`, see `identity.md`), with one
+attempt and never queued. The receiver shows someone as online for a few
+minutes after their last `online`, or after any message from them. A
+contact who just came online may get an `online` back, so both see each other.
+
+### Profile photo — `IDFON-PROFILE/1`
+
+```
+IDFON-PROFILE/1
+photo=<base64 of a small square JPEG>
+```
+
+Your photo, sent to the contacts allowed to see it
+(`visibility.audience { aspect: "photo" }`) when it changes, when they become
+allowed, and once to new contacts. An empty `photo=` removes it: it's sent to
+anyone who had it and no longer may. Durable (outbox).
 
 ### Group invite — `IDFON-GROUP/1`
 
