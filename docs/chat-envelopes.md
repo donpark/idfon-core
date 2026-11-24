@@ -164,7 +164,9 @@ conversation as a row with a title and up to a few actions.
   "glyph": "fork.knife",
   "actions": [{"id": "pizza", "title": "Pizza"}, {"id": "no", "title": "Not today", "role": "destructive"}],
   "detailURL": "https://…",
-  "data": {"any": "string pairs"}
+  "data": {"any": "string pairs"},
+  "fields": [{"id": "name", "label": "Name", "placeholder": "Your name", "value": ""}],
+  "slot": "sheet"
 }
 ```
 
@@ -173,6 +175,15 @@ conversation as a row with a title and up to a few actions.
 - `role` is `destructive` or absent.
 - `detailURL` is an http(s) page the card opens full screen.
 - `data` holds kind-specific strings.
+- `fields` makes the card a form. The apps open it in a sheet, and what the
+  person types goes back with the action they pick (`values=` below). `value`
+  is filled in to start with.
+- `slot: "sheet"` is for calls: while the receiver is in a call with the sender
+  and lets them show things during calls, the card opens over the screen by
+  itself (the call companion). Otherwise it waits in the conversation like any
+  card.
+- A card sent again with the same `kind` and `id` replaces the earlier one, so a
+  sender can change a card in place (a companion that moves to its next step).
 - A client draws the kinds it knows with their own renderer. Every other kind
   still shows, as the generic card: title, subtitle, glyph and actions. A client
   that cannot act on cards may show only the title.
@@ -183,10 +194,18 @@ conversation as a row with a title and up to a few actions.
 IDFON-UI-ACTION/1
 card=<card id>
 action=<action id>
+values=<base64 of a JSON object>
 ```
 
 The action a person chose on a card. It is sent back to whoever sent the card,
 and it is never shown as a message. Durable (outbox).
+
+- `values` is present only when the card had fields and something was typed:
+  `{"<field id>": "<text>"}`.
+- `card=compose` is a request with no card before it: the person picked one of
+  the sender's advertised actions from the + menu (the `actions` list in a
+  contact's `idfon.json`, see idfon-sdk `docs/voice-agent.md`). The contact
+  answers with a card.
 
 ### Group invite — `IDFON-GROUP/1`
 
