@@ -1,134 +1,84 @@
-# The moq fork (`donpark/moq`)
+# The media forks (`donpark/moq`, `donpark/iroh-live`)
 
-Status: **current**. The media stack (moq-audio/moq-mux/moq-net/moq-video/hang,
-moq-tokio) comes from our fork of moq. This doc says why, which branch matters,
-and how to update it.
+Status: **current** (2026-11-24, after the iroh-live upgrade, donpark/idfon#221).
+The media stack comes from two forks pinned by rev in the root `Cargo.toml`.
+This doc says why we fork, what each fork carries, and how to move a pin.
 
-## Why we fork
+## Pins
 
-Four divergences from upstream (as of the 2026-10 re-base):
+| Fork | Branch | Pinned rev | Upstream base |
+| --- | --- | --- | --- |
+| `donpark/moq` | `liquid-codec-next` | `14598b93c` | `moq-dev/moq` `main` at `4a6f52248` (the rev iroh-live pins) |
+| `donpark/iroh-live` | `audio-renditions-next` | `fbdcbdda` | `n0-computer/iroh-live` `main` at `60a3fcf` |
 
-1. **Decode-side loss recovery** — `Decoder::recover(next, frames_to_next)`
-   rebuilds one lost packet from the best source in `opus_demo` order: the
-   next packet's in-band forward error copy (LBRR) for the frame right
-   before it, its **deep redundancy (DRED)** at that frame's offset for the
-   rest of the burst, then concealment; `Consumer`'s `Options::conceal`
-   bound (≤ 1 s) fills small undeclared holes with it. A **fully recovered
-   hole is not a gap**: the decoder keeps the prediction the recovery built
-   and the timeline stays continuous; only an unfilled hole resets and stays
-   visible.
-2. **A working encoder FEC knob** — `Settings::fec` sets `OPUS_SET_INBAND_FEC`
-   *and* `OPUS_SET_PACKET_LOSS_PERC=10`. Upstream removed their flag as
-   "ineffective" (`#3841`) because without an expected loss rate libopus writes
-   no LBRR copy at all. Ours is the version that works. Policy (user design):
-   FEC is mono-only — stereo + LBRR couples the channels (see
-   `media-adaptation.md` §B2.4/§D7), so the ladder's stereo step flips it.
-3. **`BitrateControl`** — a shareable handle that ABR uses to retune the running
-   encoder from outside the publish loop (`Options::bitrate_control`).
-4. **libopus 1.6.1 via `opusic-sys`** — moq-audio's codec backends build against
-   the maintained C bindings (vendored 1.6.1, `bundled` cc build, `dred` feature)
-   instead of upstream's `unsafe-libopus` (c2rust transpile of 1.3.1). 1.6.1 adds
-   DRED + deep PLC; deep PLC is free inside the decoder, DRED is wired end to
-   end (`Settings::dred` embeds it, `recover` rebuilds bursts from it — the
-   option-space analysis lives in `media-adaptation.md` §D7.1).
+Crate manifests name the **upstream** git URLs and revs (`moq-dev/moq@4a6f52248`,
+`n0-computer/iroh-live@60a3fcf`); the root `[patch."https://github.com/moq-dev/moq"]`
+and `[patch."https://github.com/n0-computer/iroh-live"]` tables redirect every
+crate of each family to the fork. Upstream `main` is the only line we track; the
+old `release`-line branches (`loss-recovery-release`, `liquid-codec`,
+`audio-renditions` off iroh-live `dd80d44`) are retired.
 
-## Upstream topology (read before updating)
+## What the moq fork carries
 
-`moq-dev/moq` carries **two living, unrelated lines** (no common git ancestor):
+On top of `4a6f52248` (`git log 4a6f52248..14598b93c` in `~/dev/idfon/moq-upstream`):
 
-| Line | Branch | What it is |
-| --- | --- | --- |
-| A | `release` | The lineage our fork shares. **crates.io releases are cut from it**, and iroh-live builds against those releases. This is what we track. |
-| B | `main` | A re-rooted, restructured "next" line (new crate layout, MIGRATE.md guides). iroh-live tried it (`a124b82`) and retreated to released crates (`2c6f745`). Not usable with our stack today. |
+1. **libopus 1.6.1 via `opusic-sys`** instead of upstream's `unsafe-libopus`
+   (c2rust 1.3.1). Adds DRED and deep PLC.
+2. **Opt-in loss recovery.** A decoder backend reports its `Recovery`
+   (look-ahead, longest burst, default on/off) and rebuilds a lost packet from
+   the one after the hole: in-band FEC (LBRR) for the frame right before it,
+   DRED for the rest of the burst, then concealment. A consumer that recovers
+   (`Options::recover` or the codec default) holds the look-ahead as playout
+   delay and keeps a recovered hole on a continuous timeline; only an unfilled
+   hole resets.
+3. **A working in-band FEC knob** on the encoder (sets the expected loss rate
+   too; without it libopus writes no LBRR). Policy: FEC is mono-only, see
+   `media-adaptation.md` §B2.4/§D7.
+4. **LiquidCodec** — `AudioCodec::Liquid` with an application-registered
+   implementation (`moq_audio::external`), 80 ms packets, and voice encodes that
+   withhold silence. See `liquidcodec.md` in idfon-home.
+5. A log line saying whether the VideoToolbox encoder runs on hardware.
 
-Our branches on `donpark/moq`:
+Upstream `main` already gates VideoToolbox on `cfg(apple)` (macOS and iOS), so
+the iOS hardware-encoder patch the old fork needed is gone. Whether iOS now
+encodes on hardware in a real call is not yet confirmed on a device
+(donpark/idfon#208).
 
-| Branch | Base | Used by |
-| --- | --- | --- |
-| `loss-recovery-release` | `origin/release` + our 2 patch commits | idfon `main` |
-| `liquid-codec` | `loss-recovery-release` + LiquidCodec (`AudioCodec::Liquid`, `moq_audio::external`) + iOS VideoToolbox decode | **idfon branch `liquid-codec`** |
-| `loss-recovery-0.1` | `origin/main` + the same 2 patches (ported) | nothing yet — kept for the eventual move to line B |
-| `loss-recovery-0.0.23` | Frando `iroh-live-3` (the original) | nothing — frozen, rollback reference |
+## What the iroh-live fork carries
 
-The `liquid-codec` branch also pairs with an iroh-live fork, `donpark/iroh-live`
-branch `audio-renditions` (off the `dd80d44` pin): moq-media publishes several
-audio renditions so a subscriber can switch codecs mid-call. idfon's
-`Cargo.toml` patches every iroh-live crate to it.
+Publisher-ordered audio renditions and the player's rendition choice (switch
+codecs mid-call), live bitrate retune (what ABR drives, `iroh-c-ffi/src/abr.rs`),
+and mDNS through `iroh-mdns-address-lookup` (`iroh-mdns-peer-lookup` declares no
+license).
 
-## Update procedure
+## Upstreaming
 
-In the moq clone (`~/dev/moq-upstream`):
+None of this is upstream yet: no PR is open on `moq-dev/moq` or for the
+audio renditions on `n0-computer/iroh-live`. Tracked in donpark/idfon#96.
 
-1. `git fetch origin release`
-2. Replay our two patch commits onto the new head
-   (`git rebase origin/release loss-recovery-release`, resolving against any
-   new upstream shape — the consumer/encode APIs drift).
-3. `cargo test -p moq-audio` (includes the recovery tests: the in-band copy must
-   beat concealment against the original).
-4. `git push mine loss-recovery-release`
+## Moving a pin
 
-Then in idfon:
+In the moq clone (`~/dev/idfon/moq-upstream`, remotes `upstream` and `mine`):
 
-5. `cargo update -p moq-audio -p moq-net -p moq-mux -p moq-video -p moq-tokio -p hang`
-   (if `cargo update -p moq-net` says "ambiguous", the lock briefly holds two
-   instances — see the rules below).
-6. `cargo check --workspace --all-targets`, then the test crates.
+1. Pick the moq rev the target iroh-live `main` pins, and rebase
+   `liquid-codec-next` onto it.
+2. `cargo test -p moq-audio` (includes the recovery tests).
+3. `git push mine liquid-codec-next`.
+
+Rebase `audio-renditions-next` onto the target iroh-live rev the same way and
+push it. Then in idfon-core:
+
+4. Update the upstream revs in the crate manifests (grep for `moq-dev/moq` and
+   `n0-computer/iroh-live`) and the fork revs in the root `[patch]` tables.
+5. `cargo check --workspace --all-targets`, then the media tests
+   (`idfon-media`, `iroh-c-ffi`), then rebuild the apps' vendored libs.
 
 ## Rules
 
-- **One git URL/branch for the whole moq family.** Mixing two git sources, or a
-  git source with an unpatched crates.io copy, splits `moq_net`/`moq_mux` types
-  into incompatible instances. All six patched crates (incl. `moq-tokio`) point
-  at the one branch.
-- **`moq-tokio` is patched too**: `iroh-moq` pulls it, and unpatched crates.io
-  `moq-tokio` demands a *newer* `moq-net` than the fork carries — which
-  resurrects the two-instances split.
-- **Version reqs must admit the fork's versions** (release family: moq-net 0.3.x,
-  moq-tokio 0.19.x, moq-mux 0.10.x, moq-audio/moq-video 0.1.x, hang 0.21.x).
-  The idfon manifests pin these (root `[patch.crates-io]` + the direct git deps
-  in `iroh-c-ffi`, `idfon-media`, `idfon-live-media` — grep for `donpark/moq`
-  and `n0-computer/iroh-live` to find them all).
-- **iroh-live pin**: `n0-computer/iroh-live@dd80d44e` (`main`; the #73 squash
-  of `Frando/bump-moq-2`, "build against the released moq crates" — the
-  `9abd29be` branch tip is the same content plus a two-line README delta).
-  It is the bridge between moq and
-  idfon (`moq-media`, `iroh-moq`); move it deliberately, and only to a commit
-  whose moq reqs the fork satisfies.
-- `moq-relay` never enters our dependency graph (iroh-live's workspace lists it;
-  `moq-media`/`iroh-moq` do not use it), so its version skew does not matter.
-
-## iOS has no hardware encoder (VideoToolbox is macOS-gated)
-
-Observed in a real iPhone↔iPhone call (build 0.10.0/35, 2026-11-15 23:17,
-82 s): both phones logged `no hardware encoder available, falling back to
-software encoder="openh264"` and encoded 720×1280 at 30 fps with openh264.
-Software encode could not sustain the frame rate, so the picture stalled while
-the path was idle (RTT 8–15 ms, loss ≈0, goodput steady ~2 Mbps, direct LAN
-paths). The same CPU contention starved mic capture on one phone (25,664
-underrun samples, 1.43 s max gap). A network-side rendition ladder cannot fix
-this: delivery, loss and RTT all looked healthy.
-
-Cause: in this fork `moq-video` gates the VideoToolbox backend macOS-only —
-`#[cfg(target_os = "macos")]` on `mod videotoolbox`, its `HARDWARE` candidate,
-and the CoreVideo surface module in `frame.rs`, plus `objc2-*` deps under a
-`cfg(target_os = "macos")` target table. iOS (`target_os = "ios"`) therefore
-has no Apple candidate in `HARDWARE` and always falls back to openh264.
-
-Patch (verified with `cargo check -p moq-video --target aarch64-apple-ios`,
-with and without default features, using the `stable-aarch64-apple-darwin`
-toolchain — the `1.98.1` toolchain has no iOS target installed):
-
-1. `Cargo.toml`: rename the Apple target table to
-   `[target.'cfg(any(target_os="macos", target_os="ios"))'.dependencies]`, and
-   move `objc2-screen-capture-kit` and `objc2-core-graphics` (CGDirectDisplay)
-   into a new macOS-only table — ScreenCaptureKit does not exist on iOS.
-2. `src/encode/backend/mod.rs`: widen both gates (`mod videotoolbox` and its
-   `HARDWARE` entry) to `cfg(any(target_os = "macos", target_os = "ios"))`.
-3. `src/frame.rs`: widen the `macos` module gate, the `Surface::PixelBuffer`
-   variant, the scaler `Cache` struct/impl/tests, and their call sites (15
-   `cfg(target_os = "macos")` sites) the same way.
-4. `src/color.rs`: widen `Color::with_range` (CoreVideo spells out range).
-
-Not yet verified: linking and running on a device (`VTCompressionSession`) —
-needs a rebuild of `ios/Vendor/device/libiroh_c_ffi.a` and a two-phone call.
-The patch also leaves `objc2-av-foundation` unused on iOS, which is expected.
+- **One source per family.** Every moq crate in the graph must resolve to the
+  same fork rev, and every iroh-live crate likewise; a crate left on upstream or
+  crates.io splits `moq_net`/`moq_mux` types into incompatible instances. When a
+  new crate appears in either family, add it to the `[patch]` table.
+- **Move moq and iroh-live together.** The moq rev must be the one the iroh-live
+  rev builds against.
+- Keep the git pins (reproducible builds); do not track branch heads.

@@ -214,18 +214,20 @@ A 1:1 chat is a room of two with `conversation = None`: same envelope, same
 grants, same `message.send`. Nothing in R0–R3 should add a code path that only
 rooms take, or only 1:1 takes.
 
-**Room voice calls — a supported capability, currently disabled.** A live
-call is a session inside the room (`docs/ios-ui-design.md` §3/§7.1): one
-should be able to *call a room*. The multi-party details (ringing, joining,
-turn-taking) are not worked out yet, so the live-call handler
-(`crates/eve-idfon/src/rooms.rs`) still refuses room calls — a **temporary
-disable** until the room-call design lands, not a design rule (decided
-2026-10-12: an earlier "voice is 1:1 only" exception in this section was
-wrong). While the disable stands, the chat screen shows the room call button
-disabled, and room turns/voice memos stay text-only. Room detection is
-unchanged: a *room* is decided **by membership** (two or more distinct
-senders in a `conversation`), not by `conversation` being set — a threaded
-1:1 also sets one.
+**Room voice calls — supported (donpark/idfon#221).** A live call is a session
+inside the room (`ios-ui-design.md` §3/§7.1): any member can call the room. The
+daemon runs one `RoomCall` state machine per (identity, room)
+(`crates/idfon-daemon/src/room_calls.rs`, protocol in
+`crates/idfon-protocol/src/room_call.rs`): `IDFON-LIVE/1` controls with `room=`
+ride the room's channel, members join and leave with `room.call.join` /
+`room.call.leave`, and every roster change is published as `room.call.updated`.
+Media is the app's: it subscribes to and drops members from that roster and
+mixes them (`iroh-c-ffi/src/mixer.rs`); 1:1 calls bypass the mixer. A call holds
+at most 12 members, chosen deterministically by (join time, peer id). Group
+video is not built. Room detection is unchanged: a *room* is decided **by
+membership** (two or more distinct senders in a `conversation`), not by
+`conversation` being set — a threaded 1:1 also sets one. Testing:
+`group-call-testing.md` in idfon-home.
 
 ## Open questions
 

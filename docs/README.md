@@ -45,7 +45,7 @@ kept because it records decisions; **design** = not all implemented.
 | --- | --- |
 | `media-adapter-seam.md` | `video-frame.jpg` polling, seams, bundled playback / shell playback callback |
 | `media-adaptation.md` | live-call robustness: VoIP field knowledge (jitter buffers, Opus FEC/DTX/ABR, GCC/SCREAM, Wi-Fi↔cellular handover, burst/gap loss metrics), our MoQ/iroh stack reviewed against it (what `adaptive.rs`/`NetworkSignals`/moq knobs cover vs gaps), dynamic demand-based media configuration, current 60 ms initial / 60–200 ms adaptive playout target, the iOS rendition ladder and why the photo-first gate was removed (#208), prioritized test/change list |
-| `moq-fork.md` | the `donpark/moq` fork: the three patch features (loss recovery, working FEC knob, BitrateControl), upstream's two living lines (`release` vs `main`) and our branch map, the update procedure and the git-source unification rules | when touching the moq/media transport stack, updating the fork or the iroh-live pin, or debugging split `moq_net` types |
+| `moq-fork.md` | the `donpark/moq` and `donpark/iroh-live` forks: pins, what each carries (libopus 1.6.1, loss recovery, FEC knob, LiquidCodec; audio renditions, bitrate retune), moving a pin, and the one-source-per-family rule | when touching the moq/media transport stack, updating the fork or the iroh-live pin, or debugging split `moq_net` types |
 
 ## Artifacts and agents
 
