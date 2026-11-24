@@ -1,7 +1,8 @@
 # Chat envelopes
 
 The small messages the apps exchange around a conversation: typing, read
-receipts, reactions, edits, presence, profile photos, and group invites. Each one is a whole message by
+receipts, reactions, edits, presence, profile photos, doorbell keys, "free to
+talk?" knocks, cards, and group invites. Each one is a whole message by
 itself (never mixed with text), sent with `message.send`, or `room.send` in a
 group. They are `IDFON-*/1` text envelopes like the others (`reply-blocks.md`):
 a first line naming the envelope, then `key=value` lines. A client that does not
@@ -96,6 +97,96 @@ Your photo, sent to the contacts allowed to see it
 (`visibility.audience { aspect: "photo" }`) when it changes, when they become
 allowed, and once to new contacts. An empty `photo=` removes it: it's sent to
 anyone who had it and no longer may. Durable (outbox).
+
+### Doorbell key — `IDFON-DOORBELL/1`
+
+```
+IDFON-DOORBELL/1
+key=<base64 of a 32-byte X25519 public key>
+```
+
+The key a contact uses to ring your message doorbell. There is no mailbox:
+a message waits in its sender's outbox until you are reachable. While it waits,
+the sender's app asks the edge to send you one alert push ("New message") so
+your phone wakes up and comes online. The push carries only the sender's name and
+account id, sealed to this key, so the edge and Apple see neither of them.
+The phone's notification extension opens it to show who it is from.
+
+- Sealing: HPKE (RFC 9180) with X25519, HKDF-SHA256 and ChaCha20-Poly1305,
+  info `idfon-doorbell/1`. The sealed blob is the 32-byte encapsulated key
+  followed by the ciphertext, base64. The plaintext is the JSON
+  `{"n": "<name, at most 64 chars>", "i": "<account id>"}`.
+- An app sends its key once to each contact, and again when the key changes.
+  Durable (outbox). A receiver keeps the latest key per contact and ignores a
+  `key` that is not a valid X25519 public key.
+- A sender rings a contact's doorbell at most once every ten minutes while
+  messages wait, and not at all without their key. The edge route and its rate
+  limits are in idfon-edge (`/_push/doorbell`).
+- The woken phone tells the sender it is here (`IDFON-PRESENCE/1`). The
+  sender's outbox then delivers, and the real message's notification replaces
+  the doorbell's.
+
+### Knock — `IDFON-KNOCK/1`
+
+```
+IDFON-KNOCK/1
+id=<unique id>
+answer=now
+```
+
+"Free to talk?": a one-tap question before a call. Without `answer` it is the
+question. The answer repeats the question's `id`, with one of these values:
+
+- `now`: call me now.
+- `soon`: in about ten minutes. The asker's app reminds them then.
+- `text`: I'd rather text.
+
+Durable (outbox). A receiver ignores an `answer` it does not know. The apps show
+the question as a card with the three answers (and as a notification whose
+actions answer it), and the answer as a card. A `now` answer has a Call action.
+
+### Card — `IDFON-UI/1`
+
+```
+IDFON-UI/1
+payload=<base64 of JSON>
+```
+
+A small piece of interactive UI sent by a peer or an agent. It shows in the
+conversation as a row with a title and up to a few actions.
+
+```json
+{
+  "kind": "poll",
+  "id": "<unique card id>",
+  "title": "Lunch?",
+  "subtitle": "Pick one",
+  "glyph": "fork.knife",
+  "actions": [{"id": "pizza", "title": "Pizza"}, {"id": "no", "title": "Not today", "role": "destructive"}],
+  "detailURL": "https://…",
+  "data": {"any": "string pairs"}
+}
+```
+
+- `kind` and `id` are required. Everything else is optional.
+- `glyph` is an SF Symbol name.
+- `role` is `destructive` or absent.
+- `detailURL` is an http(s) page the card opens full screen.
+- `data` holds kind-specific strings.
+- A client draws the kinds it knows with their own renderer. Every other kind
+  still shows, as the generic card: title, subtitle, glyph and actions. A client
+  that cannot act on cards may show only the title.
+
+### Card answer — `IDFON-UI-ACTION/1`
+
+```
+IDFON-UI-ACTION/1
+card=<card id>
+action=<action id>
+```
+
+The action a person chose on a card. It is sent back to whoever sent the card,
+and it is never shown as a message. Durable (outbox).
 
 ### Group invite — `IDFON-GROUP/1`
 
