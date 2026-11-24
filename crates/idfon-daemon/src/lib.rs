@@ -1198,25 +1198,73 @@ fn merge_state_events(
     Ok(added)
 }
 
+/// How a send ends: delivered, or — when every attempt failed — back in the
+/// outbox (`Queued`, "not sent yet") for a durable send, `Failed` otherwise.
+fn final_send_status(delivered: bool, durable: bool) -> idfon_protocol::OperationStatus {
+    match (delivered, durable) {
+        (true, _) => idfon_protocol::OperationStatus::Delivered,
+        (false, true) => idfon_protocol::OperationStatus::Queued,
+        (false, false) => idfon_protocol::OperationStatus::Failed,
+    }
+}
+
+/// Startup: retry everything a previous process left queued or mid-send.
 fn resume_pending_operations(store: Arc<Mutex<Store>>, transport: Arc<TransportMode>) {
-    let pending = {
-        let state = store.lock().expect("store mutex poisoned");
-        state
+    resume_queued(&store, &transport, None, true, 4);
+}
+
+/// Re-attempt the outbox: queued sends (only `target`'s when given; `stale`
+/// also takes sends a previous process left `Transmitting`). Each one is
+/// claimed (→ `Transmitting`) under the store lock before any send, so
+/// overlapping triggers — app foreground, a message from the peer, a path
+/// change — never send one message twice. Returns how many were claimed.
+fn resume_queued(
+    store: &Arc<Mutex<Store>>,
+    transport: &Arc<TransportMode>,
+    target: Option<&str>,
+    stale: bool,
+    attempts: usize,
+) -> usize {
+    let claimed = {
+        let mut state = store.lock().expect("store mutex poisoned");
+        let ids: Vec<(String, String)> = state
             .operations
             .iter()
             .filter(|operation| {
-                matches!(
-                    operation.status,
-                    idfon_protocol::OperationStatus::Queued
-                        | idfon_protocol::OperationStatus::Transmitting
-                ) && operation.outbound.is_some()
+                let waiting = operation.status == idfon_protocol::OperationStatus::Queued
+                    || (stale && operation.status == idfon_protocol::OperationStatus::Transmitting);
+                waiting
+                    && operation.outbound.is_some()
+                    && target.is_none_or(|target| operation.target.as_deref() == Some(target))
             })
-            .cloned()
-            .collect::<Vec<_>>()
+            .map(|operation| (operation.operation_id.clone(), operation.identity.clone()))
+            .collect();
+        let mut claimed = Vec::new();
+        for (operation_id, identity) in ids {
+            set_operation_status(
+                &mut state,
+                &operation_id,
+                &identity,
+                idfon_protocol::OperationStatus::Transmitting,
+            );
+            if let Some(operation) = state
+                .operations
+                .iter()
+                .find(|operation| operation.operation_id == operation_id && operation.identity == identity)
+            {
+                claimed.push(operation.clone());
+            }
+        }
+        if !claimed.is_empty() {
+            let data_dir = state.data_dir.clone();
+            let _ = state.save(&data_dir);
+        }
+        claimed
     };
-    for operation in pending {
-        let store = Arc::clone(&store);
-        let transport = Arc::clone(&transport);
+    let count = claimed.len();
+    for operation in claimed {
+        let store = Arc::clone(store);
+        let transport = Arc::clone(transport);
         tokio::spawn(async move {
             let Some(envelope) = operation.outbound.clone() else {
                 return;
@@ -1234,6 +1282,7 @@ fn resume_pending_operations(store: Arc<Mutex<Store>>, transport: Arc<TransportM
                     })
                     .cloned()
             };
+            // The peer is gone (deleted): nothing will ever deliver this.
             let Some(peer) = peer else {
                 let _ = update_operation(
                     &store,
@@ -1244,7 +1293,10 @@ fn resume_pending_operations(store: Arc<Mutex<Store>>, transport: Arc<TransportM
                 return;
             };
             let mut result = Err(io::Error::other("no transport attempt"));
-            for _ in 0..=3 {
+            for attempt in 0..attempts.max(1) {
+                if is_cancelled(&store, &operation.operation_id, &operation.identity) {
+                    return;
+                }
                 let transport = Arc::clone(&transport);
                 let identity = operation.identity.clone();
                 let peer = peer.clone();
@@ -1258,21 +1310,48 @@ fn resume_pending_operations(store: Arc<Mutex<Store>>, transport: Arc<TransportM
                 if result.is_ok() {
                     break;
                 }
+                if attempt + 1 < attempts {
+                    tokio::time::sleep(std::time::Duration::from_millis(500 << attempt.min(3))).await;
+                }
             }
-            let status = if result.is_ok() {
-                idfon_protocol::OperationStatus::Delivered
-            } else {
-                idfon_protocol::OperationStatus::Failed
-            };
+            let status = final_send_status(result.is_ok(), operation.durable);
+            tracing::info!(target: "idfon.daemon", identity = %operation.identity, operation_id = %operation.operation_id, status = ?status, "outbox resume finished");
             let _ = update_operation(&store, &operation.operation_id, &operation.identity, status);
         });
     }
+    count
+}
+
+/// `operation.resume` — retry the outbox now (all peers, or `target`'s). The
+/// app calls it on its own reachability signals (foreground, network change,
+/// opening a chat); the daemon also retries a peer's sends when that peer
+/// messages us.
+fn operation_resume(
+    request: &Request,
+    store: &Arc<Mutex<Store>>,
+    transport: Option<&Arc<TransportMode>>,
+) -> Response {
+    let Some(transport) = transport else {
+        return transport_not_ready(request);
+    };
+    let target = request_text(&request.params, "target").map(|target| {
+        let state = store.lock().expect("store mutex poisoned");
+        state
+            .peers
+            .iter()
+            .find(|peer| peer.id == target || peer.name == target || peer.aliases.iter().any(|alias| alias == &target))
+            .map(|peer| peer.id.clone())
+            .unwrap_or(target)
+    });
+    let resumed = resume_queued(store, transport, target.as_deref(), false, 2);
+    success(request, serde_json::json!({"resumed": resumed}))
 }
 
 fn spawn_receiver(
     manager: Arc<idfon_core::transport::TransportManager>,
     store: Arc<Mutex<Store>>,
     identity: String,
+    transport: Arc<TransportMode>,
 ) {
     tokio::spawn(async move {
         let receiver_identity = identity.clone();
@@ -1280,7 +1359,11 @@ fn spawn_receiver(
             .serve(&identity, move |message| {
                 let store = Arc::clone(&store);
                 let identity = receiver_identity.clone();
+                let transport = Arc::clone(&transport);
                 async move {
+                    // A message from a peer proves it is reachable: retry
+                    // whatever is waiting for it in the outbox.
+                    let sender = message.sender.peer_id.clone();
                     let mut params = serde_json::to_value(message).map_err(|error| {
                         idfon_core::transport::TransportError::Failed(error.to_string())
                     })?;
@@ -1295,6 +1378,9 @@ fn spawn_receiver(
                         params,
                     };
                     let response = dispatch(request, &store);
+                    if response.ok && !sender.is_empty() {
+                        resume_queued(&store, &transport, Some(&sender), false, 2);
+                    }
                     match response.body {
                         ResponseBody::Success { result, .. } => Ok(idfon_protocol::MessageAck {
                             message_id: result["message_id"].as_str().unwrap_or_default().into(),
@@ -1336,7 +1422,7 @@ fn wire_identity(transport: Arc<TransportMode>, store: Arc<Mutex<Store>>, identi
         });
     }
     let manager = Arc::clone(manager);
-    spawn_receiver(Arc::clone(&manager), Arc::clone(&store), identity.clone());
+    spawn_receiver(Arc::clone(&manager), Arc::clone(&store), identity.clone(), Arc::clone(&transport));
     let mcp_manager = Arc::clone(&manager);
     let mcp_store = Arc::clone(&store);
     let mcp_identity = identity.clone();
@@ -2540,6 +2626,7 @@ fn dispatch_with_transport(
         "operation.get" => operation_get(&request, store),
         "operation.wait" => operation_wait(&request, store),
         "operation.cancel" => operation_cancel(&request, store),
+        "operation.resume" => operation_resume(&request, store, transport),
         "event.list" => events(&request, store),
         "event.export" => events_export(&request, store),
         "event.sync" => events_sync(&request, store, transport),
@@ -3091,6 +3178,7 @@ fn gossip_room_send(
             message_id: Some(message_id),
             outbound: Some(envelope.clone()),
             delivery: None,
+            durable: false,
         };
         state.operations.push(operation.clone());
         let _ = state.save(&state.data_dir);
@@ -3498,6 +3586,12 @@ fn send_message(
         .get("delivery")
         .cloned()
         .and_then(|value| serde_json::from_value::<idfon_protocol::DeliveryPolicy>(value).ok());
+    // Outbox semantics (Operation::durable): undeliverable stays Queued.
+    let durable = request
+        .params
+        .get("durable")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
     let retries = request
         .params
         .get("retries")
@@ -3696,6 +3790,7 @@ fn send_message(
         message_id: Some(envelope.message_id.clone()),
         outbound: Some(envelope.clone()),
         delivery: delivery_policy.clone(),
+        durable,
     };
     state.operations.push(operation.clone());
     let result = state.save(&state.data_dir);
@@ -3785,11 +3880,7 @@ fn send_message(
                 tokio::time::sleep(std::time::Duration::from_millis(500 << attempt.min(3))).await;
             }
         }
-        let status = if delivery.is_ok() {
-            idfon_protocol::OperationStatus::Delivered
-        } else {
-            idfon_protocol::OperationStatus::Failed
-        };
+        let status = final_send_status(delivery.is_ok(), durable);
         tracing::info!(
             target: "idfon.daemon",
             identity = %worker_identity,
@@ -3890,31 +3981,44 @@ fn update_operation(
     status: idfon_protocol::OperationStatus,
 ) -> io::Result<()> {
     let mut state = store.lock().expect("store mutex poisoned");
-    if let Some(operation) = state
+    set_operation_status(&mut state, operation_id, identity, status);
+    let data_dir = state.data_dir.clone();
+    state.save(&data_dir)
+}
+
+/// The status change and its `operation.state_changed` event, under a held
+/// store lock (no save).
+fn set_operation_status(
+    state: &mut Store,
+    operation_id: &str,
+    identity: &str,
+    status: idfon_protocol::OperationStatus,
+) {
+    let Some(operation) = state
         .operations
         .iter_mut()
         .find(|operation| operation.operation_id == operation_id && operation.identity == identity)
-    {
-        tracing::info!(target: "idfon.daemon", identity = %identity, operation_id = %operation_id, message_id = ?operation.message_id, status = ?status, "operation state changed");
-        operation.status = status.clone();
-        operation.updated_at = now();
-        let event_number = next_event_number(&state.events);
-        let cursor = format!("cur_{event_number:020}");
-        state.events.push(idfon_protocol::Event {
-            event_id: format!("evt_{operation_id}_{event_number}"),
-            cursor,
-            r#type: "operation.state_changed".into(),
-            timestamp: now(),
-            identity: "default".into(),
-            data: serde_json::json!({"operation_id": operation_id, "status": status}),
-        });
-        if state.events.len() > EVENT_RETENTION {
-            let excess = state.events.len() - EVENT_RETENTION;
-            state.events.drain(..excess);
-        }
+    else {
+        return;
+    };
+    tracing::info!(target: "idfon.daemon", identity = %identity, operation_id = %operation_id, message_id = ?operation.message_id, status = ?status, "operation state changed");
+    operation.status = status.clone();
+    operation.updated_at = now();
+    let message_id = operation.message_id.clone();
+    let event_number = next_event_number(&state.events);
+    let cursor = format!("cur_{event_number:020}");
+    state.events.push(idfon_protocol::Event {
+        event_id: format!("evt_{operation_id}_{event_number}"),
+        cursor,
+        r#type: "operation.state_changed".into(),
+        timestamp: now(),
+        identity: "default".into(),
+        data: serde_json::json!({"operation_id": operation_id, "status": status, "message_id": message_id}),
+    });
+    if state.events.len() > EVENT_RETENTION {
+        let excess = state.events.len() - EVENT_RETENTION;
+        state.events.drain(..excess);
     }
-    let data_dir = state.data_dir.clone();
-    state.save(&data_dir)
 }
 
 fn receive_message(request: &Request, store: &Arc<Mutex<Store>>) -> Response {
@@ -4148,6 +4252,7 @@ fn receive_message(request: &Request, store: &Arc<Mutex<Store>>) -> Response {
         message_id: Some(envelope.message_id.clone()),
         outbound: None,
         delivery: None,
+        durable: false,
     };
     state.messages.push(envelope.clone());
     state.operations.push(operation.clone());
@@ -9027,6 +9132,7 @@ mod tests {
                 device_class: Some("mobile".into()),
                 ..Default::default()
             }),
+            durable: false,
         });
         state.save(&dir).unwrap();
         let restored = Store::load(&dir).unwrap();
@@ -9675,6 +9781,7 @@ mod tests {
                 message_id: Some("msg".into()),
                 outbound: None,
                 delivery: None,
+                durable: false,
             });
         let response = dispatch(
             Request {
@@ -10251,6 +10358,142 @@ mod tests {
         );
         assert_eq!(result(leave)["removed"], true);
         assert!(Store::load(&dir).unwrap().rooms.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The outbox: a durable send to an unreachable peer is "not sent yet"
+    /// (Queued), not Failed; `operation.resume` delivers it once the peer is
+    /// reachable, exactly once. A plain send still fails as before.
+    #[test]
+    fn durable_sends_wait_in_the_outbox_until_the_peer_is_reachable() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let settle = || runtime.block_on(tokio::time::sleep(std::time::Duration::from_millis(600)));
+        let dir = temp_dir("outbox");
+        let store = Arc::new(Mutex::new(Store::load(&dir).unwrap()));
+        let fake = FakeTransport::default();
+        let transport = Arc::new(TransportMode::Fake(fake.clone()));
+        // Bob: a real endpoint id, but no address yet — every dial fails.
+        let bob_dir = temp_dir("outbox-bob");
+        let (bob, bob_endpoint) = {
+            let bob_store = Store::load(&bob_dir).unwrap();
+            let endpoint_key = bob_store.endpoint_key("default").unwrap();
+            let endpoint = iroh::SecretKey::from_bytes(&endpoint_key.to_bytes()).public();
+            (bob_store.identity_key("default").unwrap().peer_id(), endpoint)
+        };
+        {
+            let mut state = store.lock().unwrap();
+            state.peers.push(idfon_protocol::Peer {
+                id: bob.clone(),
+                identity: "default".into(),
+                name: "bob".into(),
+                endpoint_id: None,
+                endpoint_addr: None,
+                devices: Vec::new(),
+                aliases: Vec::new(),
+                ring_score: None,
+                call_mode: None,
+                pinned: false,
+                instant_call: false,
+            });
+            state.grants.push(idfon_protocol::CapabilityGrant {
+                capability: idfon_protocol::Capability::MessageSend,
+                identity: "default".into(),
+                subject: bob.clone(),
+                conversation: None,
+                active_at: "0".into(),
+                expires_at: None,
+                revision: 1,
+                revoked_at: None,
+            });
+        }
+        let rpc = |method: &str, params: serde_json::Value| -> serde_json::Value {
+            let response = dispatch_with_transport(
+                Request { version: PROTOCOL_VERSION, id: method.into(), method: method.into(), params },
+                &store,
+                Some(&transport),
+            );
+            match response.body {
+                ResponseBody::Success { result, .. } => result,
+                ResponseBody::Failure { error, .. } => panic!("{method} failed: {}", error.message),
+            }
+        };
+        let status = |operation_id: &str| -> idfon_protocol::OperationStatus {
+            let state = store.lock().unwrap();
+            state.operations.iter().find(|op| op.operation_id == operation_id).unwrap().status.clone()
+        };
+
+        let waiting = rpc("message.send", serde_json::json!({
+            "to": bob, "text": "see you at 6", "idempotency_key": "k-durable", "durable": true, "retries": 0}));
+        let plain = rpc("message.send", serde_json::json!({
+            "to": bob, "text": "ping", "idempotency_key": "k-plain", "retries": 0}));
+        let waiting_id = waiting["operation_id"].as_str().unwrap().to_owned();
+        let plain_id = plain["operation_id"].as_str().unwrap().to_owned();
+        settle();
+        assert_eq!(status(&waiting_id), idfon_protocol::OperationStatus::Queued, "durable: not sent yet");
+        assert_eq!(status(&plain_id), idfon_protocol::OperationStatus::Failed, "plain: fails as before");
+        assert!(fake.messages().is_empty());
+        // Still unreachable: a resume tries and puts it back in the outbox.
+        assert_eq!(rpc("operation.resume", serde_json::json!({"target": "bob"}))["resumed"], 1);
+        runtime.block_on(tokio::time::sleep(std::time::Duration::from_millis(1200)));
+        assert_eq!(status(&waiting_id), idfon_protocol::OperationStatus::Queued);
+
+        // Bob becomes reachable; two overlapping triggers deliver it once.
+        {
+            let mut state = store.lock().unwrap();
+            state.peers[0].endpoint_id = Some(bob_endpoint.to_string());
+            state.peers[0].endpoint_addr =
+                Some(serde_json::to_string(&EndpointAddr::new(bob_endpoint)).unwrap());
+        }
+        assert_eq!(rpc("operation.resume", serde_json::json!({})), serde_json::json!({"resumed": 1}));
+        assert_eq!(rpc("operation.resume", serde_json::json!({})), serde_json::json!({"resumed": 0}), "claimed once");
+        settle();
+        assert_eq!(status(&waiting_id), idfon_protocol::OperationStatus::Delivered);
+        assert_eq!(status(&plain_id), idfon_protocol::OperationStatus::Failed, "a failed plain send is not resumed");
+        let sent = fake.messages();
+        assert_eq!(sent.len(), 1);
+        assert!(matches!(&sent[0].content, idfon_protocol::MessageContent::Text { text } if text == "see you at 6"));
+        // The status changes are events the app can follow, with the message id.
+        let state = store.lock().unwrap();
+        assert!(state.events.iter().any(|event| event.r#type == "operation.state_changed"
+            && event.data["operation_id"] == waiting_id.as_str()
+            && event.data["status"] == "delivered"
+            && event.data["message_id"].is_string()));
+        drop(state);
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(bob_dir).unwrap();
+    }
+
+    /// A queued send that is cancelled (deleted before it was sent) is never
+    /// resumed.
+    #[test]
+    fn cancelled_outbox_items_are_not_resumed() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let dir = temp_dir("outbox-cancel");
+        let store = Arc::new(Mutex::new(Store::load(&dir).unwrap()));
+        let transport = Arc::new(TransportMode::Fake(FakeTransport::default()));
+        let key = idfon_core::IdentityKey::generate();
+        let envelope = idfon_core::sign_message(
+            &key, "endpoint-a", "msg-1",
+            idfon_protocol::MessageContent::Text { text: "draft".into() }, "k-1", None,
+        ).unwrap();
+        store.lock().unwrap().operations.push(idfon_protocol::Operation {
+            identity: "default".into(),
+            operation_id: "op-1".into(),
+            method: "message.send".into(),
+            status: idfon_protocol::OperationStatus::Cancelled,
+            target: Some("bob".into()),
+            request_fingerprint: None,
+            created_at: now(),
+            updated_at: now(),
+            idempotency_key: Some("k-1".into()),
+            message_id: Some("msg-1".into()),
+            outbound: Some(envelope),
+            delivery: None,
+            durable: true,
+        });
+        assert_eq!(resume_queued(&store, &transport, None, true, 1), 0);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
