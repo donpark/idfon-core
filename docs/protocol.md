@@ -265,7 +265,7 @@ A verified message from a sender who isn't a peer of the receiving identity is
 **held as a contact request** instead of refused, the way "unknown senders"
 work in phone messaging. This makes one-way adds work: someone who scanned your
 code or got your card adds you and writes; you see a request. It is also how a
-group join link reaches the group's owner.
+group join link reaches the group's owner (`chat-envelopes.md`, "Group links").
 
 - The sender gets an ordinary success acknowledgment (`status: "held"` in the
   `message.receive` result), so their outbox marks the message delivered.
