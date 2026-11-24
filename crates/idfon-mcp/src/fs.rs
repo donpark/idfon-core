@@ -142,7 +142,7 @@ impl FsServer {
         json!([
             {
                 "name": "diag.tail",
-                "description": "Recent Idfon diagnostic events across devices (wake outcomes, push registration, token lifecycle). Events are {ts_ms, kind, detail, device, build}.",
+                "description": "Recent IDfon diagnostic events across devices (wake outcomes, push registration, token lifecycle). Events are {ts_ms, kind, detail, device, build}.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
