@@ -33,6 +33,7 @@ kept because it records decisions; **design** = not all implemented.
 | `relay-config.md` | relay selection at runtime — parameter (flags / app launch args / FFI / `IDFON_RELAY_*`) > configuration (app Relay settings, `~/.idfon/relay.conf`) > default (N0); who honors it and why the vendored libs must be re-staged (as-built) | configuring a relay, changing relay without a binary rebuild, precedence questions |
 | `config.md` | where idfon keeps things (home, daemon data, socket, `config.toml`), profiles, every setting and its env var, the `/tmp` data migration, `idfon config path`/`show` (as-built) | finding a file, adding a setting, running a second daemon, or debugging "wrong identity" |
 | `chatrooms.md` | rooms, direct fan-out, gossip |
+| `identity.md` | one you: identities collapsed into tags on contacts, what each tag lets contacts see (presence, photo), the migration |
 | `chat-envelopes.md` | typing, read receipts, reactions, edits, group invites: the app-to-app envelopes and how they name a message |
 | `mcp-transport.md` | idfon as an MCP transport binding (implemented) |
 | `idfon-h1.md` | HTTP/1.1 over iroh: serve an existing `axum::Router` with WebSockets, SSE and chunked bodies, `RemoteId` peer identity, client + upgrade handle (slices 1–2 of #142 tested; voxl demo pending) |

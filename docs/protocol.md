@@ -92,10 +92,30 @@ session identity.
 
 | method | params | result |
 |---|---|---|
-| `identity.list` | — | `{ identities: [{id, name, active, public_key, endpoint_id}] }` |
-| `identity.create` | `{ name }` | `{ identity }` |
-| `identity.use` | `{ name }` | `{ identity, active: true }` |
-| `identity.delete` | `{ name }` | `{}` — rejected for the active or last identity |
+One you: identities are tags on contacts now (2026-11-24, `docs/identity.md`).
+
+| method | params | result |
+|---|---|---|
+| `identity.list` | — | `{ identities: [{id, name, active, public_key, endpoint_id}] }` — one entry, `default` |
+| `identity.rename` | `{ name }` | your name (what your card shows) |
+| `identity.create`, `identity.delete` | — | refused |
+
+### Tags and visibility
+
+See `docs/identity.md`.
+
+| method | params | result |
+|---|---|---|
+| `tag.list` | — | `{ tags: [{name, hide_presence, hide_photo, count}] }` |
+| `tag.set` | `{ name, hide_presence?, hide_photo? }` | `{ tag }` |
+| `tag.rename` | `{ name, to }` | `{ renamed: true }` |
+| `tag.delete` | `{ name }` | `{ deleted: true }` |
+| `visibility.get` | — | `{ visibility: {presence, photo} }` (your defaults) |
+| `visibility.set` | `{ presence?, photo? }` | `{ visibility }` |
+| `visibility.audience` | `{ aspect: "presence" \| "photo" }` | `{ aspect, peers: [id] }` — who may see it |
+
+`peer.add` takes `tags`; `peer.update` takes `tags` (replace), `add_tag`,
+`remove_tag`, and `visibility: {presence?, photo?}` (this contact's overrides).
 
 ### Peers
 
