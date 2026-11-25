@@ -85,7 +85,7 @@ session identity.
 
 | method | params | result |
 |---|---|---|
-| `daemon.status` | — | `{ ready, daemon, protocol_version, identity: {id, name, active, public_key, endpoint_id}, ticket: [bytes] }` (ticket = endpoint addr ticket, JSON byte array) |
+| `daemon.status` | — | `{ ready, daemon, protocol_version, identity: {id, name, active, public_key, endpoint_id}, ticket: [bytes], host, autostarted, clients, build: {image, stale} }` (ticket = endpoint addr ticket, JSON byte array; `host` = the executable's file name, `idfond` or the app hosting the daemon; `autostarted` = spawned by the `idfon` CLI (`IDFON_AUTOSTARTED=1`); `clients` = connected sockets, this one included; `build.stale` = the file holding the daemon code (`build.image`) changed on disk since start, so the CLI may restart an autostarted daemon that nobody else is using) |
 | `daemon.shutdown` | — | `{ shutdown: true }` |
 
 ### Identity

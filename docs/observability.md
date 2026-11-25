@@ -18,7 +18,7 @@ crosses several processes, and the fan-out is growing:
 - `idfond` daemons (one per identity; in-process on iOS, `docs/daemon.md`),
 - the macOS GUI's daemon subprocess and the CLI (which auto-spawns daemons),
 - the `idfon-gateway` / `idfon-h3` HTTP/3 provider,
-- `idfon-mcp` / `idfon-mcp-server`,
+- `idfon-mcp` / `idfon mcp server`,
 - the `eve-idfon` holder/bridge that fronts each agent,
 - the JS agents themselves (`agents/*`), which may be written and hosted by
   someone else.
