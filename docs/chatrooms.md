@@ -214,7 +214,7 @@ A 1:1 chat is a room of two with `conversation = None`: same envelope, same
 grants, same `message.send`. Nothing in R0–R3 should add a code path that only
 rooms take, or only 1:1 takes.
 
-**Room voice calls — supported (donpark/idfon#221).** A live call is a session
+**Room voice calls — supported (donpark/idfon-legacy#221).** A live call is a session
 inside the room (`ios-ui-design.md` §3/§7.1): any member can call the room. The
 daemon runs one `RoomCall` state machine per (identity, room)
 (`crates/idfon-daemon/src/room_calls.rs`, protocol in

@@ -235,7 +235,7 @@ pub trait RequestObserver: Send + Sync + 'static {
 /// Also runs before the Host/Origin (DNS-rebinding) check: that guard protects
 /// *browser* consumers, while local routes are app-facing and validate a
 /// signed credential instead (a browser cannot get one). Direct-IP LAN clients
-/// are accepted here on purpose (donpark/idfon#53).
+/// are accepted here on purpose (donpark/idfon-legacy#53).
 pub trait LocalRoute: Send + Sync + 'static {
     /// Whether this route serves `path` (the account-stripped path) for
     /// `method` and `account` (empty when the request names none).

@@ -304,7 +304,7 @@ The health telemetry built for that gate is kept: `delivery_bps_mean`,
 into the health verdict. It is read-only observability for diagnosis; nothing
 gates video on it now.
 
-**Continuation:** [epic #208](https://github.com/donpark/idfon/issues/208)
+**Continuation:** [epic #208](https://github.com/donpark/idfon-legacy/issues/208)
 tracks what remains: two-phone validation of the rung ladder, rung/threshold
 calibration, and a separately approved release decision. No device call or
 TestFlight upload has been done for the ladder.
