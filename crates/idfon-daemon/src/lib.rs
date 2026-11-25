@@ -41,7 +41,7 @@ use idfon_protocol::{
 };
 use iroh::endpoint::Connection;
 use iroh::EndpointAddr;
-use iroh_gossip::api::{Event as GossipEvent, GossipSender};
+use iroh_gossip::{Event as GossipEvent, GossipSender};
 use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
 use tokio::{

@@ -20,7 +20,7 @@ use iroh::{
     protocol::ProtocolHandler,
     Endpoint, EndpointAddr, EndpointId, SecretKey,
 };
-use iroh_gossip::{api::GossipTopic, Gossip, TopicId};
+use iroh_gossip::{Gossip, GossipTopic, TopicId};
 use thiserror::Error;
 
 /// Bounded dial-and-exchange: a first handshake can be aborted by a competing
@@ -96,7 +96,7 @@ impl GossipService {
         &self,
         topic: TopicId,
         bootstrap: Vec<EndpointId>,
-    ) -> Result<GossipTopic, iroh_gossip::api::ApiError> {
+    ) -> Result<GossipTopic, iroh_gossip::Error> {
         self.gossip.subscribe(topic, bootstrap).await
     }
 }
