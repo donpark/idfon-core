@@ -8,7 +8,7 @@ chunked bodies, plain request/response. Streaming sibling of the h3 path
 Status: **current** for slices 1–2 of [#142] (server + client, tested). The
 voxl demo (slice 3) and channel sharding (slice 4) are not in this crate.
 
-[#142]: https://github.com/donpark/idfon/issues/142
+[#142]: https://github.com/donpark/idfon-legacy/issues/142
 
 ## Why it is cheap
 

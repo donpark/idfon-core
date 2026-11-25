@@ -857,7 +857,7 @@ media_blob_fetch (
     char const * ticket);
 
 /** \brief
- *  In-app call tones (donpark/idfon#15, native shell): a small tone
+ *  In-app call tones (donpark/idfon-legacy#15, native shell): a small tone
  *  generator writing synthesized PCM through the same device playback the
  *  recordings use — no assets ship. `kind`: 0 stop, 1 ringback (loop),
  *  2 ringtone (loop), 3 answered (one-shot), 4 ended (one-shot). Every call

@@ -3,7 +3,7 @@
 > **Status:** design, for implementation. Amended 2026-11-02 after an external
 > design review (GPT-6.1 Sol): its blocker (the loopback gateway credential
 > exposure) and majors are folded in below and tracked as the P-1/P0–P4
-> subtasks of epic [#111](https://github.com/donpark/idfon/issues/111).
+> subtasks of epic [#111](https://github.com/donpark/idfon-legacy/issues/111).
 > Reasoning history: `idfon-web-analysis.md` (which chose app-owned JSON-render
 > over WebMCP in 2026-10-09 — this plan adds the *tiered* escape hatch below
 > that decision, it does not reverse it).
@@ -272,9 +272,9 @@ is superseded.
 
 ## Issues
 
-Epic [#111](https://github.com/donpark/idfon/issues/111) with subtasks
-P-1 (blocker prerequisite) [#117](https://github.com/donpark/idfon/issues/117), [#112](https://github.com/donpark/idfon/issues/112) (P0),
-[#113](https://github.com/donpark/idfon/issues/113) (P1),
-[#114](https://github.com/donpark/idfon/issues/114) (P2),
-[#115](https://github.com/donpark/idfon/issues/115) (P3),
-[#116](https://github.com/donpark/idfon/issues/116) (P4).
+Epic [#111](https://github.com/donpark/idfon-legacy/issues/111) with subtasks
+P-1 (blocker prerequisite) [#117](https://github.com/donpark/idfon-legacy/issues/117), [#112](https://github.com/donpark/idfon-legacy/issues/112) (P0),
+[#113](https://github.com/donpark/idfon-legacy/issues/113) (P1),
+[#114](https://github.com/donpark/idfon-legacy/issues/114) (P2),
+[#115](https://github.com/donpark/idfon-legacy/issues/115) (P3),
+[#116](https://github.com/donpark/idfon-legacy/issues/116) (P4).

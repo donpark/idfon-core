@@ -1,6 +1,6 @@
 # The media forks (`donpark/moq`, `donpark/iroh-live`)
 
-Status: **current** (2026-11-24, after the iroh-live upgrade, donpark/idfon#221).
+Status: **current** (2026-11-24, after the iroh-live upgrade, donpark/idfon-legacy#221).
 The media stack comes from two forks pinned by rev in the root `Cargo.toml`.
 This doc says why we fork, what each fork carries, and how to move a pin.
 
@@ -42,7 +42,7 @@ On top of `4a6f52248` (`git log 4a6f52248..14598b93c` in `~/dev/idfon/moq-upstre
 Upstream `main` already gates VideoToolbox on `cfg(apple)` (macOS and iOS), so
 the iOS hardware-encoder patch the old fork needed is gone. Whether iOS now
 encodes on hardware in a real call is not yet confirmed on a device
-(donpark/idfon#208).
+(donpark/idfon-legacy#208).
 
 ## What the iroh-live fork carries
 
@@ -54,7 +54,7 @@ license).
 ## Upstreaming
 
 None of this is upstream yet: no PR is open on `moq-dev/moq` or for the
-audio renditions on `n0-computer/iroh-live`. Tracked in donpark/idfon#96.
+audio renditions on `n0-computer/iroh-live`. Tracked in donpark/idfon-legacy#96.
 
 ## Moving a pin
 
