@@ -44,10 +44,38 @@ Your first message reaches them as a **contact request** (held, not shown as a
 chat), and they accept or decline it. Accepting adds you as their contact and
 delivers what you wrote. See protocol.md, "Contact requests".
 
+## Introductions
+
+You can share a contact's card with someone else as an introduction: the bare
+card plus a token signed by you, naming who introduced whom to whom
+(`contact.introduce`; the token, where it rides and how it is checked are in
+protocol.md, "Introductions"; the notices in chat-envelopes.md). The person
+introduced sees "introduced by Don" on your recipient's contact request.
+
+- **Ask Before Sharing My Card** is `identity.update { share: "ask" }`. Your
+  card carries it and `IDFON-SHARE/1` tells your contacts. It is advisory: a
+  sharer's app asks first, and nothing can enforce it.
+- **An introduction grants, adds or accepts nothing.** `peer.add` and
+  `request.accept` stay a person's decision; a held request with an
+  introduction is still only a request.
+- **Not transitive.** A token names one introducer, one subject and at most
+  one recipient, and is never forwarded or chained. Passing a card on is a new
+  introduction, by someone who has the contact.
+- **Only people you know count.** Wherever a receiver's own rules use
+  introductions (ring rules, request sorting, a future auto-accept), only
+  introducers who are your contacts and people (not agents, not unknown ids)
+  count, and you can mute an introducer. The daemon reports
+  `introducer_is_contact`; the person/agent check and muting are the app's.
+- **Bounded and quiet.** Requests stay bounded (64 senders, 20 messages). At
+  most 20 notices a day from one introducer are shown; more collapse into one
+  line. Agents drop notices and preferences, so two agents cannot loop on
+  them.
+
 ## Identity methods
 
 - `identity.list` lists the one identity. `identity.rename { name }` changes
-  your name, which your card shows.
+  your name, which your card shows. `identity.update { share }` sets Ask
+  Before Sharing My Card (`"ask"` | `"ok"`).
 - `identity.create` and `identity.delete` are refused. `identity.use` accepts
   only `default`.
 

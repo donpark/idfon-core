@@ -13,7 +13,7 @@ kept because it records decisions; **design** = not all implemented.
 | `../AGENTS.md` | repository working rules and the iOS shipping checklist (gated IPA, credentials, build numbers, upload verification, TestFlight push smoke test) | shipping an iOS update or checking agent workflow rules |
 | `communication-model.md` | identities, peers, messages, grants | anything about the core model |
 | `daemon.md` | why there is a daemon at all; the daemon as packaging of the feature functions | questioning the process model |
-| `protocol.md` | daemon JSON IPC methods/params, contact requests (unknown senders) | adding/changing an RPC or a client |
+| `protocol.md` | daemon JSON IPC methods/params, contact requests (unknown senders), introductions (the signed token, `contact.introduce`/`contact.inspect`) | adding/changing an RPC or a client |
 | `build.md` | which subprojects to rebuild after a change; the Rust/FFI target dirs; `pnpm build`/`pnpm voice build` orchestration; build-time options (`IDFON_TTS_PHONON`) | touching a shared crate or the c-ffi crate, unsure what needs rebuilding, building/cleaning everything, or toggling a build-time option |
 
 ## Platforms and apps
@@ -22,7 +22,7 @@ kept because it records decisions; **design** = not all implemented.
 | --- | --- |
 | `durable-files.md` | Durable file publication independent of sessions/agent lifecycle: the edge's content-addressed store (`/files`, `/models`), `idfon publish`, 24 h user pins / permanent operational pins, the agent tool, BunnyCDN, ops-only takedown with a sticky blocklist and write rate limits; as-built (no paid tier) |
 | `mcp-control.md` | MCP control-surface access model: three approval tiers over iroh/capability tickets, the request-time approval block (lock-screen actionable variant), verb-class scoping, audit-over-Diag; initial read-only tool slice |
-| `contact-exchange.md` | vCard contact cards: the NameDrop substitute, `idfon://add/` deep links, QR, import/export surfaces, the approval modal (rename/deny, admission-code auth), the test-contacts page (`scripts/test-contacts-page.mjs`) |
+| `contact-exchange.md` | vCard contact cards: the NameDrop substitute, `idfon://add/` deep links, QR, import/export surfaces, the approval modal (rename/deny, admission-code auth, introductions), the test-contacts page (`scripts/test-contacts-page.mjs`) |
 
 ## Networking, addressing, transport
 
@@ -33,8 +33,8 @@ kept because it records decisions; **design** = not all implemented.
 | `relay-config.md` | relay selection at runtime — parameter (flags / app launch args / FFI / `IDFON_RELAY_*`) > configuration (app Relay settings, `~/.idfon/relay.conf`) > default (N0); who honors it and why the vendored libs must be re-staged (as-built) | configuring a relay, changing relay without a binary rebuild, precedence questions |
 | `config.md` | where idfon keeps things (home, daemon data, socket, `config.toml`), profiles, every setting and its env var, the `/tmp` data migration, `idfon config path`/`show` (as-built) | finding a file, adding a setting, running a second daemon, or debugging "wrong identity" |
 | `chatrooms.md` | rooms, direct fan-out, gossip |
-| `identity.md` | one you: identities collapsed into tags on contacts, what each tag lets contacts see (presence, photo), the migration |
-| `chat-envelopes.md` | typing, read receipts, reactions, edits, presence, profile photos, doorbell keys, knocks, cards, group invites: the app-to-app envelopes and how they name a message; group links (the plain-text join request) |
+| `identity.md` | one you: identities collapsed into tags on contacts, what each tag lets contacts see (presence, photo), introductions and Ask Before Sharing My Card (the automation rules), the migration |
+| `chat-envelopes.md` | typing, read receipts, reactions, edits, presence, profile photos, doorbell keys, knocks, cards, group invites, introduction notices, sharing preferences: the app-to-app envelopes and how they name a message; group links (the plain-text join request) |
 | `mcp-transport.md` | idfon as an MCP transport binding (implemented) |
 | `idfon-h1.md` | HTTP/1.1 over iroh: serve an existing `axum::Router` with WebSockets, SSE and chunked bodies, `RemoteId` peer identity, client + upgrade handle (slices 1–2 of #142 tested; voxl demo pending) |
 | `idfon-channel.md` | message channels over iroh with no HTTP: WebSocket-shaped send/recv on one ordered bi-stream per channel, channel-name sharding and its isolation test, the measured WS-vs-channel overhead A/B (library; no consumer wired yet) |

@@ -2,7 +2,8 @@
 
 The small messages the apps exchange around a conversation: typing, read
 receipts, reactions, edits, presence, profile photos, doorbell keys, "free to
-talk?" knocks, cards, and group invites. Each one is a whole message by
+talk?" knocks, cards, group invites, introduction notices and sharing
+preferences. Each one is a whole message by
 itself (never mixed with text), sent with `message.send`, or `room.send` in a
 group. They are `IDFON-*/1` text envelopes like the others (`reply-blocks.md`):
 a first line naming the envelope, then `key=value` lines. A client that does not
@@ -241,6 +242,44 @@ members who are not each other's contacts can still be told. Durable.
   scoped to that room (`access.grant` with `conversation`), and is not shown as
   a contact.
 - `kind` is `group`, or `project` when the group has an icon or repository.
+
+### Introduction notice — `IDFON-INTRO/1`
+
+```
+IDFON-INTRO/1
+to=<recipient peer id>
+name=<the recipient's name as the introducer has it>
+```
+
+Sent by the introducer to the person introduced when they share that
+person's card one way (`contact.introduce` without `mutual`, see
+`protocol.md` "Introductions"): "Don shared your card with Bob". A share
+with no known recipient (share sheet, QR, file) leaves both lines out: "Don
+shared your card". A both-ways introduction sends no notice; each side's card
+says it. Durable (outbox).
+
+The receiver shows it as a system line in the chat with the introducer; the
+sender's own chat shows "You shared Stella's card with Bob" from its own
+record. At most 20 notices a day from one introducer are shown; more collapse
+into one line. It is an envelope, so it reaches only someone who has the
+introducer as a contact (envelopes from strangers are refused, not held).
+The daemon does not interpret it. Agents drop it.
+
+### Sharing preference — `IDFON-SHARE/1`
+
+```
+IDFON-SHARE/1
+share=ask
+```
+
+`share=ask` (Ask Before Sharing My Card) or `share=ok`. Sent to every contact
+when it changes and once to new contacts. Durable (outbox). The receiver
+records it with `peer.update { ref, share }` (`Peer.share`). Your card
+carries it too (`share: "ask"` in the contact ticket, absent = ok, set with
+`identity.update { share }`) for people who add you later. It is advisory:
+a sharer's app asks "Stella asked to be asked before her card is shared.
+Share anyway?", and nothing enforces it. The daemon does not interpret the
+envelope. Agents drop it.
 
 ## Group links
 

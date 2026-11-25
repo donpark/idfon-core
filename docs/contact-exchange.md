@@ -35,7 +35,7 @@ app "Share Contact Card"                                      ▼
 
 | Surface | Where |
 |---|---|
-| Codec (fold/escape/base64url) | `crates/idfon-protocol/src/vcf.rs` (tests: `tests/vcf.rs`) |
+| Codec (fold/escape/base64url, the add envelope with `intro`) | `crates/idfon-protocol/src/vcf.rs` (tests: `tests/vcf.rs`) |
 | `contact.export {ref?}` → `{vcard, link}`, `contact.import {text}` → `{peers}` | daemon (`docs/protocol.md` "Contact exchange"); `peer.add` also accepts `contact_ticket` and names the peer from its `label` |
 | CLI `idfon contact export [--peer REF] [--out F]` / `idfon contact import [FILE\|-]` | `crates/idfon-cli` |
 | `idfon://add/<base64url>` verb | `IdfonURL` (both apps); iOS `SceneDelegate`, mac `AppDelegate` |
@@ -71,6 +71,24 @@ envelope carries an `auth` block instead of a capability ticket:
 { "contact": …, "auth": { "kind": "code", "label": "Admission code",
   "criteria": "…", "url": "http://<host>:<port>/redeem", "code": "AB12CD" } }
 ```
+
+An **introduction** (someone shared a contact's card with you, signed by
+them; `protocol.md` "Introductions") rides in the same envelope as `intro`,
+the token object:
+
+```json
+{ "contact": …, "intro": { "v": 1, "introducer": "<peer id>", "introducer_name": "Don",
+  "subject": "<card owner's peer id>", "recipient": "<peer id>" | null,
+  "issued": 1795575000, "note": "…", "sig": "<hex>" } }
+```
+
+`contact.introduce` builds this link (and a vCard whose `URL` is the link and
+whose `X-IDFON-TICKET` is the card). The modal asks the daemon what it means
+with `contact.inspect { link }` and shows "Introduced by Don" (a check mark
+when `intro.valid` and `intro.introducer_is_contact`) and the note; adding
+passes it on as `peer.add { contact_ticket, intro }`. An `intro` that is not
+valid is ignored and the contact is still added. The card itself may carry
+`share: "ask"` (its owner asked to be asked before it is shared).
 
 The modal shows the agent's `criteria`, and the admission code — a per-load,
 one-shot nonce embedded in the QR and the tap link, so the link is safe to

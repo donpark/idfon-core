@@ -14,6 +14,7 @@ fn ticket() -> ContactTicket {
         label: Some("Ada; Lovelace, Jr\nEsq".into()),
         device_class: Some("phone".into()),
         capabilities: vec!["chat".into(), "live_audio".into()],
+        share: None,
     }
 }
 
@@ -115,4 +116,68 @@ fn url_only_card_still_takes_the_name_from_fn() {
 fn garbage_in_the_url_slot_is_skipped() {
     let text = "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Bad\r\nURL:idfon://add/not-base64!!\r\nEND:VCARD\r\n";
     assert!(vcard_contact_tickets(text).is_err());
+}
+
+fn intro() -> idfon_protocol::Introduction {
+    idfon_protocol::Introduction {
+        v: 1,
+        introducer: "a".repeat(64),
+        introducer_name: "Don".into(),
+        subject: "account-1".into(),
+        recipient: None,
+        issued: 1_795_575_000,
+        mutual: false,
+        note: Some("Stella does our taxes".into()),
+        sig: "0".repeat(128),
+    }
+}
+
+fn add_link_value() -> idfon_protocol::AddLink {
+    idfon_protocol::AddLink { contact: ticket(), intro: Some(intro()) }
+}
+
+#[test]
+fn the_add_link_is_the_contact_and_intro_envelope_in_base64url() {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    let link = idfon_protocol::vcf::add_link(&add_link_value());
+    let payload = link.strip_prefix("idfon://add/").expect("idfon://add/ link");
+    let json: serde_json::Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).unwrap()).unwrap();
+    assert_eq!(json["contact"], serde_json::to_value(ticket()).unwrap());
+    assert_eq!(json["intro"], serde_json::to_value(intro()).unwrap());
+    assert_eq!(json.as_object().unwrap().len(), 2);
+    // Parses back; the bare-ticket readers take the card out of it.
+    assert_eq!(idfon_protocol::vcf::add_link_from_str(&link).unwrap(), add_link_value());
+    assert_eq!(idfon_protocol::vcf::contact_ticket_from_link(&link).unwrap(), ticket());
+    // A bare card link (contact.export) has no intro.
+    let bare = idfon_protocol::vcf::contact_ticket_link(&ticket());
+    assert_eq!(idfon_protocol::vcf::add_link_from_str(&bare).unwrap().intro, None);
+    // An intro that is not a token is dropped; the card still adds.
+    let junk = format!(
+        "idfon://add/{}",
+        URL_SAFE_NO_PAD.encode(serde_json::json!({"contact": ticket(), "intro": 7}).to_string())
+    );
+    assert_eq!(idfon_protocol::vcf::add_link_from_str(&junk).unwrap().intro, None);
+}
+
+#[test]
+fn an_intro_vcard_carries_the_card_and_the_full_link() {
+    let card = idfon_protocol::vcf::add_link_vcard(&add_link_value());
+    let unfolded = card.replace("\r\n ", "");
+    assert!(unfolded.contains(&format!("URL:{}", idfon_protocol::vcf::add_link(&add_link_value()))));
+    let links = idfon_protocol::vcf::vcard_add_links(&card).unwrap();
+    assert_eq!(links, vec![add_link_value()]);
+    // Through Contacts (X- property stripped): the URL alone gives both.
+    let stripped = contacts_strips_x_property(&card);
+    assert!(!stripped.contains("X-IDFON-TICKET"));
+    assert_eq!(idfon_protocol::vcf::vcard_add_links(&stripped).unwrap(), vec![add_link_value()]);
+    assert_eq!(vcard_contact_tickets(&stripped).unwrap(), vec![ticket()]);
+}
+
+#[test]
+fn the_card_carries_share_ask_and_leaves_ok_out() {
+    let mut card = ticket();
+    assert!(!serde_json::to_string(&card).unwrap().contains("share"));
+    card.share = Some("ask".into());
+    assert!(serde_json::to_string(&card).unwrap().contains(r#""share":"ask""#));
+    assert_eq!(vcard_contact_tickets(&contact_ticket_vcard(&card)).unwrap(), vec![card]);
 }

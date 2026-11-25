@@ -2,7 +2,10 @@
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use getrandom::{rand_core::UnwrapErr, SysRng};
-use idfon_protocol::{Capability, MessageContent, MessageEnvelope, PeerAuth, VoiceRoute};
+use idfon_protocol::intro::IntroError;
+use idfon_protocol::{
+    Capability, Introduction, MessageContent, MessageEnvelope, PeerAuth, VoiceRoute,
+};
 use rcan::{Capability as RcanCapability, Delegation, Expires};
 use serde::Serialize;
 use thiserror::Error;
@@ -192,6 +195,7 @@ pub fn sign_message_with_ticket(
         trace: None,
         telemetry: None,
         context: None,
+        introduction: None,
     };
     let signature = key.sign(&auth_bytes(&unsigned)?);
     Ok(MessageEnvelope {
@@ -636,6 +640,51 @@ pub fn verify_message(message: &MessageEnvelope) -> Result<(), AuthError> {
         .map_err(|_| AuthError::VerificationFailed)
 }
 
+/// Signs an introduction: `key`'s identity introduces `subject` (a peer id)
+/// to `recipient` (a peer id, or `None` when the recipient is unknown). An
+/// empty note counts as none. Fails on a note over
+/// [`idfon_protocol::intro::MAX_INTRO_NOTE_CHARS`] characters.
+pub fn sign_introduction(
+    key: &IdentityKey,
+    introducer_name: impl Into<String>,
+    subject: impl Into<String>,
+    recipient: Option<String>,
+    issued: u64,
+    mutual: bool,
+    note: Option<String>,
+) -> Result<Introduction, IntroError> {
+    let mut intro = Introduction {
+        v: idfon_protocol::intro::INTRO_VERSION,
+        introducer: key.peer_id(),
+        introducer_name: introducer_name.into(),
+        subject: subject.into(),
+        recipient,
+        issued,
+        mutual,
+        note: note.filter(|note| !note.is_empty()),
+        sig: String::new(),
+    };
+    intro.check_shape(issued)?;
+    intro.sig = encode_hex(&key.sign(&intro.signing_bytes()).to_bytes());
+    Ok(intro)
+}
+
+/// Verifies an introduction's shape ([`Introduction::check_shape`] at `now`,
+/// epoch seconds) and its signature by `introducer`. Says nothing about
+/// whether the token is meant for you: callers check `subject` and
+/// `recipient`.
+pub fn verify_introduction(intro: &Introduction, now: u64) -> Result<(), IntroError> {
+    intro.check_shape(now)?;
+    let public = decode_fixed::<32>(&intro.introducer).ok_or(IntroError::Introducer)?;
+    let verifying_key = VerifyingKey::from_bytes(&public).map_err(|_| IntroError::Introducer)?;
+    let signature = decode_fixed::<64>(&intro.sig)
+        .map(|bytes| Signature::from_bytes(&bytes))
+        .ok_or(IntroError::SignatureEncoding)?;
+    verifying_key
+        .verify(&intro.signing_bytes(), &signature)
+        .map_err(|_| IntroError::Signature)
+}
+
 #[derive(Serialize)]
 struct AuthPayload<'a> {
     message_id: &'a str,
@@ -1033,5 +1082,188 @@ mod tests {
         assert!(verify_message(&message).is_ok());
         assert_eq!(new_traceparent().len(), 55);
         assert_ne!(new_traceparent(), new_traceparent());
+    }
+
+    /// Introductions (docs/protocol.md "Introductions"): the token signs
+    /// `idfon-intro/1\n` + its fields in order, and verifies only untouched.
+    mod introductions {
+        use super::*;
+        use idfon_protocol::intro::{MAX_INTRO_FUTURE_SECS, MAX_INTRO_NOTE_CHARS};
+
+        const NOW: u64 = 1_795_575_000;
+
+        fn sample(key: &IdentityKey, recipient: Option<String>) -> Introduction {
+            sign_introduction(
+                key,
+                "Don",
+                IdentityKey::from_bytes([2; 32]).peer_id(),
+                recipient,
+                NOW,
+                true,
+                Some("Stella does our taxes".into()),
+            )
+            .unwrap()
+        }
+
+        #[test]
+        fn round_trips_through_json_and_verifies() {
+            let key = IdentityKey::generate();
+            let bob = IdentityKey::generate().peer_id();
+            let intro = sample(&key, Some(bob.clone()));
+            assert_eq!(intro.introducer, key.peer_id());
+            assert_eq!(intro.sig.len(), 128);
+            let parsed = Introduction::from_json(&intro.to_json()).unwrap();
+            assert_eq!(parsed, intro);
+            assert_eq!(verify_introduction(&parsed, NOW), Ok(()));
+            // Also when handed over as a JSON object (RPC params).
+            let value = serde_json::to_value(&intro).unwrap();
+            assert_eq!(Introduction::from_value(&value).unwrap(), intro);
+            assert_eq!(
+                Introduction::from_value(&serde_json::Value::String(intro.to_json())).unwrap(),
+                intro
+            );
+        }
+
+        #[test]
+        fn canonical_bytes_are_the_domain_and_fields_in_order() {
+            let key = IdentityKey::from_bytes([1; 32]);
+            let subject = IdentityKey::from_bytes([2; 32]).peer_id();
+            let intro = sample(&key, None);
+            let expected = format!(
+                "idfon-intro/1\n{{\"v\":1,\"introducer\":\"{}\",\"introducer_name\":\"Don\",\"subject\":\"{subject}\",\"recipient\":null,\"issued\":{NOW},\"mutual\":true,\"note\":\"Stella does our taxes\"}}",
+                key.peer_id()
+            );
+            assert_eq!(String::from_utf8(intro.signing_bytes()).unwrap(), expected);
+            // The token is the same fields plus `sig`, in the same order.
+            let json = intro.to_json();
+            assert!(json.starts_with(&expected["idfon-intro/1\n".len()..expected.len() - 1]));
+            assert!(json.ends_with(&format!(",\"sig\":\"{}\"}}", intro.sig)));
+            // `mutual` (false) and `note` (none) are left out when absent;
+            // `recipient` is always written.
+            let plain = sign_introduction(&key, "Don", subject.clone(), None, NOW, false, Some(String::new())).unwrap();
+            assert_eq!(
+                String::from_utf8(plain.signing_bytes()).unwrap(),
+                format!(
+                    "idfon-intro/1\n{{\"v\":1,\"introducer\":\"{}\",\"introducer_name\":\"Don\",\"subject\":\"{subject}\",\"recipient\":null,\"issued\":{NOW}}}",
+                    key.peer_id()
+                )
+            );
+            assert_eq!(plain.note, None);
+            assert_eq!(verify_introduction(&plain, NOW), Ok(()));
+        }
+
+        #[test]
+        fn a_different_key_does_not_verify() {
+            let key = IdentityKey::generate();
+            let mut intro = sample(&key, None);
+            intro.introducer = IdentityKey::generate().peer_id();
+            assert_eq!(verify_introduction(&intro, NOW), Err(IntroError::Signature));
+            intro.introducer = "not-hex".into();
+            assert_eq!(verify_introduction(&intro, NOW), Err(IntroError::Introducer));
+            let mut intro = sample(&key, None);
+            intro.sig = "zz".into();
+            assert_eq!(verify_introduction(&intro, NOW), Err(IntroError::SignatureEncoding));
+        }
+
+        #[test]
+        fn any_tampered_field_breaks_the_signature() {
+            let key = IdentityKey::generate();
+            let bob = IdentityKey::generate().peer_id();
+            let intro = sample(&key, Some(bob));
+            let tampered: [fn(&mut Introduction); 7] = [
+                |i| i.introducer_name = "Mallory".into(),
+                |i| i.subject = IdentityKey::generate().peer_id(),
+                |i| i.recipient = Some(IdentityKey::generate().peer_id()),
+                |i| i.issued -= 1,
+                |i| i.mutual = false,
+                |i| i.note = Some("Stella does our books".into()),
+                |i| i.note = None,
+            ];
+            for (index, tamper) in tampered.iter().enumerate() {
+                let mut copy = intro.clone();
+                tamper(&mut copy);
+                assert_eq!(verify_introduction(&copy, NOW), Err(IntroError::Signature), "field {index}");
+            }
+        }
+
+        #[test]
+        fn issued_more_than_five_minutes_ahead_is_invalid() {
+            let key = IdentityKey::generate();
+            let subject = IdentityKey::generate().peer_id();
+            let at = |issued| sign_introduction(&key, "Don", subject.clone(), None, issued, false, None).unwrap();
+            assert_eq!(verify_introduction(&at(NOW + MAX_INTRO_FUTURE_SECS), NOW), Ok(()), "skew allowed");
+            assert_eq!(verify_introduction(&at(NOW + MAX_INTRO_FUTURE_SECS + 1), NOW), Err(IntroError::Future));
+            // No expiry: an old introduction is still context.
+            assert_eq!(verify_introduction(&at(1), NOW), Ok(()));
+        }
+
+        #[test]
+        fn a_note_over_280_characters_is_invalid() {
+            let key = IdentityKey::generate();
+            let subject = IdentityKey::generate().peer_id();
+            // Characters, not bytes: 280 multi-byte characters are fine.
+            let longest = "é".repeat(MAX_INTRO_NOTE_CHARS);
+            let ok = sign_introduction(&key, "Don", subject.clone(), None, NOW, false, Some(longest.clone())).unwrap();
+            assert_eq!(verify_introduction(&ok, NOW), Ok(()));
+            let too_long = format!("{longest}x");
+            assert_eq!(
+                sign_introduction(&key, "Don", subject.clone(), None, NOW, false, Some(too_long.clone())),
+                Err(IntroError::NoteTooLong)
+            );
+            // A token someone else built with a long note (validly signed) is
+            // still rejected.
+            let mut forged = ok.clone();
+            forged.note = Some(too_long);
+            forged.sig = encode_hex(&key.sign(&forged.signing_bytes()).to_bytes());
+            assert_eq!(verify_introduction(&forged, NOW), Err(IntroError::NoteTooLong));
+        }
+
+        #[test]
+        fn recipient_null_and_bound_are_distinct_signed_forms() {
+            let key = IdentityKey::generate();
+            let bob = IdentityKey::generate().peer_id();
+            let open = sample(&key, None);
+            let bound = sample(&key, Some(bob.clone()));
+            assert!(open.to_json().contains("\"recipient\":null"));
+            assert!(bound.to_json().contains(&format!("\"recipient\":\"{bob}\"")));
+            assert_eq!(verify_introduction(&open, NOW), Ok(()));
+            assert_eq!(verify_introduction(&bound, NOW), Ok(()));
+            // Unbinding a bound token (or binding an open one) is tampering.
+            let mut unbound = bound.clone();
+            unbound.recipient = None;
+            assert_eq!(verify_introduction(&unbound, NOW), Err(IntroError::Signature));
+            let mut rebound = open.clone();
+            rebound.recipient = Some(bob);
+            assert_eq!(verify_introduction(&rebound, NOW), Err(IntroError::Signature));
+            // A token with `recipient` missing entirely still parses as unbound.
+            let mut value = serde_json::to_value(&open).unwrap();
+            value.as_object_mut().unwrap().remove("recipient");
+            let parsed = Introduction::from_value(&value).unwrap();
+            assert_eq!(parsed.recipient, None);
+            assert_eq!(verify_introduction(&parsed, NOW), Ok(()));
+        }
+
+        #[test]
+        fn the_envelope_field_is_outside_the_message_signature() {
+            let key = IdentityKey::generate();
+            let mut message = sign_message(
+                &key,
+                "endpoint",
+                "msg-1",
+                MessageContent::Text { text: "hi".into() },
+                "k-1",
+                None,
+            )
+            .unwrap();
+            message.introduction = Some(sample(&IdentityKey::generate(), None).to_json());
+            assert!(verify_message(&message).is_ok());
+            // Older receivers' JSON (no field) and newer JSON both parse.
+            let json = serde_json::to_value(&message).unwrap();
+            assert!(json["introduction"].is_string());
+            let mut old = json.clone();
+            old.as_object_mut().unwrap().remove("introduction");
+            let parsed: MessageEnvelope = serde_json::from_value(old).unwrap();
+            assert_eq!(parsed.introduction, None);
+        }
     }
 }
