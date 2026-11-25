@@ -84,7 +84,7 @@ pub fn peer_param_key(method: &str) -> Option<&'static str> {
     Some(match method {
         "peer.add" | "peer.update" | "peer.remove" | "peer.resolve" | "peer.show"
         | "peer.status" | "peer.device.add" | "peer.device.update" | "peer.device.remove"
-        | "web.url" => "ref",
+        | "web.url" | "contact.introduce" => "ref",
         "message.send" | "mcp.listen" | "live.dial" => "to",
         "access.check" | "access.grant" | "access.revoke" | "access.ticket" => "subject",
         "live.answer" => "from",
@@ -143,6 +143,13 @@ methods! {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub identity: Option<String>,
         pub name: String,
+    }
+    "identity.update" => IdentityUpdate {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub identity: Option<String>,
+        /// Ask before sharing my card: `"ask"` or `"ok"`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub share: Option<String>,
     }
 
     // Tags and what contacts can see (docs/identity.md)
@@ -213,6 +220,9 @@ methods! {
         pub add_tag: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub remove_tag: Option<String>,
+        /// The contact's sharing preference (`IDFON-SHARE/1`): `"ask"` or `"ok"`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub share: Option<String>,
     }
     "peer.remove" => PeerRemove {
         #[serde(rename = "ref", alias = "peer")]
@@ -264,6 +274,21 @@ methods! {
 
     // Contact cards
     "contact.ticket" => ContactTicket {}
+    // Introductions (docs/protocol.md "Introductions").
+    "contact.introduce" => ContactIntroduce {
+        /// The contact whose card is shared.
+        #[serde(rename = "ref", alias = "peer")]
+        pub peer: String,
+        /// Bind the token to this person (a contact, or a peer id).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub to: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub note: Option<String>,
+        /// Both-ways introduction.
+        #[serde(default, skip_serializing_if = "is_false")]
+        pub mutual: bool,
+    }
+    "contact.inspect" => ContactInspect { pub link: String }
 
     // Contact requests: held messages from senders who aren't peers
     // (docs/protocol.md "Contact requests").

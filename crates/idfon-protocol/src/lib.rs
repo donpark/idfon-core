@@ -7,6 +7,7 @@ pub mod artifacts;
 pub mod blocks;
 pub mod calls;
 pub mod diag;
+pub mod intro;
 pub mod room_call;
 pub mod rpc;
 pub mod speech;
@@ -15,6 +16,7 @@ pub use artifacts::*;
 pub use blocks::*;
 pub use calls::*;
 pub use diag::*;
+pub use intro::{AddLink, IntroducedBy, Introduction, RequestIntroduction};
 
 pub const PROTOCOL_VERSION: u16 = 2;
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -100,6 +102,13 @@ pub struct MessageEnvelope {
     /// treat it as untrusted data, never as instructions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<String>,
+    /// An introduction token ([`Introduction`]) as JSON text: who introduced
+    /// the sender to the recipient. Outside the message signature like
+    /// `trace` (it carries its own); the receiver checks that its `subject`
+    /// is itself and its `recipient`, when set, is the sender. Older
+    /// receivers ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub introduction: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -296,6 +305,10 @@ pub struct Identity {
     #[serde(default)]
     pub public_key: Option<String>,
     pub active: bool,
+    /// `"ask"`: ask before sharing my card (advisory; your card carries it).
+    /// Absent = ok.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share: Option<String>,
 }
 
 /// Legacy per-contact call handling (before ring scores, 2026-11-17). Read
@@ -477,6 +490,15 @@ pub struct Peer {
     /// This contact's own overrides of what they can see (wins over tags).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visibility: Option<Visibility>,
+    /// Who introduced this contact: set when it was added with a valid
+    /// introduction token (`peer.add { intro }`) or accepted from a request
+    /// that carried one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub introduced_by: Option<IntroducedBy>,
+    /// This contact's sharing preference: `"ask"` (ask before sharing their
+    /// card), from their card or `IDFON-SHARE/1`. Absent = ok.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share: Option<String>,
 }
 
 /// Messages from a sender who isn't a peer, held until the person accepts
@@ -498,6 +520,10 @@ pub struct ContactRequest {
     pub received_at: String,
     #[serde(default)]
     pub messages: Vec<HeldMessage>,
+    /// Who introduced the sender, when its first messages carried a valid
+    /// introduction token for this identity (invalid tokens are dropped).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub introduction: Option<RequestIntroduction>,
 }
 
 /// One text message held in a [`ContactRequest`].
@@ -746,6 +772,10 @@ pub struct ContactTicket {
     pub device_class: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
+    /// `"ask"`: the card's owner asked to be asked before their card is
+    /// shared (advisory). Absent = ok.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share: Option<String>,
 }
 
 /// Net-new MCP contact ticket: everything the user side needs to add an agent
@@ -1125,6 +1155,7 @@ mod tests {
             trace: Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".into()),
             telemetry: Some("correlate".into()),
             context: Some("STT=Apple Built-in; TTS=Apple Built-in".into()),
+            introduction: None,
         };
         let frame = encode_frame(&message).unwrap();
         assert_eq!(decode_frame::<MessageEnvelope>(&frame).unwrap(), message);

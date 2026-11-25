@@ -10,11 +10,14 @@
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 
-use crate::ContactTicket;
+use crate::{AddLink, ContactTicket, Introduction};
 
 /// Deep-link shape for the tap-through ticket; must match the iOS/macOS
 /// `idfon://` handler (docs/idfon-gateway.md).
 const TICKET_URL_PREFIX: &str = "idfon://add/";
+/// The universal-link form of the same link (`https://idfon.net/go/<rest>`
+/// opens as `idfon://<rest>` in both apps).
+const UNIVERSAL_URL_PREFIX: &str = "https://idfon.net/go/add/";
 
 /// Escapes a vCard text value (RFC 6350 §3.4). `\r` is dropped: values hold
 /// `\n` line breaks only.
@@ -81,33 +84,78 @@ pub fn contact_ticket_link(ticket: &ContactTicket) -> String {
     link_for_json(&serde_json::to_string(ticket).expect("contact ticket serializes"))
 }
 
-/// Parses an `idfon://add/<base64url>` deep link back into its ticket.
+/// The add link for a card with an introduction: the envelope
+/// `{"contact": <card>, "intro": <token>}`, base64url, as
+/// `idfon://add/<base64url>` (docs/contact-exchange.md).
+pub fn add_link(link: &AddLink) -> String {
+    link_for_json(&serde_json::to_string(link).expect("add link serializes"))
+}
+
+/// Parses an `idfon://add/<base64url>` deep link back into its ticket. The
+/// payload may be the bare ticket or an add envelope (`{ "contact": … }`).
 pub fn contact_ticket_from_link(link: &str) -> Result<ContactTicket, String> {
+    add_link_from_str(link).map(|link| link.contact)
+}
+
+/// Parses an add link (`idfon://add/<base64url>` or its universal form
+/// `https://idfon.net/go/add/<base64url>`): a bare contact ticket, or an
+/// envelope whose `contact` is the ticket and whose optional `intro` is an
+/// introduction token. An `intro` that does not parse is dropped (it is
+/// context, never needed to add the contact); validity is checked by the
+/// daemon.
+pub fn add_link_from_str(link: &str) -> Result<AddLink, String> {
+    let link = link.trim();
     let encoded = link
-        .trim()
         .strip_prefix(TICKET_URL_PREFIX)
+        .or_else(|| link.strip_prefix(UNIVERSAL_URL_PREFIX))
         .ok_or_else(|| format!("expected {TICKET_URL_PREFIX}<base64url>"))?;
     let bytes = URL_SAFE_NO_PAD
         .decode(encoded)
         .map_err(|error| format!("invalid link encoding: {error}"))?;
-    serde_json::from_slice(&bytes).map_err(|error| format!("invalid contact ticket: {error}"))
+    add_link_from_json(&bytes)
+}
+
+fn add_link_from_json(bytes: &[u8]) -> Result<AddLink, String> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|error| format!("invalid contact ticket: {error}"))?;
+    let (contact, intro) = match value.get("contact") {
+        Some(contact) => (contact.clone(), value.get("intro").cloned()),
+        None => (value, None),
+    };
+    let contact = serde_json::from_value(contact)
+        .map_err(|error| format!("invalid contact ticket: {error}"))?;
+    let intro = intro
+        .filter(|intro| !intro.is_null())
+        .and_then(|intro| Introduction::from_value(&intro).ok());
+    Ok(AddLink { contact, intro })
 }
 
 /// Wraps a contact ticket in a vCard 3.0 card (CRLF line endings).
 pub fn contact_ticket_vcard(ticket: &ContactTicket) -> String {
+    let json = serde_json::to_string(ticket).expect("contact ticket serializes");
+    vcard_with_url(ticket, &json, &link_for_json(&json))
+}
+
+/// A vCard for an add link with an introduction: `X-IDFON-TICKET` is the
+/// card, `URL` is the full add link (card + intro).
+pub fn add_link_vcard(link: &AddLink) -> String {
+    let json = serde_json::to_string(&link.contact).expect("contact ticket serializes");
+    vcard_with_url(&link.contact, &json, &add_link(link))
+}
+
+fn vcard_with_url(ticket: &ContactTicket, json: &str, url: &str) -> String {
     let name = ticket
         .label
         .as_deref()
         .filter(|name| !name.is_empty())
         .unwrap_or(&ticket.account_id);
-    let json = serde_json::to_string(ticket).expect("contact ticket serializes");
-    let url = link_for_json(&json);
+    let url = url.to_string();
     let mut out = String::from("BEGIN:VCARD\r\nVERSION:3.0\r\n");
     for (key, value) in [
         ("FN", escape(name)),
         ("N", format!(";{};;;", escape(name))),
         ("URL", url),
-        ("X-IDFON-TICKET", escape(&json)),
+        ("X-IDFON-TICKET", escape(json)),
     ] {
         out.push_str(&fold(&format!("{key}:{value}")));
         out.push_str("\r\n");
@@ -120,23 +168,37 @@ pub fn contact_ticket_vcard(ticket: &ContactTicket) -> String {
 /// (the name the sharer chose) becomes the ticket label. Errors only when no
 /// card carries a ticket.
 pub fn vcard_contact_tickets(text: &str) -> Result<Vec<ContactTicket>, String> {
-    let mut tickets = Vec::new();
+    vcard_add_links(text).map(|links| links.into_iter().map(|link| link.contact).collect())
+}
+
+/// Like [`vcard_contact_tickets`], with each card's introduction (from the
+/// `URL` add link) when it carries one.
+pub fn vcard_add_links(text: &str) -> Result<Vec<AddLink>, String> {
+    let mut links = Vec::new();
     for lines in cards(text) {
-        let Some(json) = ticket_json(&lines) else {
-            continue;
+        let from_url = url_json(&lines).and_then(|json| add_link_from_json(json.as_bytes()).ok());
+        let mut link = match property(&lines, "X-IDFON-TICKET") {
+            Some(json) => AddLink {
+                contact: serde_json::from_str(&unescape(&json))
+                    .map_err(|error| format!("invalid X-IDFON-TICKET: {error}"))?,
+                intro: from_url.and_then(|link| link.intro),
+            },
+            None => match url_json(&lines) {
+                Some(json) => add_link_from_json(json.as_bytes())
+                    .map_err(|error| format!("invalid X-IDFON-TICKET: {error}"))?,
+                None => continue,
+            },
         };
-        let mut ticket: ContactTicket = serde_json::from_str(&json)
-            .map_err(|error| format!("invalid X-IDFON-TICKET: {error}"))?;
-        ticket.label = property(&lines, "FN")
+        link.contact.label = property(&lines, "FN")
             .map(|value| unescape(&value))
             .filter(|name| !name.is_empty())
-            .or(ticket.label);
-        tickets.push(ticket);
+            .or(link.contact.label);
+        links.push(link);
     }
-    if tickets.is_empty() {
+    if links.is_empty() {
         return Err("no X-IDFON-TICKET in vcard".into());
     }
-    Ok(tickets)
+    Ok(links)
 }
 
 /// Unfolds physical lines and groups them into BEGIN:VCARD…END:VCARD blocks.
@@ -165,14 +227,12 @@ fn cards(text: &str) -> Vec<Vec<String>> {
     blocks
 }
 
-/// Ticket JSON from `X-IDFON-TICKET`, or from the `idfon://add/<base64url>`
-/// URL when the card went through the Contacts app (unknown X- properties may
-/// be stripped there; standard `URL` fields survive). The URL prefix is
-/// matched exactly: we only ever hand-emit lowercase scheme/verb.
-fn ticket_json(lines: &[String]) -> Option<String> {
-    if let Some(json) = property(lines, "X-IDFON-TICKET") {
-        return Some(unescape(&json));
-    }
+/// The JSON in the `idfon://add/<base64url>` URL: the ticket, or an add
+/// envelope. Used when the card went through the Contacts app (unknown X-
+/// properties may be stripped there; standard `URL` fields survive), and for
+/// the introduction beside the card. The URL prefix is matched exactly: we
+/// only ever hand-emit lowercase scheme/verb.
+fn url_json(lines: &[String]) -> Option<String> {
     let encoded = property(lines, "URL")?.strip_prefix(TICKET_URL_PREFIX)?.to_string();
     let bytes = URL_SAFE_NO_PAD.decode(unescape(&encoded)).ok()?;
     String::from_utf8(bytes).ok()

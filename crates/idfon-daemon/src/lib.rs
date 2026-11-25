@@ -11,6 +11,7 @@ use std::{
 
 mod blob;
 mod diag_views;
+mod introductions;
 mod live;
 mod mcp;
 mod relay_auth;
@@ -327,6 +328,10 @@ struct Store {
     /// request while they aren't peers.
     #[serde(default)]
     blocked_senders: Vec<BlockedSender>,
+    /// Introduction tokens attached to messages to a contact until a message
+    /// from them arrives (docs/protocol.md "Introductions").
+    #[serde(default)]
+    pending_introductions: Vec<introductions::PendingIntroduction>,
     /// Endpoint ids this daemon admitted at the relay's auth service
     /// (`relay_auth`); revocation is the set difference against live
     /// peers/identities (idfon-edge/docs/relay-auth.md §6).
@@ -435,6 +440,7 @@ impl Store {
                         endpoint_id: None,
                         public_key: None,
                         active: true,
+                        share: None,
                     }],
                     peers: Vec::new(),
                     operations: Vec::new(),
@@ -446,6 +452,7 @@ impl Store {
                     revoked_tickets: Vec::new(),
                     contact_requests: Vec::new(),
                     blocked_senders: Vec::new(),
+                    pending_introductions: Vec::new(),
                     relay_admitted: Vec::new(),
                     mcp_discovery: Vec::new(),
                     mcp_command: None,
@@ -1673,6 +1680,23 @@ fn contact_ticket_value(
         label: Some(identity.name.clone()),
         device_class: None,
         capabilities: vec!["chat".into(), "live_audio".into(), "live_video".into()],
+        share: identity.share.clone(),
+    })
+}
+
+/// A saved peer's bare card (what `contact.export {ref}` and
+/// `contact.introduce` share): id, address, name and the peer's sharing
+/// preference; never capabilities. `None` without a dial address.
+fn peer_card(peer: &idfon_protocol::Peer) -> Option<idfon_protocol::ContactTicket> {
+    Some(idfon_protocol::ContactTicket {
+        version: 1,
+        account_id: peer.id.clone(),
+        endpoint_id: peer.endpoint_id.clone()?,
+        endpoint_addr: peer.endpoint_addr.clone()?,
+        label: Some(peer.name.clone()),
+        device_class: None,
+        capabilities: vec![],
+        share: peer.share.clone(),
     })
 }
 
@@ -1719,11 +1743,7 @@ fn contact_export(
                     || peer.aliases.iter().any(|alias| *alias == reference)
                     || peer.knows_endpoint(&reference)
             });
-            let (Some(peer), Some(endpoint_id), Some(endpoint_addr)) = (
-                peer,
-                peer.and_then(|peer| peer.endpoint_id.clone()),
-                peer.and_then(|peer| peer.endpoint_addr.clone()),
-            ) else {
+            let Some(card) = peer.and_then(peer_card) else {
                 return error_response(
                     request.id.clone(),
                     &request.method,
@@ -1732,15 +1752,7 @@ fn contact_export(
                     false,
                 );
             };
-            idfon_protocol::ContactTicket {
-                version: 1,
-                account_id: peer.id.clone(),
-                endpoint_id,
-                endpoint_addr,
-                label: Some(peer.name.clone()),
-                device_class: None,
-                capabilities: vec![],
-            }
+            card
         }
     };
     drop(state);
@@ -1771,8 +1783,8 @@ fn contact_import(
             false,
         );
     };
-    let tickets = match idfon_protocol::vcf::vcard_contact_tickets(&text) {
-        Ok(tickets) => tickets,
+    let links = match idfon_protocol::vcf::vcard_add_links(&text) {
+        Ok(links) => links,
         Err(message) => {
             return error_response(
                 request.id.clone(),
@@ -1784,8 +1796,11 @@ fn contact_import(
         }
     };
     let mut peers = Vec::new();
-    for ticket in tickets {
-        let mut params = serde_json::json!({"contact_ticket": ticket});
+    for link in links {
+        let mut params = serde_json::json!({"contact_ticket": link.contact});
+        if let Some(intro) = link.intro {
+            params["intro"] = serde_json::to_value(intro).expect("introduction serializes");
+        }
         if let Some(identity) = request_text(&request.params, "identity") {
             params["identity"] = identity.into();
         }
@@ -2737,6 +2752,8 @@ fn dispatch_with_transport(
         "contact.ticket" => contact_ticket(&request, store, transport),
         "contact.export" => contact_export(&request, store, transport),
         "contact.import" => contact_import(&request, store, transport),
+        "contact.introduce" => introductions::contact_introduce(&request, store),
+        "contact.inspect" => introductions::contact_inspect(&request, store),
         "request.list" => request_list(&request, store),
         "request.accept" => request_accept(&request, store),
         "request.decline" => request_decline(&request, store),
@@ -2884,6 +2901,7 @@ fn dispatch_with_transport(
             false,
         ),
         "identity.rename" => identity_rename(&request, store),
+        "identity.update" => introductions::identity_update(&request, store),
         "identity.delete" => error_response(
             request.id.clone(),
             &request.method,
@@ -4059,6 +4077,9 @@ fn send_message(
     envelope.context = request_text(&request.params, "context")
         .filter(|value| !value.is_empty())
         .map(|value| value.chars().take(MAX_CONTEXT_CHARS).collect());
+    // Added with an introduction and nothing heard from them yet: tell them
+    // who introduced us (docs/protocol.md "Introductions").
+    envelope.introduction = introductions::pending_token(&state, &identity.id, &peer.id);
     let timestamp = now();
     let operation = idfon_protocol::Operation {
         identity: identity.id.clone(),
@@ -4439,6 +4460,14 @@ fn receive_message(request: &Request, store: &Arc<Mutex<Store>>) -> Response {
         "message receive accepted"
     );
     let mut state = store.lock().expect("store mutex poisoned");
+    // A message from them: they know who we are, so stop attaching the
+    // introduction (persisted now, since a duplicate returns early).
+    if introductions::clear_pending(&mut state, &receiving_identity, &envelope.sender.peer_id) {
+        let data_dir = state.data_dir.clone();
+        if let Err(error) = state.save(&data_dir) {
+            tracing::warn!(target: "idfon.daemon", error = %error, "could not persist the cleared introduction");
+        }
+    }
     // Receiving an authorized message establishes the reciprocal reply path.
     // Do not resurrect a grant that was explicitly revoked or expired.
     if !state.grants.iter().any(|grant| {
@@ -4706,6 +4735,13 @@ fn hold_contact_request(
     if text.len() > MAX_REQUEST_TEXT_BYTES {
         return refuse("message is too long for a contact request");
     }
+    // Who introduced them, when the message carries a token valid for this
+    // identity and this sender; anything else is dropped silently. It never
+    // accepts anything (docs/protocol.md "Introductions").
+    let introduction = envelope
+        .introduction
+        .as_deref()
+        .and_then(|token| introductions::request_introduction(&state, identity, sender, token));
     let position = state
         .contact_requests
         .iter()
@@ -4762,6 +4798,7 @@ fn hold_contact_request(
                 endpoint_addr: None,
                 received_at: received_at.clone(),
                 messages: Vec::new(),
+                introduction: None,
             });
             request_id
         }
@@ -4790,20 +4827,28 @@ fn hold_contact_request(
         idempotency_key: envelope.idempotency_key.clone(),
         received_at,
     });
+    // The first valid introduction is kept.
+    if held.introduction.is_none() {
+        held.introduction = introduction;
+    }
     let endpoint_id = held.endpoint_id.clone();
+    let mut data = serde_json::json!({
+        "request_id": request_id,
+        "peer_id": sender,
+        "endpoint_id": endpoint_id,
+        "conversation": envelope.conversation,
+        "text": text,
+        "idempotency_key": envelope.idempotency_key,
+    });
+    if let Some(introduction) = &held.introduction {
+        data["introduction"] = serde_json::to_value(introduction).expect("introduction serializes");
+    }
     push_event(
         &mut state,
         identity,
         format!("evt_req_{}", envelope.message_id),
         "contact.request",
-        serde_json::json!({
-            "request_id": request_id,
-            "peer_id": sender,
-            "endpoint_id": endpoint_id,
-            "conversation": envelope.conversation,
-            "text": text,
-            "idempotency_key": envelope.idempotency_key,
-        }),
+        data,
     );
     tracing::info!(target: "idfon.daemon", identity = %identity, message_id = %envelope.message_id, sender = %sender, request_id = %request_id, "message held as contact request");
     let data_dir = state.data_dir.clone();
@@ -4835,6 +4880,11 @@ fn request_list(request: &Request, store: &Arc<Mutex<Store>>) -> Response {
         .iter()
         .rev()
         .filter(|held| identity.as_deref().is_none_or(|value| held.identity == value))
+        .cloned()
+        .map(|mut held| {
+            introductions::refresh_request(&state, &mut held);
+            held
+        })
         .collect();
     success(request, serde_json::json!({"requests": requests}))
 }
@@ -4928,6 +4978,10 @@ fn request_accept(request: &Request, store: &Arc<Mutex<Store>>) -> Response {
                 instant_call: false,
                 tags: Vec::new(),
                 visibility: None,
+                // Accepting a request that carried an introduction keeps it
+                // on the new contact.
+                introduced_by: held.introduction.as_ref().map(idfon_protocol::IntroducedBy::from),
+                share: None,
             };
             ensure_account_alias(&mut peer);
             state.peers.push(peer.clone());
@@ -5016,6 +5070,7 @@ fn request_accept(request: &Request, store: &Arc<Mutex<Store>>) -> Response {
             trace: None,
             telemetry: None,
             context: None,
+            introduction: None,
         });
         push_event(
             &mut state,
@@ -6587,6 +6642,14 @@ fn peer_add(
         Ok(score) => score.flatten(),
         Err(response) => return response,
     };
+    // An introduction token from the add link (object or JSON text). One that
+    // does not parse, or is not valid for this add, is ignored: the contact
+    // is still added (docs/protocol.md "Introductions").
+    let intro = request
+        .params
+        .get("intro")
+        .filter(|value| !value.is_null())
+        .and_then(|value| idfon_protocol::Introduction::from_value(value).ok());
     let mut state = store.lock().expect("store mutex poisoned");
     if state
         .peers
@@ -6660,7 +6723,26 @@ fn peer_add(
         instant_call: false,
         tags: request_tags(&request.params, "tags"),
         visibility: None,
+        introduced_by: None,
+        share: None,
     };
+    // Re-adding keeps who introduced them; a card says their sharing
+    // preference (absent = ok), otherwise the last known one stays.
+    let existing = state
+        .peers
+        .iter()
+        .find(|candidate| candidate.identity == peer.identity && candidate.id == peer.id)
+        .cloned();
+    peer.share = match &device_ticket {
+        Some(ticket) => ticket.share.clone().filter(|share| share == idfon_protocol::intro::SHARE_ASK),
+        None => existing.as_ref().and_then(|existing| existing.share.clone()),
+    };
+    peer.introduced_by = existing.and_then(|existing| existing.introduced_by);
+    let me = introductions::own_peer_id(&state, &peer.identity).unwrap_or_default();
+    if let Some(intro) = intro.filter(|intro| introductions::is_valid_for(intro, &peer.id, &me)) {
+        peer.introduced_by = Some(idfon_protocol::IntroducedBy::from(&intro));
+        introductions::set_pending(&mut state, &peer.identity.clone(), &peer.id.clone(), &intro);
+    }
     // Contact metadata (§19 model deltas): Favorites pin (D7) and the
     // instant-call flag (§5.1), settable at add time like `call_mode`.
     if let Some(pinned) = request
@@ -6732,6 +6814,8 @@ fn peer_add(
                 instant_call: false,
                 tags: Vec::new(),
                 visibility: None,
+                introduced_by: None,
+                share: None,
             };
             if !reciprocal.id.is_empty() {
                 state.peers.retain(|candidate| {
@@ -6968,6 +7052,21 @@ fn peer_update(request: &Request, store: &Arc<Mutex<Store>>) -> Response {
             false,
         );
     };
+    // The contact's sharing preference, from their `IDFON-SHARE/1`.
+    if let Some(value) = request_text(&request.params, "share") {
+        match idfon_protocol::intro::parse_share(&value) {
+            Ok(share) => peer.share = share,
+            Err(message) => {
+                return error_response(
+                    request.id.clone(),
+                    &request.method,
+                    ErrorCode::InvalidRequest,
+                    message,
+                    false,
+                )
+            }
+        }
+    }
     if let Some(name) = request
         .params
         .get("name")
@@ -7400,6 +7499,8 @@ fn peer_remove(request: &Request, store: &Arc<Mutex<Store>>) -> Response {
         );
     }
     if let Some(peer) = removed {
+        // A removed contact's introduction is not attached to a later re-add.
+        introductions::clear_pending(&mut state, &identity, &peer.id);
         record_state_event(
             &mut state,
             &identity,
@@ -8408,6 +8509,8 @@ mod tests {
             instant_call: false,
             tags: Vec::new(),
             visibility: None,
+            introduced_by: None,
+            share: None,
         }
     }
 
@@ -8435,6 +8538,7 @@ mod tests {
                 endpoint_id: None,
                 public_key: None,
                 active: false,
+                share: None,
             });
         }
         store.peers.push(test_peer("alice", "default", "Alice"));
@@ -8583,6 +8687,8 @@ mod tests {
                 instant_call: false,
                 tags: Vec::new(),
                 visibility: None,
+                introduced_by: None,
+                share: None,
             });
         }
         let update = |params: serde_json::Value| {
@@ -8820,6 +8926,7 @@ mod tests {
                 endpoint_id: None,
                 public_key: None,
                 active: false,
+                share: None,
             });
             let data_dir = state.data_dir.clone();
             state.ensure_identity_keys(&data_dir).unwrap();
@@ -8837,6 +8944,8 @@ mod tests {
                 instant_call: false,
                 tags: Vec::new(),
                 visibility: None,
+                introduced_by: None,
+                share: None,
             });
             state.grants.push(idfon_protocol::CapabilityGrant {
                 capability: idfon_protocol::Capability::MessageSend,
@@ -8970,6 +9079,8 @@ mod tests {
                 instant_call: false,
                 tags: Vec::new(),
                 visibility: None,
+                introduced_by: None,
+                share: None,
             };
             ensure_account_alias(&mut peer);
             state.peers.push(peer);
@@ -9110,6 +9221,8 @@ mod tests {
                 instant_call: false,
                 tags: Vec::new(),
                 visibility: None,
+                introduced_by: None,
+                share: None,
             });
             state.grants.push(idfon_protocol::CapabilityGrant {
                 capability: idfon_protocol::Capability::new("resource.read"),
@@ -9262,6 +9375,8 @@ mod tests {
                 instant_call: false,
                 tags: Vec::new(),
                 visibility: None,
+                introduced_by: None,
+                share: None,
             });
             state.grants.push(idfon_protocol::CapabilityGrant {
                 capability: idfon_protocol::Capability::new("resource.read"),
@@ -9324,6 +9439,8 @@ mod tests {
                 instant_call: false,
                 tags: Vec::new(),
                 visibility: None,
+                introduced_by: None,
+                share: None,
             };
             ensure_account_alias(&mut peer);
             state.peers.push(peer);
@@ -9466,6 +9583,8 @@ mod tests {
             instant_call: false,
             tags: Vec::new(),
             visibility: None,
+            introduced_by: None,
+            share: None,
         });
         state.grants.push(idfon_protocol::CapabilityGrant {
             capability: idfon_protocol::Capability::MessageReceive,
@@ -9847,6 +9966,8 @@ mod tests {
             instant_call: false,
             tags: Vec::new(),
             visibility: None,
+            introduced_by: None,
+            share: None,
         });
         let ticket = idfon_core::TicketSpec {
             subject: None,
@@ -9930,6 +10051,8 @@ mod tests {
             instant_call: false,
             tags: Vec::new(),
             visibility: None,
+            introduced_by: None,
+            share: None,
         });
         let ticket = idfon_core::TicketSpec {
             subject: None,
@@ -10027,6 +10150,8 @@ mod tests {
             instant_call: false,
             tags: Vec::new(),
             visibility: None,
+            introduced_by: None,
+            share: None,
         });
         let ticket = idfon_core::TicketSpec {
             subject: None,
@@ -10086,6 +10211,8 @@ mod tests {
             instant_call: false,
             tags: Vec::new(),
             visibility: None,
+            introduced_by: None,
+            share: None,
         });
         state.grants.push(idfon_protocol::CapabilityGrant {
             capability: idfon_protocol::Capability::MessageReceive,
@@ -10189,6 +10316,8 @@ mod tests {
             instant_call: false,
             tags: Vec::new(),
             visibility: None,
+            introduced_by: None,
+            share: None,
         });
         state.grants.push(idfon_protocol::CapabilityGrant {
             capability: idfon_protocol::Capability::MessageReceive,
@@ -10536,6 +10665,8 @@ mod tests {
                 instant_call: false,
                 tags: Vec::new(),
                 visibility: None,
+                introduced_by: None,
+                share: None,
             });
             let data_dir = state.data_dir.clone();
             state.save(&data_dir).unwrap();
@@ -10736,6 +10867,8 @@ mod tests {
                     instant_call: false,
                     tags: Vec::new(),
                     visibility: None,
+                    introduced_by: None,
+                    share: None,
                 });
             }
             store.save(&dir).unwrap();
@@ -10785,6 +10918,8 @@ mod tests {
                 instant_call: false,
                 tags: Vec::new(),
                 visibility: None,
+                introduced_by: None,
+                share: None,
             });
             identity.public_key.unwrap()
         };
@@ -10974,6 +11109,8 @@ mod tests {
             instant_call: false,
             tags: Vec::new(),
             visibility: None,
+            introduced_by: None,
+            share: None,
         };
         let event = idfon_protocol::Event {
             event_id: "peer-event-1".into(),
@@ -11310,6 +11447,8 @@ mod tests {
             instant_call: false,
             tags: Vec::new(),
             visibility: None,
+            introduced_by: None,
+            share: None,
         });
         store.save(&dir).unwrap();
         let store = Arc::new(Mutex::new(Store::load(&dir).unwrap()));
@@ -11348,6 +11487,8 @@ mod tests {
                 instant_call: false,
                 tags: Vec::new(),
                 visibility: None,
+                introduced_by: None,
+                share: None,
             });
         }
         store.save(&dir).unwrap();
@@ -11395,6 +11536,8 @@ mod tests {
                 instant_call: false,
                 tags: Vec::new(),
                 visibility: None,
+                introduced_by: None,
+                share: None,
             });
             state.grants.push(idfon_protocol::CapabilityGrant {
                 capability: idfon_protocol::Capability::MessageSend,
@@ -11497,6 +11640,8 @@ mod tests {
                 instant_call: false,
                 tags: Vec::new(),
                 visibility: None,
+                introduced_by: None,
+                share: None,
             });
             state.grants.push(idfon_protocol::CapabilityGrant {
                 capability: idfon_protocol::Capability::MessageSend,
@@ -11724,6 +11869,8 @@ mod tests {
                     instant_call: false,
                     tags: Vec::new(),
                     visibility: None,
+                    introduced_by: None,
+                    share: None,
                 });
                 for capability in [idfon_protocol::Capability::MessageSend, idfon_protocol::Capability::MessageReceive] {
                     state.grants.push(idfon_protocol::CapabilityGrant {
@@ -11849,4 +11996,299 @@ mod tests {
         }
     }
 
+
+    /// One daemon for the introduction tests: its own store, identity key
+    /// and fake transport (sends are routed by hand between stores).
+    struct IntroNode {
+        store: Arc<Mutex<Store>>,
+        fake: FakeTransport,
+        transport: Arc<TransportMode>,
+        peer_id: String,
+        endpoint: String,
+        dir: PathBuf,
+    }
+
+    impl IntroNode {
+        fn new(name: &str) -> Self {
+            let dir = temp_dir(name);
+            let store = Arc::new(Mutex::new(Store::load(&dir).unwrap()));
+            let fake = FakeTransport::default();
+            let (peer_id, endpoint) = {
+                let mut state = store.lock().unwrap();
+                let peer_id = state.identity_key("default").unwrap().peer_id();
+                let endpoint_key = state.endpoint_key("default").unwrap();
+                let endpoint = iroh::SecretKey::from_bytes(&endpoint_key.to_bytes()).public();
+                state.identities[0].endpoint_id = Some(endpoint.to_string());
+                state.identities[0].name = name.into();
+                fake.set_endpoint_ticket("default", serde_json::to_vec(&EndpointAddr::new(endpoint)).unwrap());
+                (peer_id, endpoint.to_string())
+            };
+            let transport = Arc::new(TransportMode::Fake(fake.clone()));
+            Self { store, fake, transport, peer_id, endpoint, dir }
+        }
+
+        fn call(&self, method: &str, params: serde_json::Value) -> Response {
+            dispatch_with_transport(
+                Request { version: PROTOCOL_VERSION, id: method.into(), method: method.into(), params },
+                &self.store,
+                Some(&self.transport),
+            )
+        }
+
+        fn rpc(&self, method: &str, params: serde_json::Value) -> serde_json::Value {
+            match self.call(method, params).body {
+                ResponseBody::Success { result, .. } => result,
+                ResponseBody::Failure { error, .. } => panic!("{method} failed: {}", error.message),
+            }
+        }
+
+        fn error(&self, method: &str, params: serde_json::Value) -> String {
+            match self.call(method, params).body {
+                ResponseBody::Success { result, .. } => panic!("{method} succeeded: {result}"),
+                ResponseBody::Failure { error, .. } => error.message,
+            }
+        }
+
+        /// A contact record for `other`, dialable (so its card exports).
+        fn know(&self, other: &IntroNode, name: &str) {
+            let endpoint: iroh::EndpointId = other.endpoint.parse().unwrap();
+            let mut peer = test_peer(&other.peer_id, "default", name);
+            peer.endpoint_id = Some(other.endpoint.clone());
+            peer.endpoint_addr = Some(serde_json::to_string(&EndpointAddr::new(endpoint)).unwrap());
+            self.store.lock().unwrap().peers.push(peer);
+        }
+
+        fn peer(&self, id: &str) -> idfon_protocol::Peer {
+            self.store.lock().unwrap().peers.iter().find(|peer| peer.id == id).cloned().unwrap()
+        }
+    }
+
+    impl Drop for IntroNode {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// `contact.introduce`, `contact.inspect`, `peer.add { intro }`,
+    /// `peer.update { share }` and `identity.update { share }` (docs/protocol.md
+    /// "Introductions").
+    #[test]
+    fn introduction_rpcs() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let don = IntroNode::new("intro-don");
+        let bob = IntroNode::new("intro-bob");
+        let stella = IntroNode::new("intro-stella");
+        let carol = IntroNode::new("intro-carol");
+        don.know(&bob, "Bob");
+        don.know(&stella, "Stella");
+        bob.know(&don, "Don");
+
+        // Only your own contacts, with a sane note and target.
+        assert!(don.error("contact.introduce", serde_json::json!({"ref": "Nobody"})).contains("only your own contacts"));
+        assert!(don.error("contact.introduce", serde_json::json!({"ref": "Stella", "note": "x".repeat(281)})).contains("280"));
+        assert!(don.error("contact.introduce", serde_json::json!({"ref": "Stella", "to": "Nobody"})).contains("not a contact"));
+        assert!(don.error("contact.introduce", serde_json::json!({"ref": "Stella", "to": "Stella"})).contains("themselves"));
+
+        // Stella asked to be asked (her IDFON-SHARE/1, recorded by the app).
+        assert!(don.error("peer.update", serde_json::json!({"ref": "Stella", "share": "maybe"})).contains("share must be"));
+        assert_eq!(don.rpc("peer.update", serde_json::json!({"ref": "Stella", "share": "ask"}))["peer"]["share"], "ask");
+
+        let shared = don.rpc("contact.introduce", serde_json::json!({
+            "ref": "Stella", "to": "Bob", "note": "Stella does our taxes", "mutual": true}));
+        assert_eq!(shared["share"], "ask", "the subject's preference");
+        let intro = &shared["intro"];
+        assert_eq!(intro["v"], 1);
+        assert_eq!(intro["introducer"], don.peer_id.as_str());
+        assert_eq!(intro["introducer_name"], "intro-don");
+        assert_eq!(intro["subject"], stella.peer_id.as_str());
+        assert_eq!(intro["recipient"], bob.peer_id.as_str());
+        assert_eq!(intro["mutual"], true);
+        assert_eq!(intro["note"], "Stella does our taxes");
+        // The link is the add envelope { contact, intro }, base64url.
+        let link = shared["link"].as_str().unwrap();
+        assert!(link.starts_with("idfon://add/"));
+        let envelope = serde_json::to_value(idfon_protocol::vcf::add_link_from_str(link).unwrap()).unwrap();
+        assert_eq!(&envelope["intro"], intro);
+        assert_eq!(envelope["contact"]["account_id"], stella.peer_id.as_str());
+        assert_eq!(envelope["contact"]["label"], "Stella");
+        assert_eq!(envelope["contact"]["share"], "ask");
+        assert!(envelope["contact"].get("capabilities").is_none(), "no access travels");
+        // The vCard carries the card and the same link.
+        let vcard = shared["vcard"].as_str().unwrap().replace("\r\n ", "");
+        assert!(vcard.contains(&format!("URL:{link}")));
+        assert!(vcard.contains("X-IDFON-TICKET:"));
+
+        // Inspect, as Bob (the recipient): valid and addressed to him.
+        let seen = bob.rpc("contact.inspect", serde_json::json!({"link": link}));
+        assert_eq!(seen["contact"], serde_json::json!({"peer_id": stella.peer_id, "name": "Stella", "share": "ask"}));
+        assert_eq!(seen["intro"]["valid"], true);
+        assert_eq!(seen["intro"]["addressed_to_me"], true);
+        assert_eq!(seen["intro"]["introducer_is_contact"], true);
+        assert_eq!(seen["intro"]["introducer_name"], "intro-don");
+        assert_eq!(seen["intro"]["note"], "Stella does our taxes");
+        assert_eq!(seen["intro"]["mutual"], true);
+        // The universal-link form reads the same.
+        let universal = link.replace("idfon://add/", "https://idfon.net/go/add/");
+        assert_eq!(bob.rpc("contact.inspect", serde_json::json!({"link": universal})), seen);
+        // As Carol (a forwarded link): not hers, not valid, Don unknown.
+        let forwarded = carol.rpc("contact.inspect", serde_json::json!({"link": link}));
+        assert_eq!(forwarded["intro"]["valid"], false);
+        assert_eq!(forwarded["intro"]["addressed_to_me"], false);
+        assert_eq!(forwarded["intro"]["introducer_is_contact"], false);
+        // Unbound (share sheet): valid for anyone, addressed to no one.
+        let open = don.rpc("contact.introduce", serde_json::json!({"ref": "Stella"}));
+        assert!(open["intro"]["recipient"].is_null());
+        assert!(open["intro"].get("mutual").is_none() && open["intro"].get("note").is_none());
+        let open_seen = carol.rpc("contact.inspect", serde_json::json!({"link": open["link"]}));
+        assert_eq!(open_seen["intro"]["valid"], true);
+        assert_eq!(open_seen["intro"]["addressed_to_me"], false);
+        // Tampered: the note changed after signing.
+        let mut tampered = envelope.clone();
+        tampered["intro"]["note"] = "Stella does our books".into();
+        let tampered_link = idfon_protocol::vcf::add_link(&serde_json::from_value(tampered).unwrap());
+        assert_eq!(bob.rpc("contact.inspect", serde_json::json!({"link": tampered_link}))["intro"]["valid"], false);
+        // A plain card link has no intro; garbage is refused.
+        let plain = don.rpc("contact.export", serde_json::json!({"ref": "Stella"}));
+        assert!(bob.rpc("contact.inspect", serde_json::json!({"link": plain["link"]})).get("intro").is_none());
+        assert!(bob.error("contact.inspect", serde_json::json!({"link": "idfon://add/!!"})).contains("invalid"));
+
+        // peer.add with the intro: Bob records who introduced Stella and keeps
+        // the token to attach; the card's preference comes along.
+        let card = &envelope["contact"];
+        let added = bob.rpc("peer.add", serde_json::json!({"contact_ticket": card, "intro": intro}))["peer"].clone();
+        assert_eq!(added["share"], "ask");
+        assert_eq!(added["introduced_by"], serde_json::json!({
+            "peer_id": don.peer_id, "name": "intro-don", "issued": intro["issued"],
+            "note": "Stella does our taxes", "mutual": true}));
+        assert!(introductions::pending_token(&bob.store.lock().unwrap(), "default", &stella.peer_id).is_some());
+        // Re-adding without an intro keeps it.
+        let readded = bob.rpc("peer.add", serde_json::json!({"contact_ticket": card}))["peer"].clone();
+        assert_eq!(readded["introduced_by"]["peer_id"], don.peer_id.as_str());
+        // Carol adds from the forwarded link: added, but the intro is ignored.
+        let carols = carol.rpc("peer.add", serde_json::json!({"contact_ticket": card, "intro": serde_json::to_string(intro).unwrap()}))["peer"].clone();
+        assert_eq!(carols["id"], stella.peer_id.as_str());
+        assert!(carols.get("introduced_by").is_none());
+        assert!(carol.store.lock().unwrap().pending_introductions.is_empty());
+        // peer.update share=ok clears it.
+        assert!(bob.rpc("peer.update", serde_json::json!({"ref": "Stella", "share": "ok"}))["peer"].get("share").is_none());
+
+        // identity.update { share }: your own card carries it.
+        assert!(don.error("identity.update", serde_json::json!({})).contains("share is required"));
+        assert!(don.error("identity.update", serde_json::json!({"share": "never"})).contains("share must be"));
+        assert_eq!(don.rpc("identity.update", serde_json::json!({"share": "ask"})), serde_json::json!({"identity": "default", "share": "ask"}));
+        assert_eq!(don.rpc("identity.list", serde_json::json!({}))["identities"][0]["share"], "ask");
+        let own = don.rpc("contact.export", serde_json::json!({}));
+        let own_card = idfon_protocol::vcf::contact_ticket_from_link(own["link"].as_str().unwrap()).unwrap();
+        assert_eq!(own_card.share.as_deref(), Some("ask"));
+        assert_eq!(don.rpc("identity.update", serde_json::json!({"share": "ok"}))["share"], "ok");
+        let own = don.rpc("contact.export", serde_json::json!({}));
+        assert_eq!(idfon_protocol::vcf::contact_ticket_from_link(own["link"].as_str().unwrap()).unwrap().share, None);
+        // Persisted.
+        assert!(Store::load(&don.dir).unwrap().identities[0].share.is_none());
+        don.rpc("identity.update", serde_json::json!({"share": "ask"}));
+        assert_eq!(Store::load(&don.dir).unwrap().identities[0].share.as_deref(), Some("ask"));
+    }
+
+    /// A introduces C to B; B adds C with the intro and writes; C's held
+    /// request shows the introduction from A (a contact of C's). The token
+    /// rides B's messages to C until C's first message reaches B.
+    #[test]
+    fn an_introduction_rides_the_first_messages_to_the_person_introduced() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let a = IntroNode::new("intro-a");
+        let b = IntroNode::new("intro-b");
+        let c = IntroNode::new("intro-c");
+        let d = IntroNode::new("intro-d");
+        a.know(&b, "Bob");
+        a.know(&c, "Carol");
+        c.know(&a, "Ann");
+        // Deliver every send, as `message.receive` on the target's store.
+        let deliver = |from: &IntroNode, nodes: &[&IntroNode]| -> Vec<(String, Response)> {
+            let mut delivered = Vec::new();
+            for _ in 0..80 {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                let sent = from.fake.take_sent_to();
+                if sent.is_empty() && !delivered.is_empty() {
+                    break;
+                }
+                for (target, envelope) in sent {
+                    let to = nodes.iter().find(|node| node.endpoint == target).expect("a known node");
+                    let mut params = serde_json::to_value(&envelope).unwrap();
+                    params["identity"] = "default".into();
+                    let introduction = envelope.introduction.clone().unwrap_or_default();
+                    delivered.push((introduction, to.call("message.receive", params)));
+                }
+            }
+            delivered
+        };
+
+        let shared = a.rpc("contact.introduce", serde_json::json!({"ref": "Carol", "to": "Bob", "note": "she fixes bikes"}));
+        // B adds C from the link's vCard (contact.import reads the intro from
+        // its URL), grants chat like the app does, and writes.
+        let imported = b.rpc("contact.import", serde_json::json!({"text": shared["vcard"]}))["peers"][0].clone();
+        assert_eq!(imported["id"], c.peer_id.as_str());
+        assert_eq!(imported["introduced_by"]["peer_id"], a.peer_id.as_str());
+        b.rpc("access.grant", serde_json::json!({"identity": "default", "subject": c.peer_id, "capability": "message.send"}));
+        b.rpc("message.send", serde_json::json!({"to": c.peer_id, "text": "hi, Ann said to write", "idempotency_key": "k1", "retries": 0}));
+        b.rpc("message.send", serde_json::json!({"to": c.peer_id, "text": "about the bike", "idempotency_key": "k2", "retries": 0}));
+        let delivered = deliver(&b, &[&c]);
+        assert_eq!(delivered.len(), 2);
+        for (introduction, response) in &delivered {
+            assert_eq!(introduction, &shared["intro"].to_string(), "the token rides every first message");
+            assert!(response.ok, "{response:?}");
+        }
+
+        // C sees a held request, introduced by A, who is C's contact.
+        let requests = c.rpc("request.list", serde_json::json!({}))["requests"].clone();
+        assert_eq!(requests.as_array().unwrap().len(), 1);
+        let request = &requests[0];
+        assert_eq!(request["peer_id"], b.peer_id.as_str());
+        assert_eq!(request["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(request["introduction"], serde_json::json!({
+            "introducer": a.peer_id, "introducer_name": "intro-a", "introducer_is_contact": true,
+            "addressed": true, "note": "she fixes bikes", "issued": shared["intro"]["issued"], "mutual": false}));
+        let events = c.rpc("event.list", serde_json::json!({"type": "contact.request"}))["events"].clone();
+        assert!(events.as_array().unwrap().iter().all(|event| event["data"]["introduction"]["introducer"] == a.peer_id.as_str()));
+        // Nothing was accepted or granted.
+        assert!(c.store.lock().unwrap().peers.iter().all(|peer| peer.id != b.peer_id));
+        // C forgetting A: the request still shows the introduction, unvouched.
+        c.store.lock().unwrap().peers.retain(|peer| peer.id != a.peer_id);
+        assert_eq!(c.rpc("request.list", serde_json::json!({}))["requests"][0]["introduction"]["introducer_is_contact"], false);
+        c.know(&a, "Ann");
+
+        // D replays A's token (bound to B) on its own message: dropped.
+        d.know(&c, "Carol");
+        d.rpc("access.grant", serde_json::json!({"identity": "default", "subject": c.peer_id, "capability": "message.send"}));
+        d.store.lock().unwrap().pending_introductions.push(introductions::PendingIntroduction {
+            identity: "default".into(),
+            peer_id: c.peer_id.clone(),
+            token: shared["intro"].to_string(),
+        });
+        d.rpc("message.send", serde_json::json!({"to": c.peer_id, "text": "me too", "idempotency_key": "k1", "retries": 0}));
+        let replayed = deliver(&d, &[&c]);
+        assert!(replayed[0].1.ok, "the message is still held");
+        let requests = c.rpc("request.list", serde_json::json!({}))["requests"].clone();
+        let from_d = requests.as_array().unwrap().iter().find(|request| request["peer_id"] == d.peer_id.as_str()).unwrap();
+        assert!(from_d.get("introduction").is_none(), "a token not bound to the sender is dropped");
+
+        // C accepts B (a person's decision) and replies; the new contact keeps
+        // who introduced them.
+        let request_id = request["request_id"].as_str().unwrap();
+        let accepted = c.rpc("request.accept", serde_json::json!({"request_id": request_id, "name": "Bob"}))["peer"].clone();
+        assert_eq!(accepted["introduced_by"]["peer_id"], a.peer_id.as_str());
+        c.rpc("message.send", serde_json::json!({"to": b.peer_id, "text": "hi Bob", "idempotency_key": "r1", "retries": 0}));
+        let replies = deliver(&c, &[&b]);
+        assert!(replies[0].1.ok, "{:?}", replies[0].1);
+        assert!(replies[0].0.is_empty(), "C was added without an introduction");
+        // B heard from C: no more token, and that is persisted.
+        assert!(introductions::pending_token(&b.store.lock().unwrap(), "default", &c.peer_id).is_none());
+        assert!(Store::load(&b.dir).unwrap().pending_introductions.is_empty());
+        b.rpc("message.send", serde_json::json!({"to": c.peer_id, "text": "great", "idempotency_key": "k3", "retries": 0}));
+        let later = deliver(&b, &[&c]);
+        assert!(later[0].0.is_empty(), "no introduction after hearing back");
+        assert!(later[0].1.ok);
+        assert_eq!(b.peer(&c.peer_id).introduced_by.unwrap().peer_id, a.peer_id, "the record stays");
+    }
 }

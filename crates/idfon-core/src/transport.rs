@@ -883,6 +883,7 @@ mod tests {
                 trace: None,
                 telemetry: None,
                 context: None,
+                introduction: None,
             };
             let ack = sender
                 .send(&receiver.endpoint().addr(), &message)
@@ -922,6 +923,7 @@ mod tests {
             trace: None,
             telemetry: None,
             context: None,
+            introduction: None,
         };
         let target = EndpointAddr::from_parts(
             "0000000000000000000000000000000000000000000000000000000000000000"

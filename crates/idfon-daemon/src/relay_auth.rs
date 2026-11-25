@@ -539,6 +539,7 @@ mod tests {
             endpoint_id: Some(endpoint.into()),
             public_key: None,
             active: true,
+            share: None,
         }
     }
 
@@ -566,6 +567,8 @@ mod tests {
             instant_call: false,
             tags: Vec::new(),
             visibility: None,
+            introduced_by: None,
+            share: None,
         }
     }
 

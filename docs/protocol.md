@@ -96,8 +96,9 @@ One you: identities are tags on contacts now (2026-11-24, `docs/identity.md`).
 
 | method | params | result |
 |---|---|---|
-| `identity.list` | — | `{ identities: [{id, name, active, public_key, endpoint_id}] }` — one entry, `default` |
+| `identity.list` | — | `{ identities: [{id, name, active, public_key, endpoint_id, share?}] }` — one entry, `default`; `share: "ask"` when set (absent = ok) |
 | `identity.rename` | `{ name }` | your name (what your card shows) |
+| `identity.update` | `{ share }` | `{ identity, share }` — your sharing preference, `"ask"` (Ask Before Sharing My Card) or `"ok"`; your card carries it (see "Introductions") |
 | `identity.create`, `identity.delete` | — | refused |
 
 ### Tags and visibility
@@ -150,13 +151,19 @@ values fold into `ring_score` once (`ring_score_v1`).
 
 | method | params | result |
 |---|---|---|
-| `peer.list` | — | `{ peers: [Peer] }`; Peer = `{id, identity, name, aliases, endpoint_id, endpoint_addr, ring_score?, ...}` |
-| `peer.add` | `{ ref, id, name, endpoint_id, endpoint_addr, aliases, ring_score?, mcp_ticket? }` | `{ peer }` |
+| `peer.list` | — | `{ peers: [Peer] }`; Peer = `{id, identity, name, aliases, endpoint_id, endpoint_addr, ring_score?, introduced_by?, share?, ...}` |
+| `peer.add` | `{ ref, id, name, endpoint_id, endpoint_addr, aliases, ring_score?, mcp_ticket?, contact_ticket?, intro? }` | `{ peer }` |
+
+`introduced_by` = `{ peer_id, name, issued, note?, mutual }`: who introduced
+this contact (from a valid `intro` at `peer.add`, or the introduction on an
+accepted contact request). `share`: `"ask"` when the contact asked to be asked
+before their card is shared (from their card or `IDFON-SHARE/1`); absent = ok.
+See "Introductions".
 
 `mcp_ticket` (M3) is an MCP contact ticket; when present it fills any omitted
 `id`/`endpoint_id`/`endpoint_addr`/`name` and caches the ticket's
 `server/discover` result. See the MCP transport section.
-| `peer.update` | same as add | `{ peer }` |
+| `peer.update` | same as add, plus `share?` (`"ask"` \| `"ok"`) | `{ peer }` |
 | `peer.remove` | `{ ref }` | `{}` |
 | `peer.resolve` | `{ ref }` | live channel info |
 | `peer.show` / `peer.status` | `{ ref }` | `{ peer }` / connectivity |
@@ -175,7 +182,105 @@ keeps standard `URL` fields. `peer.add` also accepts a `contact_ticket`
 | method | params | result |
 |---|---|---|
 | `contact.export` | `{ ref?, identity? }` | `{ vcard, link }`; `ref` exports that saved peer, omitted exports an identity's own card (`identity` names the line by id or name, default `default`); `link` is the `idfon://add/<base64url>` deep link |
-| `contact.import` | `{ text, identity? }` | `{ peers: [Peer] }`; upserts each idfon card (aborts on a card that fails validation; idempotent) |
+| `contact.import` | `{ text, identity? }` | `{ peers: [Peer] }`; upserts each idfon card (aborts on a card that fails validation; idempotent); a card whose `URL` add link carries an `intro` is added with it |
+
+A card (`ContactTicket`) carries `share: "ask"` when its owner set Ask Before
+Sharing My Card; absent = ok. Your own card carries your `identity.update`
+preference; a peer's card carries the last preference you recorded for them.
+
+#### Introductions
+
+Sharing a contact's card with someone else, signed by you (idfon-home
+`docs/introductions.md`). **An introduction grants, adds or accepts
+nothing**: the card is the bare card `contact.export {ref}` builds (no
+capabilities, tickets, admission codes or ring grants), and the token is
+context, never a credential.
+
+**The token** (JSON; the daemon signs and checks it, apps never do):
+
+```json
+{ "v": 1,
+  "introducer": "<peer id>", "introducer_name": "Don",
+  "subject": "<introduced peer id>", "recipient": "<peer id>" | null,
+  "issued": 1795575000, "mutual": true, "note": "Stella does our taxes",
+  "sig": "<hex ed25519>" }
+```
+
+- `sig` is the introducer's ed25519 signature (its peer id is the public
+  key) over `idfon-intro/1\n` followed by the compact JSON (serde_json: no
+  whitespace) of the other fields in exactly this order: `v`, `introducer`,
+  `introducer_name`, `subject`, `recipient`, `issued`, then `mutual` only when
+  true and `note` only when present and non-empty. `recipient` is always
+  written, `null` when unbound. Example of the signed bytes:
+  `idfon-intro/1\n{"v":1,"introducer":"<hex>","introducer_name":"Don","subject":"<hex>","recipient":"<hex>","issued":1795579241,"note":"Stella does our taxes"}`.
+  Codec: `crates/idfon-protocol/src/intro.rs`; `idfon_core::sign_introduction`
+  and `verify_introduction`.
+- Invalid: `v` other than 1, `note` over 280 characters (Unicode scalar
+  values), `issued` more than 5 minutes in the future, or a signature that
+  does not verify. There is no expiry.
+- `recipient` binds the token to the person it was given to; `null` is a
+  share with no known recipient (share sheet, QR, file).
+- Not transitive: one introducer, one subject, at most one recipient. The
+  daemon never forwards or chains a token.
+
+**Where it rides.**
+
+1. The add link: `idfon://add/<base64url>` of `{ "contact": <card>, "intro":
+   <token> }` (beside `capability`/`auth` in the same envelope,
+   `contact-exchange.md`). The vCard `contact.introduce` returns has the card
+   in `X-IDFON-TICKET` and this link in `URL`.
+2. `MessageEnvelope.introduction`: the token as JSON text, outside the message
+   signature like `trace` (it carries its own). After `peer.add` with a valid
+   `intro`, the daemon attaches the token to every message it sends that
+   contact (each `message.send`, including a room's direct fan-out; not room
+   gossip broadcasts) until the first message from that contact arrives. That
+   state is persisted (`pending_introductions`). Older receivers ignore the
+   field.
+
+**Valid for me.** A token counts when it verifies, its `subject` is the
+expected person, and its `recipient` is `null` or the expected other party:
+
+| where | `subject` | `recipient` must be |
+|---|---|---|
+| `peer.add { intro }`, `contact.inspect` | the card's owner | `null` or this identity |
+| a held contact request | this identity | `null` or the sender |
+
+A token that is not valid is ignored silently: `peer.add` still adds the
+contact (without `introduced_by`), a held message is still held (without an
+introduction).
+
+| method | params | result |
+|---|---|---|
+| `contact.introduce` | `{ ref, to?, note?, mutual? }` | `{ link, vcard, intro, share }` — `ref`'s card with a token signed by this identity, bound to `to` (a contact ref, or a 64-hex peer id) when given; `intro` is the token object; `share` is the subject's preference (`"ask"` \| `"ok"`). Only your own contacts can be introduced; `ref` = `to` and a note over 280 characters are refused. Sends nothing: a both-ways introduction is two calls with `mutual: true`, and the app sends the cards and any notice. |
+| `contact.inspect` | `{ link }` | `{ contact: { peer_id, name, share }, intro?: { valid, introducer, introducer_name, introducer_is_contact, subject, recipient, addressed_to_me, issued, mutual, note } }` — reads an add link (`idfon://add/…` or `https://idfon.net/go/add/…`; a bare card link has no `intro`). `valid` means it would count for `peer.add` here (above); `addressed_to_me` = `recipient` is this identity; `introducer_is_contact` = the introducer is one of your contacts; `note` is `null` when absent. `introducer_name` is the name the introducer gave itself: show your own name for them when they are a contact. |
+| `peer.add` | existing, plus `intro?` (the token object, or its JSON text) | `{ peer }` — with `introduced_by` when `intro` is valid; the token is kept to attach (above). Re-adding without `intro` keeps an earlier `introduced_by`. |
+| `peer.update` | existing, plus `share?` | records a contact's preference (from their `IDFON-SHARE/1`) |
+| `identity.update` | `{ share }` | your own preference; your card carries it |
+
+Examples (ids shortened):
+
+```json
+{"method":"contact.introduce","params":{"ref":"Stella","to":"Bob","note":"Stella does our taxes"}}
+→ {"link":"idfon://add/<base64url>","vcard":"BEGIN:VCARD…","share":"ask",
+   "intro":{"v":1,"introducer":"<don>","introducer_name":"Don","subject":"<stella>","recipient":"<bob>","issued":1795579241,"note":"Stella does our taxes","sig":"<hex>"}}
+
+{"method":"contact.inspect","params":{"link":"idfon://add/<base64url>"}}
+→ {"contact":{"peer_id":"<stella>","name":"Stella","share":"ask"},
+   "intro":{"valid":true,"introducer":"<don>","introducer_name":"Don","introducer_is_contact":true,"subject":"<stella>","recipient":"<bob>","addressed_to_me":true,"issued":1795579241,"mutual":false,"note":"Stella does our taxes"}}
+
+{"method":"peer.add","params":{"contact_ticket":{…,"share":"ask"},"intro":{…}}}
+→ {"peer":{"id":"<stella>",…,"introduced_by":{"peer_id":"<don>","name":"Don","issued":1795579241,"note":"Stella does our taxes","mutual":false},"share":"ask"}}
+
+{"method":"peer.update","params":{"ref":"Stella","share":"ask"}} → {"peer":{…,"share":"ask"}}
+{"method":"identity.update","params":{"share":"ask"}} → {"identity":"default","share":"ask"}
+```
+
+The sharing preference and the notice to the person introduced are app
+envelopes (`IDFON-SHARE/1`, `IDFON-INTRO/1` in `chat-envelopes.md`); the
+daemon does not interpret them. The rules for automation (introductions never
+add or accept anyone; only introducers who are your contacts and people
+count in a receiver's own rules; agents drop notices and preferences) are in
+`identity.md`, "Introductions".
 
 ### Messaging
 
@@ -183,6 +288,9 @@ keeps standard `URL` fields. `peer.add` also accepts a `contact_ticket`
 |---|---|---|
 | `message.send` | `{ to, text, idempotency_key, capability_ticket?, retries?, durable? }` (`capability_ticket` is the holder's rcan token string) | `{ authenticated, message_id, operation_id, status: "queued" }` — returns immediately; delivery proceeds in the daemon (retries per `retries`), confirm via `operation.wait`. Sender needs a `message.send` grant for the peer (own daemon); the receiver needs `message.receive` for the sender. A successful send auto-establishes the local receive side of the reply path. `durable: true` makes it an outbox item: if every attempt fails it goes back to `queued` ("not sent yet") instead of `failed`, and is retried later (see `operation.resume`). Chat messages set it; time-bound sends (call signaling) must not. |
 | `message.receive` | — | receive-side helper used by the transport; not called by shells. A sender who isn't a peer is held as a contact request (see "Contact requests"). |
+
+Outbound envelopes may carry `introduction` (an introduction token as JSON
+text, unsigned like `trace`): see "Introductions".
 
 The `event.wait`/`event.list` methods below are how received messages surface: a
 `message.received` event with `data: { message_id, peer_id, conversation,
@@ -281,14 +389,25 @@ group join link reaches the group's owner (`chat-envelopes.md`, "Group links").
   same `unauthorized` error an unknown sender used to get, and makes no
   request. The block lasts until `request.unblock` or until they are added as
   a peer (`peer.add`, `request.accept`).
-- Nothing is accepted automatically.
+- Nothing is accepted automatically, introduced or not.
+- **Introductions.** When a held message carries an introduction token
+  (`MessageEnvelope.introduction`) that is valid for this identity — it
+  verifies, its `subject` is this identity, and its `recipient` is `null` or
+  the sender — the request records `introduction { introducer,
+  introducer_name, introducer_is_contact, addressed, note?, issued, mutual }`.
+  The first valid token wins; invalid ones are dropped silently.
+  `addressed` = the token was bound to the sender (`false` for a share with no
+  known recipient). `introducer_is_contact` is refreshed on every
+  `request.list`. Accepting the request copies it to the new contact's
+  `introduced_by`. See "Introductions".
 
 Each held message emits a `contact.request` event with `data: { request_id,
-peer_id, endpoint_id, conversation, text, idempotency_key }`.
+peer_id, endpoint_id, conversation, text, idempotency_key, introduction? }`
+(`introduction` is the request's, when it has one).
 
 | method | params | result |
 |---|---|---|
-| `request.list` | — | `{ requests: [ContactRequest] }`, newest first. ContactRequest = `{ request_id, identity, peer_id, endpoint_id, endpoint_addr, received_at, messages: [{ message_id, text, conversation, idempotency_key, received_at }] }`; `endpoint_addr` is the sender's dial address (JSON text) as seen on the connection, or `null` |
+| `request.list` | — | `{ requests: [ContactRequest] }`, newest first. ContactRequest = `{ request_id, identity, peer_id, endpoint_id, endpoint_addr, received_at, messages: [{ message_id, text, conversation, idempotency_key, received_at }], introduction? }`; `endpoint_addr` is the sender's dial address (JSON text) as seen on the connection, or `null` |
 | `request.accept` | `{ request_id, name?, conversation? }` | `{ peer }` — adds the sender as a peer (named `name`, else a short prefix of their id; dialed at `endpoint_addr`, else by id through discovery), grants `message.send` and `message.receive` for them (scoped to `conversation` when given, like a group member's grants), then emits each held message the grant covers as an ordinary `message.received` event and removes the request. With `conversation`, held messages outside it are dropped |
 | `request.decline` | `{ request_id, block? }` | `{ request_id, peer_id, blocked }` — drops the request; `block: true` also refuses the sender's future messages |
 | `request.unblock` | `{ peer_id }` | `{ peer_id, unblocked }` |
