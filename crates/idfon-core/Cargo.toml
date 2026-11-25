@@ -31,7 +31,7 @@ rand_core = "0.10"
 # available on wasm). Tokio's `rt-multi-thread` is rejected by the wasm target.
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 idfon-config = { path = "../idfon-config" }
-iroh-gossip = "0.102"
+iroh-gossip = "0.103"
 tokio = { version = "1", features = ["rt-multi-thread", "time", "io-util", "sync"] }
 getrandom = { version = "0.4", features = ["sys_rng"] }
 
