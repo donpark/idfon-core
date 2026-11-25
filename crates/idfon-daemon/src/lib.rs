@@ -10,6 +10,7 @@ use std::{
 };
 
 mod blob;
+mod build_info;
 mod diag_views;
 mod introductions;
 mod live;
@@ -841,6 +842,7 @@ pub async fn run(config: DaemonConfig) -> io::Result<()> {
         ));
     }
     let _data_lock = DataLock::acquire(&data_dir)?;
+    build_info::record_start();
     // Chunked-upload staging is transient by definition; a crash can leave an
     // accumulator behind, so sweep it on every boot.
     let _ = std::fs::remove_dir_all(data_dir.join("staging"));
@@ -986,6 +988,7 @@ async fn accept_loop(
             // Counts as an active client for the whole connection, which is
             // what long-poll (`wait`) and `events --follow` hold open.
             let _conn = ConnGuard(connections);
+            let _client = build_info::ClientGuard::new();
             if let Err(error) = serve(stream, store, transport, shutdown).await {
                 tracing::warn!(target: "idfon.daemon", error = %error, "client error");
             }
@@ -2771,16 +2774,24 @@ fn dispatch_with_transport(
                 .unwrap_or("default");
             success(
                 &request,
-                serde_json::json!({
-                    "identity": identity,
-                    "daemon": "idfond",
-                    "ready": true,
-                    "protocol_version": PROTOCOL_VERSION,
-                    "ticket": transport
-                        .and_then(|transport| transport.endpoint_ticket_for(identity_id))
-                        .unwrap_or_default(),
-                    "contact_ticket": contact_ticket_value(&state, transport, identity_id),
-                }),
+                {
+                    let mut status = serde_json::json!({
+                        "identity": identity,
+                        "daemon": "idfond",
+                        "ready": true,
+                        "protocol_version": PROTOCOL_VERSION,
+                        "ticket": transport
+                            .and_then(|transport| transport.endpoint_ticket_for(identity_id))
+                            .unwrap_or_default(),
+                        "contact_ticket": contact_ticket_value(&state, transport, identity_id),
+                    });
+                    if let (Some(status), serde_json::Value::Object(build)) =
+                        (status.as_object_mut(), build_info::status_fields())
+                    {
+                        status.extend(build);
+                    }
+                    status
+                },
             )
         }
         "identity.list" => {
@@ -11364,6 +11375,31 @@ mod tests {
             .unwrap();
         assert!(result.is_ok(), "daemon run failed: {result:?}");
         assert!(!socket.exists(), "socket not cleaned up on idle exit");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn daemon_status_says_which_build_runs_and_who_started_it() {
+        let dir = temp_dir("status-build");
+        let store = Arc::new(Mutex::new(Store::load(&dir).unwrap()));
+        build_info::record_start();
+        let response = dispatch(
+            Request {
+                version: PROTOCOL_VERSION,
+                id: "status".into(),
+                method: "daemon.status".into(),
+                params: serde_json::json!({}),
+            },
+            &store,
+        );
+        let ResponseBody::Success { result, .. } = response.body else {
+            panic!("daemon.status failed");
+        };
+        assert_eq!(result["daemon"], "idfond");
+        assert!(result["host"].as_str().is_some_and(|host| !host.is_empty()), "{result}");
+        assert_eq!(result["autostarted"], false);
+        assert!(result["clients"].is_u64());
+        assert_eq!(result["build"]["stale"], false);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

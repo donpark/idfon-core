@@ -47,6 +47,7 @@ pub const SETTINGS: &[Setting] = &[
     setting("IDFON_MCP_COMMAND", "mcp.command", "local MCP server inbound idfon/mcp/1 streams splice to"),
     setting("IDFON_IDLE_EXIT_SECS", "daemon.idle_exit_secs", "auto-started daemon idle shutdown, seconds (0 = never)"),
     setting("IDFON_ENDPOINT_PORT", "endpoint.port", "UDP port to pin the endpoint to, so its address survives restarts"),
+    setting("IDFON_ASK_PEER", "ask.peer", "who `idfon ask` asks by default: a contact, such as the idfon app on your phone"),
 ];
 
 /// Where a setting's value came from.
