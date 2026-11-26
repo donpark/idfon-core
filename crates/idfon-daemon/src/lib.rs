@@ -1262,14 +1262,12 @@ async fn wire_sync_identity(
                     let envelope: idfon_protocol::StateSyncEnvelope =
                         serde_json::from_slice(&bytes).map_err(io::Error::other)?;
                     idfon_core::verify_state_sync(&envelope).map_err(io::Error::other)?;
-                    let accepted = {
-                        let state = store.lock().expect("store mutex poisoned");
-                        state.peers.iter().any(|peer| {
-                            peer.identity == identity
-                                && peer.id == envelope.account_id
-                                && peer.knows_endpoint(&remote)
-                        })
-                    };
+                    let accepted = sync_sender_allowed(
+                        &store.lock().expect("store mutex poisoned"),
+                        &identity,
+                        &envelope.account_id,
+                        &remote,
+                    );
                     if !accepted {
                         return Err(io::Error::new(
                             io::ErrorKind::PermissionDenied,
@@ -1292,13 +1290,36 @@ async fn wire_sync_identity(
     });
 }
 
-fn merge_state_events(
-    store: &Arc<Mutex<Store>>,
-    envelope: &idfon_protocol::StateSyncEnvelope,
-) -> io::Result<usize> {
-    let mut state = store.lock().expect("store mutex poisoned");
+/// Whether `account_id` is the account key of `identity` (any local identity
+/// when `None`). State sync is between the user's own devices: every contact
+/// can sign a batch with their own key, and a batch can grant capabilities
+/// and rewrite or remove peers.
+fn own_account(state: &Store, identity: Option<&str>, account_id: &str) -> bool {
+    state.identities.iter().any(|item| {
+        identity.is_none_or(|identity| item.id == identity)
+            && item.public_key.as_deref() == Some(account_id)
+    })
+}
+
+/// `idfon/sync/1` admission: the batch is signed by `identity`'s own account
+/// key and arrives from an endpoint enrolled for that account.
+fn sync_sender_allowed(state: &Store, identity: &str, account_id: &str, remote: &str) -> bool {
+    own_account(state, Some(identity), account_id)
+        && state.peers.iter().any(|peer| {
+            peer.identity == identity && peer.id == account_id && peer.knows_endpoint(remote)
+        })
+}
+
+/// Applies a verified batch's new events (deduplicated by event id) and
+/// appends them with local cursors: a remote cursor is the sender's, and
+/// keeping it would break cursor order (a `u64::MAX` cursor would freeze
+/// every later event's number).
+fn merge_synced_events(
+    state: &mut Store,
+    events: &[idfon_protocol::Event],
+) -> Result<usize, Response> {
     let mut added = 0;
-    for event in &envelope.events {
+    for event in events {
         if state
             .events
             .iter()
@@ -1306,14 +1327,27 @@ fn merge_state_events(
         {
             continue;
         }
-        apply_state_event(&mut state, event)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid state event"))?;
-        state.events.push(event.clone());
+        apply_state_event(state, event)?;
+        let number = next_event_number(&state.events);
+        let mut event = event.clone();
+        event.cursor = format!("cur_{number:020}");
+        state.events.push(event);
         added += 1;
     }
-    if added > 0 {
-        state.events.sort_by(|a, b| a.event_id.cmp(&b.event_id));
+    if state.events.len() > EVENT_RETENTION {
+        let excess = state.events.len() - EVENT_RETENTION;
+        state.events.drain(..excess);
     }
+    Ok(added)
+}
+
+fn merge_state_events(
+    store: &Arc<Mutex<Store>>,
+    envelope: &idfon_protocol::StateSyncEnvelope,
+) -> io::Result<usize> {
+    let mut state = store.lock().expect("store mutex poisoned");
+    let added = merge_synced_events(&mut state, &envelope.events)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid state event"))?;
     let data_dir = state.data_dir.clone();
     state.save(&data_dir)?;
     if added > 0 {
@@ -7963,24 +7997,20 @@ fn events_merge(request: &Request, store: &Arc<Mutex<Store>>) -> Response {
             false,
         );
     }
-    let incoming = envelope.events;
     let mut state = store.lock().expect("store mutex poisoned");
-    let mut added = 0usize;
-    for event in incoming {
-        if state
-            .events
-            .iter()
-            .any(|existing| existing.event_id == event.event_id)
-        {
-            continue;
-        }
-        if let Err(response) = apply_state_event(&mut state, &event) {
-            return response;
-        }
-        state.events.push(event);
-        added += 1;
+    if !own_account(&state, None, &envelope.account_id) {
+        return error_response(
+            request.id.clone(),
+            &request.method,
+            ErrorCode::Unauthorized,
+            "sync envelope is not signed by a local identity's account".into(),
+            false,
+        );
     }
-    state.events.sort_by(|a, b| a.event_id.cmp(&b.event_id));
+    let added = match merge_synced_events(&mut state, &envelope.events) {
+        Ok(added) => added,
+        Err(response) => return response,
+    };
     let data_dir = state.data_dir.clone();
     if let Err(error) = state.save(&data_dir) {
         return error_response(
@@ -11199,6 +11229,14 @@ mod tests {
             data: serde_json::json!({"peer": peer}),
         };
         let key = idfon_core::IdentityKey::generate();
+        store.lock().unwrap().identities.push(Identity {
+            id: "default".into(),
+            name: "default".into(),
+            endpoint_id: None,
+            public_key: Some(key.peer_id()),
+            active: true,
+            share: None,
+        });
         let envelope = idfon_core::sign_state_sync(
             &key,
             key.peer_id(),
@@ -11214,6 +11252,113 @@ mod tests {
         assert!(dispatch(request(), &store).ok);
         assert!(dispatch(request(), &store).ok);
         assert_eq!(store.lock().unwrap().peers.len(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn sync_event(event_id: &str, cursor: &str, grantee: &str) -> idfon_protocol::Event {
+        idfon_protocol::Event {
+            event_id: event_id.into(),
+            cursor: cursor.into(),
+            r#type: "grant.created".into(),
+            timestamp: "1".into(),
+            identity: "default".into(),
+            data: serde_json::json!({"grant": {
+                "identity": "default",
+                "subject": grantee,
+                "capability": "mcp.transport",
+                "conversation": null,
+                "active_at": "1",
+                "expires_at": null,
+                "revision": 1,
+                "revoked_at": null,
+            }}),
+        }
+    }
+
+    /// Security review 2026-11-26 C1: a contact can sign a batch with their
+    /// own key; only a local identity's account may sync state.
+    #[test]
+    fn events_merge_refuses_a_batch_from_another_account() {
+        let dir = temp_dir("events-merge-foreign");
+        let store = Arc::new(Mutex::new(Store::load(&dir).unwrap()));
+        let contact = idfon_core::IdentityKey::generate();
+        let envelope = idfon_core::sign_state_sync(
+            &contact,
+            contact.peer_id(),
+            "batch-1".into(),
+            vec![sync_event("grant-1", "cur_1", &contact.peer_id())],
+        );
+        let response = dispatch(
+            Request {
+                version: PROTOCOL_VERSION,
+                id: "merge".into(),
+                method: "events.merge".into(),
+                params: serde_json::json!({"envelope": envelope}),
+            },
+            &store,
+        );
+        assert!(!response.ok);
+        let state = store.lock().unwrap();
+        assert!(state.grants.iter().all(|grant| grant.subject != contact.peer_id()));
+        assert!(state.events.iter().all(|event| event.event_id != "grant-1"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn sync_admits_only_own_enrolled_devices() {
+        let dir = temp_dir("sync-admission");
+        let mut state = Store::load(&dir).unwrap();
+        let own = idfon_core::IdentityKey::generate().peer_id();
+        state.identities.push(Identity {
+            id: "default".into(),
+            name: "default".into(),
+            endpoint_id: None,
+            public_key: Some(own.clone()),
+            active: true,
+            share: None,
+        });
+        let peer = |id: &str, endpoint: &str| idfon_protocol::Peer {
+            doorbell_key: None,
+            id: id.into(),
+            identity: "default".into(),
+            name: id.into(),
+            endpoint_id: Some(endpoint.into()),
+            endpoint_addr: None,
+            devices: Vec::new(),
+            aliases: Vec::new(),
+            ring_score: None,
+            call_mode: None,
+            pinned: false,
+            instant_call: false,
+            tags: Vec::new(),
+            visibility: None,
+            introduced_by: None,
+            share: None,
+        };
+        state.peers.push(peer(&own, "my-laptop"));
+        state.peers.push(peer("carol", "carol-phone"));
+        assert!(sync_sender_allowed(&state, "default", &own, "my-laptop"));
+        assert!(!sync_sender_allowed(&state, "default", "carol", "carol-phone"));
+        assert!(!sync_sender_allowed(&state, "default", &own, "carol-phone"));
+        assert!(!sync_sender_allowed(&state, "other", &own, "my-laptop"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn merged_events_take_local_cursors() {
+        let dir = temp_dir("sync-cursors");
+        let mut state = Store::load(&dir).unwrap();
+        record_state_event(&mut state, "default", "identity.renamed", serde_json::json!({}));
+        let merged = merge_synced_events(
+            &mut state,
+            &[sync_event("grant-1", "cur_18446744073709551615", "laptop")],
+        )
+        .unwrap_or_else(|_| panic!("merge failed"));
+        assert_eq!(merged, 1);
+        record_state_event(&mut state, "default", "identity.renamed", serde_json::json!({}));
+        let cursors: Vec<&str> = state.events.iter().map(|event| event.cursor.as_str()).collect();
+        let n = cursors.len();
+        assert_eq!(&cursors[n - 3..], ["cur_00000000000000000001", "cur_00000000000000000002", "cur_00000000000000000003"]);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
