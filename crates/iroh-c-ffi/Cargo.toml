@@ -33,6 +33,9 @@ iroh-blobs = "0.105"
 # v4l2r 0.0.7 bindgen also fails against Ubuntu 22.04 kernel headers
 # (missing AV1/VP9 stateless controls).
 iroh-live = { git = "https://github.com/n0-computer/iroh-live", rev = "60a3fcfc0dd2416f640496a2787404552b45cdb3", default-features = false }
+# The call publication's audience set (`iroh_live::Audience::Peers`); the
+# version iroh-live uses, so the watchable is the same type.
+n0-watcher = "1.0.1"
 # macOS camera permission request (camera access is also requested from the
 # Swift shells; this covers daemon-side starts). objc2 hard-fails to compile
 # on non-Apple platforms, hence the target gate; ensure_camera_access is

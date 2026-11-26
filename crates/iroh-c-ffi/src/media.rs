@@ -5,7 +5,7 @@
 //! stays in moq-audio/moq-video.
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     ffi::c_void,
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
@@ -469,6 +469,48 @@ struct CallSession {
     accept: SessionAccept,
     publication: Option<Publication>,
     subscribers: HashMap<EndpointId, Subscriber>,
+    /// Who may see the publication: the members this session listens to.
+    /// Each member publishes and subscribes from one endpoint, so the peers
+    /// we subscribe to are the peers that subscribe to us. The node admits
+    /// every peer (and, on iOS, rides the identity endpoint whose id is on
+    /// every contact card), so without this anyone could read the call
+    /// (security review 2026-11-26, C2). A member's subscribe waits until
+    /// the set includes it; a removed member loses the path at once.
+    audience: n0_watcher::Watchable<BTreeSet<EndpointId>>,
+    /// The broadcast name, random per session so a path cannot be guessed;
+    /// stable within the session so a restart (device switch) republishes
+    /// at the same path.
+    broadcast_name: String,
+}
+
+impl CallSession {
+    /// Sets the audience to the members this session listens to.
+    fn sync_audience(&self) {
+        #[cfg_attr(not(test), allow(unused_mut))]
+        let mut members: BTreeSet<EndpointId> = self.subscribers.keys().copied().collect();
+        #[cfg(test)]
+        members.extend(TEST_LISTENERS.lock().unwrap_or_else(|poison| poison.into_inner()).iter());
+        let _ = self.audience.set(members);
+    }
+}
+
+/// Tests read the call from an in-process listener node that the session
+/// never subscribes back to, so they admit it here (`tests::remote_listener`).
+#[cfg(test)]
+static TEST_LISTENERS: Mutex<BTreeSet<EndpointId>> = Mutex::new(BTreeSet::new());
+
+#[cfg(test)]
+fn admit_test_listener(id: EndpointId, admit: bool) {
+    let mut listeners = TEST_LISTENERS.lock().unwrap_or_else(|poison| poison.into_inner());
+    if admit {
+        listeners.insert(id);
+    } else {
+        listeners.remove(&id);
+    }
+    drop(listeners);
+    if let Some(session) = SESSION.lock().unwrap_or_else(|poison| poison.into_inner()).as_ref() {
+        session.sync_audience();
+    }
 }
 
 /// How a call session receives connections.
@@ -602,13 +644,17 @@ pub(crate) async fn session_handle() -> anyhow::Result<SessionHandle> {
         return Ok(handle);
     }
     tracing::info!(target: "idfon.media", id = %endpoint.id().fmt_short(), "call session started");
-    *slot = Some(CallSession {
+    let session = CallSession {
         endpoint: endpoint.clone(),
         node: node.clone(),
         accept,
         publication: None,
         subscribers: HashMap::new(),
-    });
+        audience: n0_watcher::Watchable::new(BTreeSet::new()),
+        broadcast_name: format!("idfon-live-{:016x}", rand::random::<u64>()),
+    };
+    session.sync_audience();
+    *slot = Some(session);
     Ok(SessionHandle { endpoint, node })
 }
 
@@ -984,18 +1030,25 @@ fn start_live(
         *VIDEO_PTS_CLOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner()) = VideoPtsClock::default();
-        let name = format!("idfon-live-{}", std::process::id());
         let layout = LiveLayout::default();
         // A restart (device switch) replaces the publication at the same path:
         // drop the old broadcast first so the path is free.
-        let replaced = SESSION
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .as_mut()
-            .and_then(|session| session.publication.take());
+        let (replaced, name, audience) = {
+            let mut slot = SESSION.lock().unwrap_or_else(|poison| poison.into_inner());
+            let Some(call) = slot.as_mut() else {
+                anyhow::bail!("call session ended during publish setup");
+            };
+            (call.publication.take(), call.broadcast_name.clone(), call.audience.clone())
+        };
         drop(replaced);
         tracing::info!(target: "idfon.media", "live broadcast creation begin");
-        let broadcast: LocalBroadcast = layout.publish(&session.node, &name)?;
+        // Members only (see `CallSession::audience`), not `layout.publish`'s
+        // `Audience::Granted`, which the layout's policy grants to every peer.
+        let (_publication, broadcast) = session.node.publish_with(
+            layout.path(session.node.id(), &name)?,
+            iroh_live::Audience::Peers(audience),
+            |producer| LocalBroadcast::try_from(producer.clone()),
+        )?;
         tracing::info!(target: "idfon.media", "live broadcast created");
         if audio {
             let renditions = call_renditions(codec, sample_rate, channels, video)?;
@@ -1631,6 +1684,7 @@ fn start_listen_leg(session: SessionHandle, ticket: BroadcastTicket, addr: Optio
     match slot.as_mut() {
         Some(call) => {
             call.subscribers.insert(peer, subscriber);
+            call.sync_audience();
         }
         None => {
             // The session ended under us (a concurrent stop): end the leg.
@@ -2462,7 +2516,11 @@ pub fn media_live_unsubscribe() {
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
         .as_mut()
-        .map(|session| session.subscribers.drain().map(|(_, sub)| sub).collect())
+        .map(|session| {
+            let legs = session.subscribers.drain().map(|(_, sub)| sub).collect();
+            session.sync_audience();
+            legs
+        })
         .unwrap_or_default();
     for subscriber in subscribers {
         stop_subscriber(subscriber);
@@ -2540,7 +2598,11 @@ pub fn media_live_remove_member(peer: char_p::Ref<'_>) -> u8 {
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
         .as_mut()
-        .and_then(|session| session.subscribers.remove(&peer));
+        .and_then(|session| {
+            let leg = session.subscribers.remove(&peer);
+            session.sync_audience();
+            leg
+        });
     let Some(subscriber) = subscriber else {
         return 1;
     };
@@ -3192,12 +3254,71 @@ mod tests {
     /// call session is per process, so an in-process listener on the session's
     /// node would read the publication locally, not over the network.
     fn remote_listener() -> super::SessionHandle {
+        let listener = unadmitted_listener();
+        // A real far phone is in the audience because the call listens to it;
+        // this one is never listened to, so admit it.
+        super::admit_test_listener(listener.endpoint.id(), true);
+        listener
+    }
+
+    fn unadmitted_listener() -> super::SessionHandle {
         super::tokio_executor(async {
             let endpoint = super::bind_call_endpoint().await.expect("listener endpoint");
             // The layout grant, as a real session: each peer may publish under its own id.
             let node = super::Node::new(endpoint.clone(), super::LiveLayout::default().config());
             super::SessionHandle { endpoint, node }
         })
+    }
+
+    /// Security review 2026-11-26 C2: the node admits every peer, so the call's
+    /// publication must be visible only to its members. A peer outside the
+    /// audience waits on the path; admitted, it gets it; dropped, it loses it.
+    #[test]
+    fn only_call_members_can_subscribe_to_the_call() {
+        let _guard = crate::util::MEDIA_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let ticket_text =
+            super::start_live(true, false, true, None, AudioCodec::Opus, 48_000, 1)
+                .expect("publish");
+        let ticket: super::BroadcastTicket = ticket_text.parse().expect("ticket");
+        assert!(
+            ticket.path().to_string().contains("idfon-live-")
+                && !ticket.path().to_string().ends_with(&std::process::id().to_string()),
+            "the broadcast name is random, not the pid: {}",
+            ticket.path()
+        );
+        let stranger = unadmitted_listener();
+        let addr = publisher_addr();
+        let subscribe = |listener: &super::SessionHandle, wait: u64| {
+            let node = listener.node.clone();
+            let addr = addr.clone();
+            let path = ticket.path().clone();
+            let peer = ticket.peer();
+            super::tokio_executor(async move {
+                let _session = node.connect(addr).await.expect("dial the publisher");
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(wait),
+                    node.subscribe(path, super::Reach::Direct(peer)),
+                )
+                .await
+            })
+        };
+        assert!(
+            subscribe(&stranger, 3).is_err(),
+            "a peer outside the call must not see the broadcast"
+        );
+        super::admit_test_listener(stranger.endpoint.id(), true);
+        let subscription = subscribe(&stranger, 15)
+            .expect("an admitted member sees the broadcast")
+            .expect("subscribe");
+        super::admit_test_listener(stranger.endpoint.id(), false);
+        let dropped = super::tokio_executor(async move {
+            tokio::time::timeout(std::time::Duration::from_secs(10), subscription.closed()).await
+        });
+        assert!(dropped.is_ok(), "a removed member loses the broadcast");
+        super::media_live_stop();
+        super::tokio_executor(async move { stranger.node.shutdown().await });
     }
 
     /// The in-process publisher's dial address, as the invite's `addr=` carries it, plus

@@ -71,7 +71,10 @@ push it. Then in idfon-core:
 4. Update the upstream revs in the crate manifests (grep for `moq-dev/moq` and
    `n0-computer/iroh-live`) and the fork revs in the root `[patch]` tables.
 5. `cargo check --workspace --all-targets`, then the media tests
-   (`idfon-media`, `iroh-c-ffi`), then rebuild the apps' vendored libs.
+   (`idfon-media`, `iroh-c-ffi`), then rebuild the apps' vendored libs. The
+   `iroh-c-ffi` run must include `only_call_members_can_subscribe_to_the_call`:
+   a pin move that changes `Audience`, `LiveLayout`'s policy or path
+   resolution can silently reopen the call to every peer (see Rules).
 
 ## Rules
 
@@ -82,3 +85,11 @@ push it. Then in idfon-core:
 - **Move moq and iroh-live together.** The moq rev must be the one the iroh-live
   rev builds against.
 - Keep the git pins (reproducible builds); do not track branch heads.
+- **Calls publish to their members only.** `LiveLayout::default().config()`
+  admits every peer and lets it subscribe to any path, and
+  `LiveLayout::publish` uses `Audience::Granted`, so a call published that way
+  can be read by anyone who reaches the endpoint (security review 2026-11-26,
+  C2). The app call path (`iroh-c-ffi` `media.rs`) publishes with
+  `Audience::Peers` over the members it listens to; `idfon-media` uses
+  `Audience::peers([peer])`. Keep both, and check `Audience` semantics when the
+  iroh-live pin moves.
