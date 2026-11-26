@@ -411,7 +411,7 @@ static MIXER: Mutex<Option<crate::mixer::Mixer>> = Mutex::new(None);
 
 /// Members added with `media_live_add_member` (group call, G0). Their legs skip
 /// the A/V anchor (group video is later work, and one anchor serves one
-/// picture) and write per-member call captures.
+/// picture).
 static GROUP_PEERS: Mutex<Option<HashSet<EndpointId>>> = Mutex::new(None);
 
 /// Remote members a call holds at most: 12 people including this one.
@@ -1543,9 +1543,8 @@ fn start_listen_leg(session: SessionHandle, ticket: BroadcastTicket, addr: Optio
             // while the holder kept publishing — suspected relay/route boundary).
             // A silent early end means dead air until hangup; treat it as
             // transient and re-subscribe while the call is still active.
-            let mut samples: Vec<f32> = Vec::new();
+            // A call keeps none of the audio it plays: no PCM, no timing log.
             let mut decoded_channels = 1u32;
-            let mut timing = String::from("frame,arrival_us,arrival_gap_us,pts_us,media_gap_us,samples,sink_buffered_ms\n");
             let mut decoded_total = 0usize;
             let capture_started = std::time::Instant::now();
             let mut attempt = 0u32;
@@ -1567,8 +1566,8 @@ fn start_listen_leg(session: SessionHandle, ticket: BroadcastTicket, addr: Optio
                     ticket.clone(),
                     addr.clone(),
                     &thread_stop,
-                    &mut samples,
-                    &mut timing,
+                    None,
+                    None,
                     &mut decoded_total,
                     capture_started,
                     attempt,
@@ -1614,18 +1613,6 @@ fn start_listen_leg(session: SessionHandle, ticket: BroadcastTicket, addr: Optio
             }
             // The endpoint is the call session's: it outlives this leg and
             // shuts down with the session (`release_session_if_idle`).
-            // A group member's capture is named for it, so legs don't overwrite each other.
-            let suffix = if is_group_peer(&peer) {
-                format!("-{}", peer.fmt_short())
-            } else {
-                String::new()
-            };
-            let received_wav = media_path(&format!("received{suffix}.wav"));
-            let received_timing = media_path(&format!("received{suffix}-timing.csv"));
-            write_wav(&received_wav, &samples, decoded_channels)?;
-            std::fs::write(&received_timing, timing)?;
-            eprintln!("[media] live audio captures wav={} timing={}", received_wav.display(), received_timing.display());
-            archive_call_capture(&received_wav, &received_timing);
             PLAYBACK_CONTROL.lock().unwrap().take();
             release_mixer_if_idle();
             result
@@ -1656,7 +1643,7 @@ fn start_listen_leg(session: SessionHandle, ticket: BroadcastTicket, addr: Optio
     0
 }
 
-/// Stop one listen leg and wait for its thread (which writes the call capture).
+/// Stop one listen leg and wait for its thread.
 fn stop_subscriber(mut subscriber: Subscriber) {
     subscriber.stop.store(true, Ordering::Relaxed);
     if let Some(handle) = subscriber.handle.take() {
@@ -1734,7 +1721,9 @@ fn apply_playback_gain(data: &[u8]) -> Vec<u8> {
 }
 
 /// One subscribe-and-decode attempt: connect, wait for the audio catalog,
-/// decode into `samples`/`timing` until the track ends or `stop` is set.
+/// decode until the track ends or `stop` is set. `samples` and `timing`, when
+/// given, collect the decoded PCM and a per-frame timing row for tests; a call
+/// passes `None` and keeps no audio.
 /// Returns Ok(true) when the stop flag ended it, Ok(false) on an early track
 /// end (caller decides whether to retry), Err on transport/setup failure.
 async fn subscribe_decode_once(
@@ -1742,8 +1731,8 @@ async fn subscribe_decode_once(
     ticket: BroadcastTicket,
     addr: Option<EndpointAddr>,
     stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-    samples: &mut Vec<f32>,
-    timing: &mut String,
+    mut samples: Option<&mut Vec<f32>>,
+    mut timing: Option<&mut String>,
     decoded_total: &mut usize,
     capture_started: std::time::Instant,
     attempt: u32,
@@ -1764,6 +1753,8 @@ async fn subscribe_decode_once(
     // close ending the other's attempt, back and forth. Only a stall with no
     // selected path left, or a second stall in a row, closes it now.
     let mut redial = false;
+    // Interleaved samples this attempt decoded (log context only).
+    let mut media_samples = 0usize;
     let attempt_started = std::time::Instant::now();
     let res = async {
         // Dial the known address first: a bare-id dial waits on discovery,
@@ -2067,7 +2058,7 @@ async fn subscribe_decode_once(
                 tracing::warn!(
                     attempt,
                     decoded = *decoded_total,
-                    media_secs = samples.len() as f64 / (48_000.0 * input.channels as f64),
+                    media_secs = media_samples as f64 / (48_000.0 * input.channels as f64),
                     stall_secs = last_frame.elapsed().as_secs_f64(),
                     stalls_in_row = *stalls_in_row,
                     no_path,
@@ -2190,7 +2181,7 @@ async fn subscribe_decode_once(
             let Some(frame) = frame else {
                 // Track ended. Normal only if the caller stopped it; otherwise
                 // the holder is still publishing and this is a transient break.
-                let media_secs = samples.len() as f64 / (48_000.0 * input.channels as f64);
+                let media_secs = media_samples as f64 / (48_000.0 * input.channels as f64);
                 tracing::warn!(
                     attempt,
                     decoded = decoded_total,
@@ -2239,7 +2230,10 @@ async fn subscribe_decode_once(
             if decoded <= 3 || decoded % 100 == 0 || arrival_gap_us > 30_000 || media_gap_us > 1_000 {
                 eprintln!("[media] audio frame decoded #{} arrival_gap={}us media_gap={}us samples={}", decoded, arrival_gap_us, media_gap_us, frame_samples);
             }
-            timing.push_str(&format!("{decoded},{arrival_us},{arrival_gap_us},{pts_us},{media_gap_us},{frame_samples},{:.2}\n", playback.buffered().as_secs_f64() * 1_000.0));
+            media_samples += frame_samples;
+            if let Some(timing) = timing.as_deref_mut() {
+                timing.push_str(&format!("{decoded},{arrival_us},{arrival_gap_us},{pts_us},{media_gap_us},{frame_samples},{:.2}\n", playback.buffered().as_secs_f64() * 1_000.0));
+            }
             if !started {
                 startup.extend_from_slice(&frame.data);
                 if startup.len() / 4 < startup_prebuffer_frames * input.channels as usize {
@@ -2292,8 +2286,10 @@ async fn subscribe_decode_once(
             }
             // Audio has reached the sink: the call is audible again.
             set_sub_state(SUB_PLAYING);
-            for chunk in frame.data.chunks_exact(4) {
-                samples.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+            if let Some(samples) = samples.as_deref_mut() {
+                for chunk in frame.data.chunks_exact(4) {
+                    samples.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+                }
             }
         }
     };
@@ -2368,54 +2364,7 @@ fn frame_pts_gap_us(data: &[u8], channels: u32) -> u128 {
     (data.len() / 4) as u128 * 1_000_000 / (48_000 * channels as u128)
 }
 
-/// Calls whose received audio is kept in `<media_base>/call-captures/`.
-const KEPT_CALL_CAPTURES: usize = 5;
-
-/// Copy the call's `received.wav` and `received-timing.csv` to
-/// `call-captures/<unix_ms>-received.{wav,csv}`, and keep only the newest
-/// `KEPT_CALL_CAPTURES` calls. `received.wav` is overwritten by the next call;
-/// a tester who restarts the app to reset state still has the earlier calls.
-/// Best effort: a failed copy only logs.
-fn archive_call_capture(wav: &std::path::Path, timing: &std::path::Path) {
-    let dir = media_base().join("call-captures");
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let result = (|| -> std::io::Result<()> {
-        std::fs::create_dir_all(&dir)?;
-        std::fs::copy(wav, dir.join(format!("{stamp:013}-received.wav")))?;
-        std::fs::copy(timing, dir.join(format!("{stamp:013}-received-timing.csv")))?;
-        Ok(())
-    })();
-    if let Err(err) = result {
-        eprintln!("[media] call capture archive failed: {err}");
-        return;
-    }
-    prune_call_captures(&dir, KEPT_CALL_CAPTURES);
-}
-
-/// Remove all but the newest `keep` calls in `dir`. A call is the files that
-/// share a `<unix_ms>-` prefix; the zero-padded stamp sorts by name.
-fn prune_call_captures(dir: &std::path::Path, keep: usize) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    let mut by_call: std::collections::BTreeMap<String, Vec<PathBuf>> = Default::default();
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if let Some((stamp, _)) = name.split_once('-') {
-            if !stamp.is_empty() && stamp.bytes().all(|b| b.is_ascii_digit()) {
-                by_call.entry(stamp.to_owned()).or_default().push(entry.path());
-            }
-        }
-    }
-    let excess = by_call.len().saturating_sub(keep);
-    for files in by_call.into_values().take(excess) {
-        for file in files {
-            let _ = std::fs::remove_file(file);
-        }
-    }
-}
-
+#[cfg(test)]
 fn write_wav(path: &std::path::Path, samples: &[f32], channels: u32) -> anyhow::Result<()> {
     write_wav_at(path, samples, channels, 48_000)
 }
@@ -3139,15 +3088,7 @@ fn tone_pcm(kind: u8) -> Vec<u8> {
 }
 #[ffi_export]
 pub fn media_live_recording_samples() -> usize {
-    let path = {
-        let received = media_path("received.wav");
-        if received.exists() {
-            received
-        } else {
-            media_path("recording.wav")
-        }
-    };
-    std::fs::read(path)
+    std::fs::read(media_path("recording.wav"))
         .ok()
         .and_then(|data| wav_format(&data))
         // frames, not interleaved values: the waveform is a time axis
@@ -3184,14 +3125,7 @@ pub fn media_live_recording_store() -> char_p::Box {
             });
         }
         let provider = guard.as_ref().unwrap();
-        let path = {
-            let local = media_path("recording.wav");
-            if local.exists() {
-                local
-            } else {
-                media_path("received.wav")
-            }
-        };
+        let path = media_path("recording.wav");
         anyhow::ensure!(path.exists(), "no recording available");
         let content = provider.store.add_path(&path).await?;
         Ok::<String, anyhow::Error>(format!(
@@ -3343,29 +3277,6 @@ mod tests {
         assert!(super::supported_audio_profile(AudioCodec::Opus, 24_000));
         assert!(!super::supported_audio_profile(AudioCodec::Pcm, 48_000));
         assert!(!super::supported_audio_profile(AudioCodec::Opus, 16_000));
-    }
-
-    #[test]
-    fn call_captures_keep_the_newest_calls() {
-        let dir = std::env::temp_dir().join(format!("idfon-capture-prune-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        for stamp in 1..=7u64 {
-            for suffix in ["received.wav", "received-timing.csv"] {
-                std::fs::write(dir.join(format!("{stamp:013}-{suffix}")), b"x").unwrap();
-            }
-        }
-        std::fs::write(dir.join("notes.txt"), b"x").unwrap();
-        super::prune_call_captures(&dir, 5);
-        let mut left: Vec<String> = std::fs::read_dir(&dir)
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        left.sort();
-        assert_eq!(left.len(), 11);
-        assert!(left[0].starts_with("0000000000003-"));
-        assert!(left.contains(&"notes.txt".to_owned()));
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -3836,8 +3747,8 @@ mod tests {
                 ticket,
                 Some(addr),
                 &stop,
-                &mut samples,
-                &mut timing,
+                Some(&mut samples),
+                Some(&mut timing),
                 &mut decoded_total,
                 std::time::Instant::now(),
                 1,
@@ -4035,8 +3946,8 @@ mod tests {
                 ticket,
                 Some(addr),
                 &stop,
-                &mut samples,
-                &mut timing,
+                Some(&mut samples),
+                Some(&mut timing),
                 &mut decoded_total,
                 std::time::Instant::now(),
                 1,
@@ -4259,8 +4170,8 @@ mod tests {
                 ticket,
                 Some(addr),
                 &stop,
-                &mut samples,
-                &mut timing,
+                Some(&mut samples),
+                Some(&mut timing),
                 &mut decoded_total,
                 std::time::Instant::now(),
                 1,
@@ -4451,8 +4362,8 @@ mod tests {
             ticket,
             Some(addr),
             &stop,
-            &mut samples,
-            &mut timing,
+            Some(&mut samples),
+            Some(&mut timing),
             &mut decoded_total,
             std::time::Instant::now(),
             1,
@@ -4558,8 +4469,8 @@ mod tests {
                         ticket.clone(),
                         Some(addr.clone()),
                         &stop,
-                        &mut samples,
-                        &mut timing,
+                        Some(&mut samples),
+                        Some(&mut timing),
                         &mut decoded_total,
                         std::time::Instant::now(),
                         attempt,
@@ -4822,8 +4733,8 @@ mod tests {
             ticket,
             Some(addr),
             &stop,
-            &mut samples,
-            &mut timing,
+            Some(&mut samples),
+            Some(&mut timing),
             &mut decoded_total,
             std::time::Instant::now(),
             1,
