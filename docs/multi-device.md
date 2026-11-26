@@ -158,8 +158,12 @@ restart and re-resolve current peer endpoints.
 
 State mutations emit events. Devices exchange signed event batches over the
 `idfon/sync/1` Iroh protocol. The receiving device verifies the account
-signature, confirms the remote endpoint is enrolled for that account,
-deduplicates event IDs, and applies supported snapshots deterministically.
+signature, requires that account to be the receiving identity's own (a
+contact can sign a batch with their own key, and a batch can grant
+capabilities and rewrite peers), confirms the remote endpoint is enrolled for
+that account, deduplicates event IDs, and applies supported snapshots
+deterministically. Merged events take local cursors; the sender's are
+ignored. The local `events.merge` RPC applies the same own-account rule.
 
 This is a log-union prototype, not a CRDT. Blobs continue to use existing
 tickets.
