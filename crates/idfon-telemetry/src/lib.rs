@@ -122,6 +122,14 @@ fn filter(default_filter: &str) -> EnvFilter {
         .unwrap_or_else(|_| EnvFilter::new(default_filter))
 }
 
+/// Log files are readable by their owner only (unix): they hold peer ids and
+/// network addresses.
+fn owner_only(options: &mut std::fs::OpenOptions) -> &mut std::fs::OpenOptions {
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(options, 0o600);
+    options
+}
+
 /// Installs the subscriber; `true` when this call won. Idempotent.
 fn install(service: &str, sink: Sink, default_filter: &str) -> bool {
     let filter = filter(default_filter);
@@ -129,9 +137,7 @@ fn install(service: &str, sink: Sink, default_filter: &str) -> bool {
         match &sink {
             Sink::Stderr => Box::new(std::io::stderr()),
             Sink::File(path) => Box::new(
-                std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
+                owner_only(std::fs::OpenOptions::new().create(true).append(true))
                     .open(path)
                     .unwrap_or_else(|_| {
                         std::fs::File::create("/dev/null").expect("/dev/null unavailable")

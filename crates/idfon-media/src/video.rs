@@ -174,24 +174,23 @@ pub fn answer_to_h264(
     out: &Path,
     seconds: u64,
     wait: u64,
-    from: Option<&str>,
+    callers: &[String],
     _quality: Option<Quality>,
 ) -> anyhow::Result<VideoStats> {
     let out = out.to_path_buf();
-    let from = from.map(str::to_owned);
+    let callers = crate::live::parse_callers(callers)?;
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Runtime::new()?;
         runtime.block_on(async move {
             let layout = LiveLayout::default();
             let node = Node::new(transport.endpoint().clone(), layout.config());
             let side = mount_side_channels(&transport, &node);
-            let wanted: Option<iroh::EndpointId> = from.as_deref().map(str::parse).transpose()?;
             let mut accepted = node.accepted();
             let session = tokio::time::timeout(std::time::Duration::from_secs(wait), async {
                 use n0_future::StreamExt as _;
                 loop {
                     let Some(session) = accepted.next().await else { anyhow::bail!("live transport shut down"); };
-                    if wanted.is_none_or(|id| session.peer() == id) { break Ok::<_, anyhow::Error>(session); }
+                    if callers.contains(&session.peer()) { break Ok::<_, anyhow::Error>(session); }
                 }
             }).await.map_err(|_| anyhow::anyhow!("no incoming call within {wait}s"))??;
             let caller = session.peer();

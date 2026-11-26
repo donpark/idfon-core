@@ -311,24 +311,33 @@ async fn stream_peer(
 /// Waits up to `wait` seconds for an inbound 1:1 call on the daemon's
 /// transport endpoint (the MoQ ALPN side-channel is registered here for the
 /// duration), accepts it, and records the caller's audio to a WAV file,
-/// ending when the caller's broadcast ends or `seconds` elapse. With `from`
-/// set, calls from any other endpoint are rejected.
+/// ending when the caller's broadcast ends or `seconds` elapse. Only calls
+/// from `callers` (endpoint ids) are accepted; any other is ignored.
 pub fn answer_to_wav(
     transport: std::sync::Arc<idfon_core::transport::IrohTransport>,
     out: &Path,
     seconds: u64,
     wait: u64,
-    from: Option<&str>,
+    callers: &[String],
 ) -> anyhow::Result<ListenStats> {
     let out = out.to_path_buf();
-    let from = from.map(str::to_string);
+    let callers = parse_callers(callers)?;
     let handle = std::thread::spawn(move || {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?
-            .block_on(answer_wav(&transport, &out, seconds, wait, from.as_deref()))
+            .block_on(answer_wav(&transport, &out, seconds, wait, &callers))
     });
     handle.join().map_err(|_| anyhow::anyhow!("answer thread panicked"))?
+}
+
+/// The endpoints an answer accepts. Empty is an error: answering must name
+/// who may call (a contact, or `--from`).
+pub(crate) fn parse_callers(ids: &[String]) -> anyhow::Result<Vec<EndpointId>> {
+    anyhow::ensure!(!ids.is_empty(), "no caller to accept: add the caller as a contact or pass --from");
+    ids.iter()
+        .map(|id| id.parse().map_err(|err| anyhow::anyhow!("invalid caller endpoint id {id}: {err}")))
+        .collect()
 }
 
 async fn answer_wav(
@@ -336,12 +345,8 @@ async fn answer_wav(
     out: &Path,
     seconds: u64,
     wait: u64,
-    from: Option<&str>,
+    callers: &[EndpointId],
 ) -> anyhow::Result<ListenStats> {
-    let from_id: Option<EndpointId> = match from {
-        Some(id) => Some(id.parse().map_err(|err| anyhow::anyhow!("invalid --from endpoint id: {err}"))?),
-        None => None,
-    };
     // Mount a node on the daemon endpoint (side channels on the MoQ ALPNs)
     // and take the caller's call broadcast over its session.
     let layout = LiveLayout::default();
@@ -354,9 +359,8 @@ async fn answer_wav(
             let Some(session) = accepted.next().await else {
                 anyhow::bail!("live transport shut down");
             };
-            match from_id {
-                Some(want) if session.peer() != want => continue,
-                _ => break Ok::<_, anyhow::Error>(session),
+            if callers.contains(&session.peer()) {
+                break Ok::<_, anyhow::Error>(session);
             }
         }
     })

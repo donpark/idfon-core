@@ -16,7 +16,7 @@ Grammar (RFC 3986 hierarchical form), parsed by `IdfonURL` in both Apple apps:
 
 ```
 idfon://<ref>[/path...]     resource
-idfon://dial/<ref>          verb   (also videodial, answer)
+idfon://call/<ref>          verb   (iOS; also video) a call, after the app asks
 idfon://add/<base64url>     verb   self-add from a vCard deep link (the ticket
                                   rides in the URL; see contact-exchange.md)
 ```
@@ -24,8 +24,9 @@ idfon://add/<base64url>     verb   self-add from a vCard deep link (the ticket
 - `ref` resolves against the local peer list: peer id, name, alias, endpoint
   id, and (iOS) device endpoint ids — the daemon's own `ref` rule.
 - An endpoint-id host is normalized to lowercase hex. Reserved verbs
-  (`dial`, `videodial`, `answer`) are matched case-insensitively and never name a
-  peer; resource refs keep their case.
+  (`add`, `call`, `video`, `card`, `join`) are matched case-insensitively and
+  never name a peer; resource refs keep their case. No link places or answers
+  a call without asking.
 - **Derived account handle:** `idfon_core::account_alias(account_id)` is
   `blake3(account_id)` hex, stored as a reserved peer alias
   (`ensure_account_alias` on `peer.add`/`peer.update`, backfilled on load). Any

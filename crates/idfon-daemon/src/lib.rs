@@ -1601,6 +1601,20 @@ fn resolved_identity_id(request: &Request, store: &Arc<Mutex<Store>>) -> String 
         .unwrap_or(identity_ref)
 }
 
+/// Every endpoint id (primary and devices) of the identity's contacts: who
+/// `media.live.answer` accepts when the request names no caller.
+fn contact_endpoints(store: &Arc<Mutex<Store>>, identity_id: &str) -> Vec<String> {
+    let state = store.lock().expect("store mutex poisoned");
+    let mut ids = Vec::new();
+    for peer in state.peers.iter().filter(|peer| peer.identity == identity_id) {
+        ids.extend(peer.endpoint_id.iter().cloned());
+        ids.extend(peer.devices.iter().map(|device| device.endpoint_id.clone()));
+    }
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
 /// Resolves the dial target peer (MessageSend grant enforced, matching the
 /// message path) and hands the serialized endpoint address to the live dial
 /// handler.
@@ -2920,7 +2934,9 @@ fn dispatch_with_transport(
         "live.publish" => live::live_publish(&request),
         "live.dial" => live_dial_dispatch(&request, store),
         "live.answer" => {
-            live::live_answer(&request, transport, &resolved_identity_id(&request, store))
+            let identity_id = resolved_identity_id(&request, store);
+            let contacts = contact_endpoints(store, &identity_id);
+            live::live_answer(&request, transport, &identity_id, contacts)
         }
         "live.stop" => live::live_stop(&request),
         "live.subscribe" => live::live_subscribe(&request),

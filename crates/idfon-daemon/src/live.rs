@@ -366,13 +366,15 @@ pub fn live_dial(request: &Request, peer_addr: &str) -> Response {
 /// `media.live.answer` — wait for an inbound 1:1 call and record it.
 /// Params: `out` (optional WAV path), `seconds` (capture window, default
 /// 60, cap 600), `wait` (seconds to wait for a caller, default 120, cap
-/// 600), `from` (optional caller endpoint id). Blocking. Requires the real
-/// iroh transport: the call rides the daemon's transport endpoint via a
-/// side-channel ALPN for the duration.
+/// 600), `from` (optional caller endpoint id). Without `from`, only the
+/// identity's contacts (`contacts`, their endpoint ids) may call. Blocking.
+/// Requires the real iroh transport: the call rides the daemon's transport
+/// endpoint via a side-channel ALPN for the duration.
 pub fn live_answer(
     request: &Request,
     transport: Option<&std::sync::Arc<TransportMode>>,
     identity_id: &str,
+    contacts: Vec<String>,
 ) -> Response {
     let method = &request.method;
     let Some(transport) = transport else {
@@ -398,6 +400,10 @@ pub fn live_answer(
         .get("from")
         .and_then(serde_json::Value::as_str)
         .filter(|value| !value.is_empty());
+    let callers = match from {
+        Some(id) => vec![id.to_string()],
+        None => contacts,
+    };
     let video = request
         .params
         .get("video")
@@ -439,7 +445,7 @@ pub fn live_answer(
             Err(message) => return error(&request.id, method, message),
         };
         return match idfon_media::video::answer_to_h264(
-            transport, &out, seconds, wait, from, quality,
+            transport, &out, seconds, wait, &callers, quality,
         ) {
             Ok(stats) => ok(
                 &request.id,
@@ -455,7 +461,7 @@ pub fn live_answer(
             Err(err) => error(&request.id, method, format!("live answer failed: {err:#}")),
         };
     }
-    match idfon_media::live::answer_to_wav(transport, &out, seconds, wait, from) {
+    match idfon_media::live::answer_to_wav(transport, &out, seconds, wait, &callers) {
         Ok(stats) => ok(
             &request.id,
             serde_json::json!({

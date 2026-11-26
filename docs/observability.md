@@ -24,7 +24,7 @@ crosses several processes, and the fan-out is growing:
   someone else.
 
 Today triage means hopping disjoint, unstructured logs:
-`/tmp/idfon-<pid>.log` (GUI/FFI), `/tmp/idfon-holder-<pid>.log`,
+`idfon-<pid>.log` (GUI/FFI; `~/Library/Logs/Idfon` on macOS), `/tmp/idfon-holder-<pid>.log`,
 `~/.idfon/<instance>/holder.log`, `bridge.log`, `agents/*/eve.log`. There is no
 single correlation id joining those files, so "what led to this behavior?"
 cannot be answered exactly. `docs/troubleshooting.md` documents this pain entry
