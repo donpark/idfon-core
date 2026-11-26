@@ -928,6 +928,23 @@ pub async fn run(config: DaemonConfig) -> io::Result<()> {
         wire_sync_identity(Arc::clone(&transport), Arc::clone(&store), identity.clone()).await;
     }
     resume_pending_operations(Arc::clone(&store), Arc::clone(&transport));
+    // Blobs from an earlier run stay fetchable: serve the store on every
+    // identity endpoint now, not only after this run's first `put`.
+    if data_dir.join("blobs").is_dir() {
+        if let TransportMode::Iroh(manager) = transport.as_ref() {
+            for (identity, _) in &bound_keys {
+                if let Some(identity_transport) = manager.current(identity).await {
+                    let root = data_dir.join("blobs");
+                    // Off the daemon runtime: the blob worker blocks on its own.
+                    tokio::task::spawn_blocking(move || {
+                        if let Err(error) = blob::run_serve(root, identity_transport) {
+                            tracing::warn!(target: "idfon.blob", error = %error, "serving stored blobs failed");
+                        }
+                    });
+                }
+            }
+        }
+    }
     // Relay auto-enrollment (idfon-edge/docs/relay-auth.md §6): keeps every identity and
     // peer device endpoint admitted at the relay's auth service. No-op unless
     // IDFON_RELAY_ENROLL_URL is set.

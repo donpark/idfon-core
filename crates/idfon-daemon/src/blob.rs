@@ -63,26 +63,23 @@ fn serve_on(provider: &mut BlobProvider, transport: &Arc<IrohTransport>) {
     provider.served.insert(id, (transport.clone(), guard));
 }
 
-/// Adds `data` to the store and returns a ticket that names `transport`'s
-/// endpoint (the identity endpoint), or a fallback endpoint without one.
-pub async fn put(
-    root: PathBuf,
-    data: Vec<u8>,
-    transport: Option<Arc<IrohTransport>>,
-) -> anyhow::Result<(BlobTicket, usize)> {
-    // One store per process, created lazily and reused. It locks blobs.db:
-    // opening a second FsStore on the same root while this one is alive
-    // deadlocks, and the store must stay alive anyway to serve fetchers. The
-    // lock is held across add_slice to serialize store access.
+type Providers = tokio::sync::MutexGuard<'static, HashMap<PathBuf, BlobProvider>>;
+
+/// The providers, with the one for `root` loaded. One store per process,
+/// created lazily and reused. It locks blobs.db: opening a second FsStore on
+/// the same root while this one is alive deadlocks, and the store must stay
+/// alive anyway to serve fetchers. Callers hold the guard across store access
+/// to serialize it.
+async fn providers_with(root: &Path) -> anyhow::Result<Providers> {
     let mut providers = PROVIDERS
         .get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
         .lock()
         .await;
-    if !providers.contains_key(&root) {
-        let store = FsStore::load(&root).await?;
+    if !providers.contains_key(root) {
+        let store = FsStore::load(root).await?;
         let protocol = BlobsProtocol::new(store.as_ref(), None);
         providers.insert(
-            root.clone(),
+            root.to_path_buf(),
             BlobProvider {
                 store,
                 protocol,
@@ -91,6 +88,49 @@ pub async fn put(
             },
         );
     }
+    Ok(providers)
+}
+
+/// Serves the store at `root` on `transport` (the identity endpoint) without
+/// adding anything: the daemon calls it at start, so tickets minted by an
+/// earlier run keep working after a restart.
+pub async fn serve(root: PathBuf, transport: Arc<IrohTransport>) -> anyhow::Result<()> {
+    let mut providers = providers_with(&root).await?;
+    let provider = providers.get_mut(&root).expect("provider just set");
+    serve_on(provider, &transport);
+    Ok(())
+}
+
+/// The blob behind `ticket`, when the ticket names an endpoint this process
+/// serves blobs on: our own blob. `Ok(None)` means it is someone else's (dial
+/// them). An endpoint can't dial itself, and a throwaway endpoint in the same
+/// process doesn't reach it either, so our own tickets are read from the store.
+async fn read_own(ticket: &BlobTicket) -> anyhow::Result<Option<Vec<u8>>> {
+    let Some(providers) = PROVIDERS.get() else {
+        return Ok(None);
+    };
+    let providers = providers.lock().await;
+    let id = ticket.addr().id;
+    let Some(provider) = providers.values().find(|provider| {
+        provider.served.contains_key(&id)
+            || provider.fallback.as_ref().is_some_and(|(endpoint, _)| endpoint.id() == id)
+    }) else {
+        return Ok(None);
+    };
+    if !provider.store.blobs().has(ticket.hash()).await? {
+        anyhow::bail!("this blob is no longer in your store");
+    }
+    Ok(Some(provider.store.blobs().get_bytes(ticket.hash()).await?.to_vec()))
+}
+
+/// Adds `data` to the store and returns a ticket that names `transport`'s
+/// endpoint (the identity endpoint), or a fallback endpoint without one.
+pub async fn put(
+    root: PathBuf,
+    data: Vec<u8>,
+    transport: Option<Arc<IrohTransport>>,
+) -> anyhow::Result<(BlobTicket, usize)> {
+    let mut providers = providers_with(&root).await?;
     let provider = providers.get_mut(&root).expect("provider just set");
     let endpoint = match &transport {
         Some(transport) => {
@@ -147,14 +187,17 @@ pub async fn fetch(
     if cache_matches(&output, ticket.hash()) {
         return Ok(output);
     }
+    if let Some(bytes) = read_own(&ticket).await? {
+        write_cache(&root, &ticket, &bytes, &output).await?;
+        return Ok(output);
+    }
     // The ticket carries the provider's own addresses (direct and relay), and
     // `connect` dials them as given, so the fetch does not depend on pkarr
     // having propagated. Retries cover a provider that is still coming online.
     // ponytail: 6 attempts x 1s.
-    // A ticket for one of our own blobs names our own endpoint, which can't
-    // dial itself ("connecting to ourself is not supported"): fetch it from
-    // a throwaway endpoint instead. With one identity (docs/identity.md)
-    // there is no second identity endpoint to do it.
+    // Our own endpoint can't dial itself; `read_own` covered our own blobs, so
+    // a ticket naming us here is a blob this process doesn't serve (yet):
+    // dial from a throwaway endpoint, as for any provider.
     let endpoint = endpoint.filter(|endpoint| endpoint.id() != ticket.addr().id);
     let mut last = None;
     for attempt in 0..6 {
@@ -180,6 +223,29 @@ pub async fn fetch(
         }
     }
     Err(last.expect("at least one attempt"))
+}
+
+/// Writes `bytes` as the cache file for `ticket` (temp file, fsync, rename), so
+/// a reader never sees a half-written one.
+async fn write_cache(root: &Path, ticket: &BlobTicket, bytes: &[u8], output: &Path) -> std::io::Result<()> {
+    static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
+    tokio::fs::create_dir_all(root).await?;
+    let tmp = root.join(format!(
+        "{}.blob.tmp.own.{}.{}",
+        ticket.hash(),
+        std::process::id(),
+        NEXT_TMP.fetch_add(1, Ordering::Relaxed)
+    ));
+    let write = async {
+        tokio::fs::write(&tmp, bytes).await?;
+        tokio::fs::File::open(&tmp).await?.sync_all().await?;
+        tokio::fs::rename(&tmp, output).await
+    }
+    .await;
+    if write.is_err() {
+        let _ = tokio::fs::remove_file(&tmp).await;
+    }
+    write
 }
 
 /// True only for a cache file whose bytes hash to the blob's hash. Exports can
@@ -295,6 +361,12 @@ pub fn run_fetch(
         .map_err(|_| anyhow::anyhow!("blob worker panicked"))?
 }
 
+pub fn run_serve(root: PathBuf, transport: Arc<IrohTransport>) -> anyhow::Result<()> {
+    std::thread::spawn(move || runtime().block_on(serve(root, transport)))
+        .join()
+        .map_err(|_| anyhow::anyhow!("blob worker panicked"))?
+}
+
 pub fn run_put(
     root: PathBuf,
     data: Vec<u8>,
@@ -308,6 +380,19 @@ pub fn run_put(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Our own ticket is read from our store: no dial (which never connected:
+    /// that was `idfon get` hanging on a blob the same daemon had stored).
+    #[test]
+    fn own_ticket_reads_from_the_store() {
+        let dir = std::env::temp_dir().join(format!("idfon-blob-own-{}", std::process::id()));
+        let (ticket, _) = run_put(dir.join("blobs"), b"own bytes".to_vec(), None).unwrap();
+        let started = std::time::Instant::now();
+        let path = run_fetch(ticket.to_string(), dir.join("fetched"), None).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"own bytes");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "{:?}", started.elapsed());
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     /// Fails before any network work: a collection ticket is never kept.
     #[test]
