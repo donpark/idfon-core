@@ -167,6 +167,7 @@ See "Introductions".
 | `peer.remove` | `{ ref }` | `{}` |
 | `peer.resolve` | `{ ref }` | live channel info |
 | `peer.show` / `peer.status` | `{ ref }` | `{ peer }` / connectivity |
+| `peer.doorbell` | `{ peer, url? }` | `{ rung }` (devices the edge pushed to) or `{ rung: 0, skipped: "recent" }` — rings the contact's message doorbell (docs/chat-envelopes.md `IDFON-DOORBELL/1`): seals our name and account id to their `doorbell_key` and posts it to `<edge>/<peer>/_push/doorbell` with our own `message.send` statement. At most once per contact every ten minutes (reset when a message to them is delivered). Fails without their key or an edge (`IDFON_EDGE_URL`, or `url`) |
 
 #### Contact exchange (vCards)
 

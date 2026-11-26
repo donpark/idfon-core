@@ -12,6 +12,7 @@ fn device(id: &str, addr: Option<&str>, class: Option<&str>) -> PeerDevice {
 
 fn sample() -> Peer {
     Peer {
+        doorbell_key: None,
         id: "account".into(),
         identity: "default".into(),
         name: "Alice".into(),
