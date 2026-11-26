@@ -13,7 +13,8 @@ Most triage starts by joining one flow across processes. See
   `trace=<id>` (or `message_id=<id>`, `peer_id=<id>`) across the files below.
 - **Daemon.** CLI-spawned: `<data_dir>/idfond.log` (default
   `/tmp/idfon/idfond.log`; its stderr is captured there). App-spawned: the FFI
-  subscriber writes `/tmp/idfon-<pid>.log`.
+  subscriber writes `idfon-<pid>.log` to `~/Library/Logs/Idfon/` on macOS
+  (owner only, last 5 runs kept) and to the app's tmp on iOS.
 - **Holder / bridge / agent.** `/tmp/idfon-holder-<pid>.log` (holder tracing),
   `~/.idfon/<instance>/holder.log`, `bridge.log`, `agents/*/eve.log`. The node
   bridge/relay and Eve extension emit single-line JSON tagged `idfon.bridge` /
