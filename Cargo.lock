@@ -3020,6 +3020,7 @@ dependencies = [
  "moq-net",
  "moq-video",
  "n0-future",
+ "n0-watcher",
  "objc2",
  "once_cell",
  "rand 0.10.3",
