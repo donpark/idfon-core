@@ -25,6 +25,36 @@ here can break idfon-sdk, idfon-ios and idfon-mac, which build this checkout:
   apps (`../idfon-mac/build.sh`, `../idfon-ios/build.sh`).
 - `docs/build.md` maps a change to what must be rebuilt.
 
+## Security invariants
+
+Each was a real hole (security review 2026-11-26, in idfon-home
+`docs/security-review-2026-11-26.md`) and has a test that fails if it comes
+back. Do not weaken a guard to make a feature work; if a feature needs more
+reach, design the authorization first and add a negative test.
+
+- **State sync is between the user's own devices only.** `idfon/sync/1` and
+  `events.merge` apply a batch only when it is signed by the receiving
+  identity's own account key and (over iroh) arrives from an endpoint enrolled
+  for that account (`own_account`, `sync_sender_allowed` in idfon-daemon). A
+  contact is a stored peer and can sign a batch with their own key; a batch can
+  grant any capability (`mcp.transport` → `sh -c`) and rewrite or remove peers.
+  Merged events take local cursors; never keep a sender's. Tests:
+  `events_merge_refuses_a_batch_from_another_account`,
+  `sync_admits_only_own_enrolled_devices`, `merged_events_take_local_cursors`.
+- **Call media is visible to call members only.** `LiveLayout`'s policy admits
+  every peer with subscribe-anything, and on iOS the call rides the identity
+  endpoint, whose id is on every contact card. So the call publication in
+  `iroh-c-ffi` must use `Audience::Peers(CallSession::audience)`, kept in sync
+  with the listen legs; never `LiveLayout::publish` or `Audience::Granted` for a
+  call, and never a fixed broadcast name. Test:
+  `only_call_members_can_subscribe_to_the_call` (re-run it on every iroh-live
+  pin move).
+- **Every remote-reachable handler checks who is asking.** A new ALPN, side
+  channel, envelope or RPC reachable from a peer states its attacker (stranger,
+  contact, ticket holder) and its authorization next to the code, keys that
+  check on the authenticated QUIC remote id (not a field in the payload), and
+  ships with a test that a non-authorized peer is refused.
+
 ## Checks
 
 - **Verify before retrying.** For network, device, or model checks, keep the returned operation ID and inspect that operation and its events before sending again. Reusing an idempotency key returns the existing operation; it does not re-run it. A new key creates a new request and may create another model turn.

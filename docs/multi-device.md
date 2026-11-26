@@ -158,12 +158,19 @@ restart and re-resolve current peer endpoints.
 
 State mutations emit events. Devices exchange signed event batches over the
 `idfon/sync/1` Iroh protocol. The receiving device verifies the account
-signature, requires that account to be the receiving identity's own (a
-contact can sign a batch with their own key, and a batch can grant
-capabilities and rewrite peers), confirms the remote endpoint is enrolled for
-that account, deduplicates event IDs, and applies supported snapshots
-deterministically. Merged events take local cursors; the sender's are
-ignored. The local `events.merge` RPC applies the same own-account rule.
+signature, requires that account to be the receiving identity's own,
+confirms the remote endpoint is enrolled for that account, deduplicates event
+IDs, and applies supported snapshots deterministically. Merged events take
+local cursors; the sender's are ignored. The local `events.merge` RPC applies
+the same own-account rule.
+
+> **Warning: own account only.** Until 2026-11-26 the check was "some stored
+> peer with this endpoint", which every contact passes: any contact could sign
+> a batch with their own key and grant themselves `mcp.transport` or re-point
+> another contact (security review C1). Contacts must never be able to sync
+> state. If cross-account sync is ever wanted, it needs its own protocol with
+> per-event authorization, not a wider gate here. The tests in
+> `AGENTS.md` "Security invariants" guard this.
 
 This is a log-union prototype, not a CRDT. Blobs continue to use existing
 tickets.

@@ -10,7 +10,7 @@ kept because it records decisions; **design** = not all implemented.
 
 | Doc | Covers | Read when |
 | --- | --- | --- |
-| `../AGENTS.md` | repository working rules and the iOS shipping checklist (gated IPA, credentials, build numbers, upload verification, TestFlight push smoke test) | shipping an iOS update or checking agent workflow rules |
+| `../AGENTS.md` | repository working rules, the **security invariants** (state sync own-account only, call media members-only, remote handlers check the QUIC remote id; each with its guard test) and the iOS shipping checklist (gated IPA, credentials, build numbers, upload verification, TestFlight push smoke test) | shipping an iOS update, checking agent workflow rules, or touching sync, call media, or any remote-reachable handler |
 | `communication-model.md` | identities, peers, messages, grants | anything about the core model |
 | `daemon.md` | why there is a daemon at all; the daemon as packaging of the feature functions | questioning the process model |
 | `protocol.md` | daemon JSON IPC methods/params, contact requests (unknown senders), introductions (the signed token, `contact.introduce`/`contact.inspect`) | adding/changing an RPC or a client |
