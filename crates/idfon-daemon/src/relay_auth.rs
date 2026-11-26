@@ -545,6 +545,7 @@ mod tests {
 
     fn peer(id: &str, name: &str, endpoint: &str, devices: Vec<(&str, Option<&str>)>) -> Peer {
         Peer {
+            doorbell_key: None,
             id: id.into(),
             identity: "default".into(),
             name: name.into(),

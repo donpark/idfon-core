@@ -64,6 +64,25 @@ Allow once / Deny"), one tap on the lock screen. This reuses the hardened
 `/_push/*` plumbing; the approval's own verb-scope and TTL are decided by the
 same rules above.
 
+**Built (2026-11-25): the lock-screen channel.** A yes/no request reaches a
+locked iPhone and is answered there, end to end, for `idfon ask` (idfon-sdk):
+
+1. The asker sends a `kind: "ask"` card (docs/chat-envelopes.md), durable.
+2. While it waits, the asker's daemon rings the doorbell (`peer.doorbell`):
+   the existing "New message" alert push, our name sealed to the phone's key.
+   No new push type, and APNs and the edge see nothing new.
+3. The woken phone comes online, the card arrives over iroh, and the app posts
+   an actionable notification (`idfon.ask`): Allow needs Face ID or the
+   passcode (`.authenticationRequired`); Deny does not.
+4. The tap sends `IDFON-UI-ACTION/1` from the background (durable), and the
+   asker counts only that contact's answer to that card. An unanswered card
+   expires: the asker replaces it with an action-less card and the phone
+   removes the notification.
+
+Still design here: MCP tool requests as the source of the approval (who /
+what / scope / duration in the card, verb-scoped tickets issued on Allow),
+and duration choices beyond allow/deny.
+
 ## Tool surface (initial slice)
 
 Read-only first, behind `diagnostics.read`:

@@ -11,6 +11,7 @@ use std::{
 
 mod blob;
 mod build_info;
+mod doorbell;
 mod diag_views;
 mod introductions;
 mod live;
@@ -1199,6 +1200,13 @@ async fn handle_request(
     }
     if request.method == "file.publish" {
         return encode_json(&files_publish(&request).await).map_err(io::Error::other);
+    }
+    if request.method == "peer.doorbell" {
+        let mut request = request.clone();
+        if request_text(&request.params, "identity").is_none() {
+            request.params["identity"] = serde_json::Value::String(session_identity.clone());
+        }
+        return encode_json(&doorbell::ring_request(&request, store).await).map_err(io::Error::other);
     }
     if request.method == "provider.start" {
         let identity = request_text(&request.params, "identity")
@@ -4221,6 +4229,10 @@ fn send_message(
             status = ?status,
             "message send finished"
         );
+        if delivery.is_ok() {
+            // Delivered: the next wait for them may ring their doorbell again.
+            doorbell::delivered(&worker_identity, &worker_peer.id);
+        }
         let identity = worker_identity.clone();
         let _ = tokio::task::spawn_blocking(move || {
             update_operation(&worker_store, &operation_id, &identity, status)
@@ -4625,6 +4637,8 @@ fn receive_message(request: &Request, store: &Arc<Mutex<Store>>) -> Response {
         envelope.conversation.as_deref(),
         text,
     );
+    // Their doorbell key (`IDFON-DOORBELL/1`): kept for `peer.doorbell`.
+    doorbell::on_received(&mut state, &receiving_identity, &envelope.sender.peer_id, text);
     let result = state.save(&state.data_dir);
     drop(state);
     if room_control {
@@ -4993,6 +5007,7 @@ fn request_accept(request: &Request, store: &Arc<Mutex<Store>>) -> Response {
                     .and_then(|id| serde_json::to_string(&EndpointAddr::new(id)).ok())
             });
             let mut peer = idfon_protocol::Peer {
+                doorbell_key: None,
                 id: held.peer_id.clone(),
                 identity: identity.clone(),
                 name,
@@ -6693,6 +6708,7 @@ fn peer_add(
         );
     }
     let mut peer = idfon_protocol::Peer {
+        doorbell_key: None,
         id: id.into(),
         identity,
         name,
@@ -6827,6 +6843,7 @@ fn peer_add(
             .cloned()
         {
             let reciprocal = idfon_protocol::Peer {
+                doorbell_key: None,
                 id: source.public_key.clone().unwrap_or_default(),
                 identity: remote.id.clone(),
                 name: source.name.clone(),
@@ -8524,6 +8541,7 @@ mod tests {
 
     fn test_peer(id: &str, identity: &str, name: &str) -> idfon_protocol::Peer {
         idfon_protocol::Peer {
+            doorbell_key: None,
             id: id.into(),
             identity: identity.into(),
             name: name.into(),
@@ -8702,6 +8720,7 @@ mod tests {
         {
             let mut state = store.lock().unwrap();
             state.peers.push(idfon_protocol::Peer {
+                doorbell_key: None,
                 id: "p1".into(),
                 identity: "default".into(),
                 name: "Alice".into(),
@@ -8959,6 +8978,7 @@ mod tests {
             let data_dir = state.data_dir.clone();
             state.ensure_identity_keys(&data_dir).unwrap();
             state.peers.push(idfon_protocol::Peer {
+                doorbell_key: None,
                 id: peer_id.clone(),
                 identity: "default".into(),
                 name: "Alice".into(),
@@ -9094,6 +9114,7 @@ mod tests {
         {
             let mut state = store.lock().unwrap();
             let mut peer = idfon_protocol::Peer {
+                doorbell_key: None,
                 id: account_id.into(),
                 identity: "default".into(),
                 name: "Alice".into(),
@@ -9236,6 +9257,7 @@ mod tests {
         {
             let mut state = store.lock().unwrap();
             state.peers.push(idfon_protocol::Peer {
+                doorbell_key: None,
                 id: "caller".into(),
                 identity: "default".into(),
                 name: "Caller".into(),
@@ -9388,6 +9410,7 @@ mod tests {
         {
             let mut state = producer_store.lock().unwrap();
             state.peers.push(idfon_protocol::Peer {
+                doorbell_key: None,
                 id: "consumer".into(),
                 identity: "e2e".into(),
                 name: "Consumer".into(),
@@ -9454,6 +9477,7 @@ mod tests {
         {
             let mut state = consumer_store.lock().unwrap();
             let mut peer = idfon_protocol::Peer {
+                doorbell_key: None,
                 id: account_id.into(),
                 identity: "default".into(),
                 name: "Producer".into(),
@@ -9598,6 +9622,7 @@ mod tests {
         let peer_id = key.peer_id();
         let mut state = store.lock().unwrap();
         state.peers.push(idfon_protocol::Peer {
+            doorbell_key: None,
             id: peer_id.clone(),
             identity: "default".into(),
             name: "Alice".into(),
@@ -9981,6 +10006,7 @@ mod tests {
         let sender_id = sender_key.peer_id();
         // Cross-daemon pairing: peer exists, but no grants at all.
         store.lock().unwrap().peers.push(idfon_protocol::Peer {
+            doorbell_key: None,
             id: sender_id.clone(),
             identity: "default".into(),
             name: "Alice".into(),
@@ -10066,6 +10092,7 @@ mod tests {
         // it can never match `sender.peer_id`, only the signer's claimed
         // endpoint — the split-identity pairing that died at the gate.
         store.lock().unwrap().peers.push(idfon_protocol::Peer {
+            doorbell_key: None,
             id: "endpoint-a".into(),
             identity: "default".into(),
             name: "MacApp".into(),
@@ -10165,6 +10192,7 @@ mod tests {
         let receiver_key = store.lock().unwrap().identity_key("default").unwrap();
         let sender_id = sender_key.peer_id();
         store.lock().unwrap().peers.push(idfon_protocol::Peer {
+            doorbell_key: None,
             id: sender_id.clone(),
             identity: "default".into(),
             name: "MacApp".into(),
@@ -10226,6 +10254,7 @@ mod tests {
         let sender_id = sender_key.peer_id();
         let mut state = store.lock().unwrap();
         state.peers.push(idfon_protocol::Peer {
+            doorbell_key: None,
             id: sender_id.clone(),
             identity: "default".into(),
             name: "Alice".into(),
@@ -10331,6 +10360,7 @@ mod tests {
         let peer_id = key.peer_id();
         let mut state = store.lock().unwrap();
         state.peers.push(idfon_protocol::Peer {
+            doorbell_key: None,
             id: peer_id.clone(),
             identity: "default".into(),
             name: "Alice".into(),
@@ -10680,6 +10710,7 @@ mod tests {
         {
             let mut state = Store::load(&dir).unwrap();
             state.peers.push(idfon_protocol::Peer {
+                doorbell_key: None,
                 id: "peer-1".into(),
                 identity: "default".into(),
                 name: "Alice".into(),
@@ -10882,6 +10913,7 @@ mod tests {
                 ("p-none", None),
             ] {
                 store.peers.push(idfon_protocol::Peer {
+                    doorbell_key: None,
                     id: id.into(),
                     identity: "default".into(),
                     name: id.into(),
@@ -10933,6 +10965,7 @@ mod tests {
             state.identities[0].endpoint_id = Some("self-endpoint".into());
             let identity = state.identities[0].clone();
             state.peers.push(idfon_protocol::Peer {
+                doorbell_key: None,
                 id: identity.public_key.clone().unwrap(),
                 identity: identity.id,
                 name: "Self".into(),
@@ -11124,6 +11157,7 @@ mod tests {
         let dir = temp_dir("events-merge");
         let store = Arc::new(Mutex::new(Store::load(&dir).unwrap()));
         let peer = idfon_protocol::Peer {
+            doorbell_key: None,
             id: "alice".into(),
             identity: "default".into(),
             name: "Alice".into(),
@@ -11487,6 +11521,7 @@ mod tests {
         let dir = temp_dir("resolve");
         let mut store = Store::load(&dir).unwrap();
         store.peers.push(idfon_protocol::Peer {
+            doorbell_key: None,
             id: "peer-1".into(),
             identity: "default".into(),
             name: "Alice".into(),
@@ -11527,6 +11562,7 @@ mod tests {
         let mut store = Store::load(&dir).unwrap();
         for id in ["peer-1", "peer-2"] {
             store.peers.push(idfon_protocol::Peer {
+                doorbell_key: None,
                 id: id.into(),
                 identity: "default".into(),
                 name: "same".into(),
@@ -11576,6 +11612,7 @@ mod tests {
         {
             let mut state = store.lock().unwrap();
             state.peers.push(idfon_protocol::Peer {
+                doorbell_key: None,
                 id: "peer-b".into(),
                 identity: "default".into(),
                 name: "Bob".into(),
@@ -11680,6 +11717,7 @@ mod tests {
         {
             let mut state = store.lock().unwrap();
             state.peers.push(idfon_protocol::Peer {
+                doorbell_key: None,
                 id: bob.clone(),
                 identity: "default".into(),
                 name: "bob".into(),
@@ -11909,6 +11947,7 @@ mod tests {
             for other in nodes.iter().filter(|o| o.peer_id != me.peer_id) {
                 let endpoint: iroh::EndpointId = other.endpoint.parse().unwrap();
                 state.peers.push(idfon_protocol::Peer {
+                    doorbell_key: None,
                     id: other.peer_id.clone(),
                     identity: "default".into(),
                     name: other.peer_id[..8].to_string(),

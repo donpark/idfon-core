@@ -499,6 +499,10 @@ pub struct Peer {
     /// card), from their card or `IDFON-SHARE/1`. Absent = ok.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub share: Option<String>,
+    /// Their message doorbell key (base64 X25519 public key), from their
+    /// `IDFON-DOORBELL/1`: `peer.doorbell` seals our name to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doorbell_key: Option<String>,
 }
 
 /// Messages from a sender who isn't a peer, held until the person accepts

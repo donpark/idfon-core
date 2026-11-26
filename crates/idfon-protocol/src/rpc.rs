@@ -329,7 +329,14 @@ methods! {
         pub retries: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub delivery: Option<DeliveryPolicy>,
+        /// Keep it in the outbox until delivered (retried when the peer is
+        /// back), instead of failing once retries run out.
+        #[serde(default, skip_serializing_if = "is_false")]
+        pub durable: bool,
     }
+    // Ring a contact's message doorbell: one "New message" push that wakes
+    // their phone for what waits in the outbox (`IDFON-DOORBELL/1`).
+    "peer.doorbell" => PeerDoorbell { pub peer: String }
 
     // Rooms
     "room.create" => RoomCreate {

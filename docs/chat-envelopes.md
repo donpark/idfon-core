@@ -108,8 +108,9 @@ key=<base64 of a 32-byte X25519 public key>
 
 The key a contact uses to ring your message doorbell. There is no mailbox:
 a message waits in its sender's outbox until you are reachable. While it waits,
-the sender's app asks the edge to send you one alert push ("New message") so
-your phone wakes up and comes online. The push carries only the sender's name and
+the sender's app (or any client, through the daemon's `peer.doorbell`) asks the
+edge to send you one alert push ("New message") so your phone wakes up and
+comes online. The push carries only the sender's name and
 account id, sealed to this key, so the edge and Apple see neither of them.
 The phone's notification extension opens it to show who it is from.
 
@@ -119,7 +120,8 @@ The phone's notification extension opens it to show who it is from.
   `{"n": "<name, at most 64 chars>", "i": "<account id>"}`.
 - An app sends its key once to each contact, and again when the key changes.
   Durable (outbox). A receiver keeps the latest key per contact and ignores a
-  `key` that is not a valid X25519 public key.
+  `key` that is not a valid X25519 public key. The daemon keeps it on the
+  contact (`doorbell_key` in `peer.show`).
 - A sender rings a contact's doorbell at most once every ten minutes while
   messages wait, and not at all without their key. The edge route and its rate
   limits are in idfon-edge (`/_push/doorbell`).
@@ -188,6 +190,13 @@ conversation as a row with a title and up to a few actions.
 - A client draws the kinds it knows with their own renderer. Every other kind
   still shows, as the generic card: title, subtitle, glyph and actions. A client
   that cannot act on cards may show only the title.
+- `kind: "ask"` is an approval request (`idfon ask` in idfon-sdk): actions
+  `allow` and `deny`, title the question, subtitle the detail. Besides the
+  generic card, the iPhone shows it as a notification whose Allow (after Face
+  ID or the passcode) and Deny answer from the lock screen. The asker sends it
+  durable and rings the doorbell when it waits. When nobody answers in time,
+  the asker sends the card again with no actions and an "Expired" subtitle;
+  the phone then removes the notification.
 
 ### Card answer — `IDFON-UI-ACTION/1`
 

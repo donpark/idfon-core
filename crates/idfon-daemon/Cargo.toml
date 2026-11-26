@@ -13,7 +13,9 @@ linux-vaapi = ["idfon-media/linux-vaapi"]
 idfon-config = { path = "../idfon-config" }
 anyhow = "1"
 axum = "0.8"
+base64 = "0.23"
 blake3 = "1"
+hpke = { version = "0.15", default-features = false, features = ["alloc", "chacha", "getrandom", "x25519"] }
 futures-util = "0.3"
 iroh-gossip = "0.103"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
